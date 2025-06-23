@@ -189,6 +189,8 @@ cargo run --example map_example
 cargo run --example combined_example  # Shows both collections working together
 cargo run --example streaming_demo    # Demonstrates efficient streaming iteration
 cargo run --example nested_example   # Shows nested collections (Map -> Vec)
+cargo run --example simple_ranking   # Gaming leaderboard from docs/motivation.md
+cargo run --example ranking_history  # Complex ranking system with persistence
 ```
 
 ## License
