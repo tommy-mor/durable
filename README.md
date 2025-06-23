@@ -4,7 +4,7 @@ RocksDB-backed persistent data structures for Rust. Think `std::collections` but
 
 ## Features
 
-- **Persistent Collections**: `DurableVec`, `DurableMap` (coming soon), `DurableSet` (coming soon)
+- **Persistent Collections**: `DurableVec`, `DurableMap`, `DurableSet` (coming soon)
 - **Type-Safe**: Full Rust type safety with serde serialization
 - **ACID Guarantees**: All operations are atomic and crash-safe
 - **Zero-Copy Capable**: Efficient iteration without loading entire collections
@@ -21,6 +21,7 @@ durable = "0.1.0"
 
 ## Example
 
+### DurableVec
 ```rust
 use durable::{Db, DurableVec};
 use serde::{Serialize, Deserialize};
@@ -53,6 +54,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+### DurableMap
+```rust
+use durable::{Db, DurableMap};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let db = Db::open("my_db")?;
+    
+    // Create a persistent map
+    let mut scores = DurableMap::<String, u32>::new(&db, "scores")?;
+    
+    // Use it like a HashMap!
+    scores.insert("Alice".to_string(), 100)?;
+    scores.insert("Bob".to_string(), 85)?;
+    
+    // Get values
+    if let Some(score) = scores.get(&"Alice".to_string())? {
+        println!("Alice's score: {}", score);
+    }
+    
+    // Iterate over entries
+    for (name, score) in scores.iter()? {
+        println!("{}: {}", name, score);
+    }
+    
+    Ok(())
+}
+```
+
 ## Current Status
 
 ### Implemented
@@ -65,22 +94,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
   - Unicode string support
   - Complex type support
 
+- ✅ `DurableMap<K, V>` with full test coverage including:
+  - Basic operations: `insert`, `get`, `remove`, `contains_key`, `len`, `clear`
+  - Batch operations: `extend`
+  - Iteration: `iter()`, `keys()`, `values()`
+  - Complex key and value types
+  - Property-based testing with proptest
+
 ### Coming Soon
 
-- 🚧 `DurableMap<K, V>` - Persistent HashMap
 - 🚧 `DurableSet<T>` - Persistent HashSet  
 - 🚧 Streaming iterators for better memory efficiency
 - 🚧 Collection nesting (e.g., `DurableMap<String, DurableVec<T>>`)
 - 🚧 Schema migration support
+- 🚧 Batch operations across multiple collections
 
 ## Performance
 
-DurableVec operations are designed to be efficient:
+All operations are designed to be efficient:
 
-- `push`: Single atomic write with WAL flush
-- `get`: Direct key lookup, O(1) 
-- `extend`: Batched writes for efficiency
-- `clear`: Atomic batch deletion
+- **DurableVec**:
+  - `push`: Single atomic write with WAL flush
+  - `get`: Direct key lookup, O(1) 
+  - `extend`: Batched writes for efficiency
+  - `clear`: Atomic batch deletion
+
+- **DurableMap**:
+  - `insert`/`get`: Direct key lookup, O(1) average
+  - `remove`: Single delete with WAL flush
+  - `len`: O(n) scan (can be optimized with metadata)
+  - `extend`: Batched writes for efficiency
 
 ## Testing
 
@@ -90,10 +133,12 @@ Run the test suite:
 cargo test
 ```
 
-Run the example:
+Run the examples:
 
 ```bash
 cargo run --example vec_example
+cargo run --example map_example
+cargo run --example combined_example  # Shows both collections working together
 ```
 
 ## License

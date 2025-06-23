@@ -6,7 +6,9 @@ use rocksdb::{DB as RocksDB, Options, WriteBatch};
 use thiserror::Error;
 
 pub mod vec;
+pub mod map;
 pub use vec::DurableVec;
+pub use map::DurableMap;
 
 /// Error types for Durable operations
 #[derive(Error, Debug)]

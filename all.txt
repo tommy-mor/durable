@@ -1,0 +1,1724 @@
+This file is a merged representation of the entire codebase, combined into a single document by Repomix.
+
+================================================================
+File Summary
+================================================================
+
+Purpose:
+--------
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+
+File Format:
+------------
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Multiple file entries, each consisting of:
+  a. A separator line (================)
+  b. The file path (File: path/to/file)
+  c. Another separator line
+  d. The full contents of the file
+  e. A blank line
+
+Usage Guidelines:
+-----------------
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+
+Notes:
+------
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+
+Additional Info:
+----------------
+
+================================================================
+Directory Structure
+================================================================
+docs/
+  001.md
+  motivation.md
+examples/
+  vec_example.rs
+src/
+  lib.rs
+  vec.rs
+.gitignore
+Cargo.toml
+LICENSE
+README.md
+repomix.config.json
+todo.tdsl
+
+================================================================
+Files
+================================================================
+
+================
+File: docs/001.md
+================
+## Durable — RocksDB-backed Persistent Data Structures for Rust
+
+### *draft RFC v0.1*
+
+---
+
+### 1  Purpose
+
+Provide ergonomic, std-like collections (`DurableMap`, `DurableVec`, `DurableSet`, …) whose contents are **durably stored in RocksDB** yet feel in-memory:
+
+```rust
+let db  = durable::open("db");               // single call opens RocksDB
+let mut posts = DurableMap::<Uuid, Post>::new(&db, "posts")?;
+
+posts.insert(id, post)?;                     // ACID write
+let p = posts.get(&id)?;                     // typed read
+```
+
+Target use cases:
+
+| Domain                         | Why durable?                     |
+| ------------------------------ | -------------------------------- |
+| Local-first apps / CRDT caches | crash-safe, embedded             |
+| High-write time-series blobs   | append-only keys, fast iteration |
+| ML / ranking histories         | vector-within-vector patterns    |
+| Game state / async board games | snapshot + rollback              |
+| Sorter (tag → bucket → item)   | exactly the motivating structure |
+
+---
+
+### 2  Design Goals
+
+1. **Ergonomic** – Feel like `std::collections`; no manual key mangling.
+2. **Typed** – Keys & values are generic; (de)serialization pluggable (default = `bincode`).
+3. **Atomic** – Multi-op `batch.commit()` gives RocksDB write-batch semantics.
+4. **Crash-safe** – Every public write path `fsync`s RocksDB WAL first.
+5. **Composable** – Any collection may nest another via *prefix subspaces*.
+6. **Zero external services** – Single embedded `.sst` directory.
+7. **Opt-in features** – Reactive diffs, LRU cache, metrics behind feature flags.
+
+Non-goals (v0 line):
+
+* Distributed replication
+* Multi-process concurrency (one writer process is assumed; readers may open secondary Rocks instances)
+* SQL-style ad-hoc queries – you iterate, not query-plan.
+
+---
+
+### 3  Key–Value Layout
+
+*Each collection owns a **prefix** inside a single Column Family (`default` by default).*
+
+```
+<user-prefix> 0x00 <col_id> 0x00 <logical-key> [ 0x00 <subindex> …]
+```
+
+* `user-prefix`   = crate-level namespace (allows multi-tenant apps)
+* `col_id`        = 8-byte, little-endian numeric ID assigned on `DurableMap::new(&db,"posts")`.
+* `logical-key`   = `serde`-encoded key (or ordinal for Vec).
+* `subindex`      = extra path segments used by nested collections (e.g., `Vec` elements in a map value).
+
+Because RocksDB stores keys lexicographically, all elements of a collection (and its descendants) live contiguously → range scans & prefix deletes are cheap.
+
+---
+
+### 4  Public API (surface)
+
+```rust
+/// Opens (or creates) a durable database at `path`.
+pub fn open<P: AsRef<Path>>(path: P) -> Result<Db, Error>;
+
+/// A transactional write batch
+pub struct Batch<'db> { /* .. */ }
+
+impl<'db> Batch<'db> {
+    pub fn put<K,V>(&mut self, col: &impl WriteCollection<K,V>, key: &K, val: &V) -> Result<()>;
+    pub fn delete<K,V>(&mut self, col: &impl WriteCollection<K,V>, key: &K) -> Result<()>;
+    pub fn commit(self) -> Result<()>;
+}
+
+/// Collections ------------------------------------------------------------
+
+pub struct DurableMap<'db, K, V> { /* .. */ }
+pub struct DurableVec<'db, T>    { /* .. */ }
+pub struct DurableSet<'db, T>    { /* .. */ }
+pub struct DurableIndex<'db, K, V> { /* sorted-map, range queries */ }
+
+/// Common read API
+pub trait ReadCollection<K,V> {
+    fn get(&self, k: &K) -> Result<Option<V>>;
+    fn contains_key(&self, k: &K) -> Result<bool>;
+    fn len(&self) -> Result<u64>;
+    fn iter(&self) -> Iter<'_, (K,V)>;               // owns snapshot
+}
+
+/// Common write API (auto batch or explicit)
+pub trait WriteCollection<K,V>: ReadCollection<K,V> {
+    fn insert(&mut self, k: K, v: V) -> Result<Option<V>>;
+    fn remove(&mut self, k: &K) -> Result<Option<V>>;
+    fn clear(&mut self) -> Result<()>;
+}
+```
+
+*All writes go through an internal `rocksdb::WriteBatch`* so a single logical op remains atomic even if it touches subkeys (e.g., pushing into a `DurableVec` updates `len` meta key + appends element).
+
+---
+
+### 5  Collection Semantics
+
+#### 5.1 `DurableVec<T>`
+
+* Meta-key `__len` stores current length (`u64`).
+* Element key  = `<prefix>|<index (big-endian 8-byte)>`
+* `push(elem)` = `batch.put(key(len), elem); batch.put(__len, len+1)`
+  – O(1) write, O(log N) read via prefix seek.
+* `iter()` performs a prefix range; snapshot guarantees repeat-read.
+
+#### 5.2 `DurableMap<K,V>`
+
+* Key = `<prefix>|<serde(k)>`
+* `len` optional (feature `"size_tracking"`); otherwise O(prefix-scan).
+
+#### 5.3 Nested Collections
+
+```rust
+let users  = DurableMap::<String, DurableVec<Order>>::new(&db,"users")?;
+users.entry("alice")?.or_default()?.push(order)?;
+```
+
+Internally `Entry::or_default` creates a *child prefix* off the parent’s key:
+`<users-prefix>|"alice"|0x00|<vec-id>|…`
+
+Child collections store their own metadata keys beneath that path.
+
+---
+
+### 6  Transactions & Consistency
+
+* **Auto-batch**: default mutator methods create a WriteBatch, commit, and flush WAL.
+* **Explicit batch**: user opens `let mut wb = db.batch();`, issues puts/deletes via collection adapters, then `wb.commit()` for cross-collection atomicity.
+* **Crash guarantee**: after `commit` returns, updates survive power loss (`rocksdb::DB::flush_wal(true)`).
+
+Read operations take a **consistent snapshot** by default; advanced users can opt-out for max throughput.
+
+---
+
+### 7  Migrations (v0.2 roadmap)
+
+* Each collection stores a `u32 schema_version` meta key.
+* `durable::open` accepts an optional `Schema` describing:
+
+  ```rust
+  struct Schema { collections: Vec<CollectionDef>, version: u32 }
+  ```
+
+  If version mismatch ⇒ run user-supplied `migrate(old, new, &db)` which gets a mutable view and may batch-rewrite keys.
+
+---
+
+### 8  Reactive Diffs (feature `"watch"`)
+
+* Behind a Tokio-aware feature; uses RocksDB’s `get_updates_since(seq)` API.
+* `watch_prefix(prefix) -> impl Stream<Diff>`
+  – `Diff` = key, old val (Option), new val (Option).
+* Back-pressure handled with an in-process ring buffer; user chooses lag policy.
+
+---
+
+### 9  Caching Layer (feature `"cache"`)
+
+* Probabilistic LRU over deserialized values.
+* Configurable per-collection: `with_cache(cap_entries, ttl_ms)`.
+* Coherent: write path invalidates cache keys on commit.
+
+---
+
+### 10  Error Model
+
+```rust
+#[non_exhaustive]
+pub enum Error {
+    Rocks(rocksdb::Error),
+    Serde(bincode::Error),
+    Corruption(String),
+    TransactionAborted,
+    // feature-gated variants e.g. WatchLagged
+}
+```
+
+`Result<T> = std::result::Result<T, Error>` everywhere.
+
+---
+
+### 11  Performance Budget (baseline targets)
+
+| Operation            | Goal                                   |
+| -------------------- | -------------------------------------- |
+| `map.insert`         | < 30 µs (including WAL fsync)          |
+| `vec.push`           | < 25 µs                                |
+| Prefix iteration 1 M | > 120 MB/s read BW on NVMe             |
+| Concurrent readers   | Linear scaling up to RocksDB read-IOPS |
+| Watch latency        | < 5 ms p50 on local SSD                |
+
+(bench harness lives in `benches/` via Criterion.)
+
+---
+
+### 12  Dependency Footprint
+
+* `rocksdb` (–> FB fork)   ⟹ builds C++11 static lib         (\~10 MB)
+* `bincode` (default), with `serde` feature.
+* `tokio-stream` only if `watch` feature enabled.
+
+MSRV = 1.76.
+
+---
+
+### 13  Minimum Deliverable for **v0.1-alpha**
+
+* [ ] `Db::open`, `Db::batch`
+* [ ] `DurableMap`, `DurableVec`
+* [ ] automatic serialization via `serde`
+* [ ] atomic commit + WAL flush
+* [ ] snapshot reads
+* [ ] unit tests (insert/get/iter/crash-recovery using `tempdir`)
+* [ ] criterion bench
+
+---
+
+### 14  Future Work
+
+* **Replicated mode** (Raft or FoundationDB layer)
+* **CRDT merge semantics** for offline edits
+* **DurableGraph** (adjacency lists + index)
+* WebAssembly key-value adapters (edge workers)
+* `tracing` instrumentation & Prometheus metrics
+
+---
+
+### 15  Licensing & Governance
+
+* License: **Apache-2.0 OR MIT** (standard Rust dual license)
+* Code-of-conduct: Rust CoC template
+* Contribution model: PR + mandatory CI (fmt, clippy, test, bench)
+* Early roadmap guided by original author(s); transfer to an org when ≥3 maintainers.
+
+---
+
+## Appendix A — Sorter Use-Case Sketch
+
+```rust
+type TagId  = String;
+type Bucket = u64;                  // logical Unix day or version #
+type ItemId = String;
+type Elo    = i32;
+
+let hist = DurableMap::<TagId, DurableMap<Bucket, DurableVec<(ItemId,Elo)>>>::new(&db,"hist")?;
+
+// update elo
+hist.entry("tf2")?
+    .or_default()?
+    .entry(today_bucket)?
+    .or_default()?
+    .push((item_id, new_elo))?;
+
+// stream bucket
+let items = hist.get("tf2")?.unwrap()
+                .get(&today_bucket)?.unwrap()
+                .iter().collect::<Vec<_>>();
+```
+
+All three layers share one RocksDB instance; you pay one WAL flush per ranking update, but reads are prefix-scans with zero allocations.
+
+================
+File: docs/motivation.md
+================
+# Why Durable? The Missing Abstraction Layer for Persistent Storage
+
+## The Problem: The Abstraction Gap
+
+Every database forces developers to translate between how they **think** about data and how they **store** it. This translation layer is where bugs hide, performance suffers, and development slows down.
+
+### Example: Building a Multiplayer Game Leaderboard
+
+Let's say you need to store player rankings by game mode, with history by day. Here's the data model in your head:
+
+```
+Game Mode → Day → List of (Player, Score)
+```
+
+#### With Raw Key-Value Stores (sled, RocksDB)
+
+```rust
+// Storing a score requires manual key construction
+let key = format!("leaderboard:{}:{}:player:{}", game_mode, day, player_id);
+db.insert(key.as_bytes(), score.to_le_bytes())?;
+
+// Getting today's leaderboard? Manual prefix scan and deserialization
+let prefix = format!("leaderboard:{}:{}:", game_mode, day);
+let mut scores = Vec::new();
+for item in db.scan_prefix(prefix.as_bytes()) {
+    let (key, value) = item?;
+    // Parse player_id from key string... hope the format is right
+    // Deserialize score... hope it's the right type
+    scores.push((player_id, score));
+}
+scores.sort_by_key(|(_, s)| *s);
+
+// Want to know how many players played today? Another scan!
+// Want to atomically update multiple scores? Write a transaction wrapper!
+// Want to clean up old days? Manual prefix iteration and deletion!
+```
+
+**Problems:**
+- String manipulation for every operation
+- No type safety (everything is bytes)
+- Manual implementation of collection semantics
+- No atomicity across related keys
+- Performance overhead from string parsing
+
+#### With SQL Databases (SQLite, PostgreSQL)
+
+```sql
+CREATE TABLE leaderboards (
+    game_mode VARCHAR(50),
+    day DATE,
+    player_id UUID,
+    score INTEGER,
+    PRIMARY KEY (game_mode, day, player_id)
+);
+
+-- Getting a leaderboard requires SQL
+SELECT player_id, score 
+FROM leaderboards 
+WHERE game_mode = ? AND day = ?
+ORDER BY score DESC;
+```
+
+```rust
+// In Rust, you need an ORM or manual query building
+let scores: Vec<(Uuid, i32)> = sqlx::query_as(
+    "SELECT player_id, score FROM leaderboards WHERE game_mode = $1 AND day = $2 ORDER BY score DESC"
+)
+.bind(&game_mode)
+.bind(&day)
+.fetch_all(&pool)
+.await?;
+```
+
+**Problems:**
+- Impedance mismatch (relational model vs nested structures)
+- SQL complexity for simple operations
+- ORMs add abstraction layers and performance overhead
+- Async runtime required even for local storage
+- Schema migrations for every structural change
+
+#### With Document Stores (MongoDB)
+
+```javascript
+// Document structure
+{
+  game_mode: "ranked",
+  day: "2024-01-15",
+  scores: [
+    { player_id: "abc", score: 1500 },
+    { player_id: "def", score: 1400 }
+  ]
+}
+
+// But now you have a different problem: updating a single score
+// requires loading and saving the entire document!
+```
+
+**Problems:**
+- Not embedded (requires separate process)
+- Document size limits
+- Inefficient for partial updates
+- Complex setup for local-first apps
+
+## The Solution: Native Data Structures
+
+With Durable, you express your data model directly:
+
+```rust
+let leaderboard = DurableMap::<String, DurableMap<u32, DurableVec<(PlayerId, Score)>>>::new(&db, "leaderboard")?;
+
+// Store a score - reads like natural Rust code
+leaderboard
+    .entry(game_mode)?
+    .or_default()?
+    .entry(day)?
+    .or_default()?
+    .push((player_id, score))?;
+
+// Get today's leaderboard - it's just a Vec
+let mut today_scores = leaderboard
+    .get(&game_mode)?
+    .and_then(|mode| mode.get(&day).ok())
+    .unwrap_or_default();
+today_scores.sort_by_key(|(_, s)| *s);
+
+// All operations are atomic, typed, and efficient
+```
+
+## Why This Matters
+
+### 1. **Zero Translation Overhead**
+
+Your mental model **is** the storage model. No more:
+- String concatenation for keys
+- Manual serialization/deserialization  
+- SQL query construction
+- Document structure mapping
+
+### 2. **Composition Without Complexity**
+
+Nested data structures "just work":
+
+```rust
+// A real-world example: user notifications by app by priority
+let notifications = DurableMap::<UserId, 
+    DurableMap<AppId, 
+        DurableMap<Priority, 
+            DurableVec<Notification>>>>::new(&db, "notifs")?;
+
+// Natural access patterns
+notifications
+    .get(&user_id)?
+    .get(&app_id)?
+    .get(&Priority::High)?
+    .iter()
+    .take(10)  // Latest 10 high-priority notifications
+```
+
+Try implementing this with SQL joins or KV prefixes!
+
+### 3. **Type Safety Throughout**
+
+```rust
+// This won't compile - type safety at every level
+let score: String = leaderboard.get(&"chess")?.get(&20240115)?.get(0)?;
+//          ^^^^^^ expected Score, found String
+
+// With raw KV stores, this is a runtime error after deserialization
+```
+
+### 4. **Atomicity By Design**
+
+```rust
+// Multiple operations in one atomic batch
+let mut batch = db.batch();
+batch.vec_push(&game.players, new_player)?;
+batch.map_insert(&game.scores, player_id, 0)?;
+batch.map_increment(&game.stats, "player_count", 1)?;
+batch.commit()?;  // All or nothing
+```
+
+### 5. **Performance Without Compromise**
+
+- **Locality**: Related data stored contiguously (prefix design)
+- **Zero-copy possible**: Direct memory mapping for read-heavy workloads
+- **Streaming iteration**: No need to load entire collections
+- **Bulk operations**: Native batch support
+
+## Comparison Matrix
+
+| Feature | Durable | sled/RocksDB | SQLite | MongoDB |
+|---------|---------|--------------|---------|----------|
+| **Native collections** | ✅ Built-in | ❌ DIY | ❌ Tables only | ⚠️ Documents |
+| **Type safety** | ✅ Full | ❌ Bytes | ⚠️ ORM-dependent | ⚠️ Schema validation |
+| **Nested structures** | ✅ Natural | ❌ Manual prefixes | ❌ Joins/JSON | ✅ Embedded docs |
+| **Atomic operations** | ✅ Automatic | ⚠️ Manual batching | ✅ Transactions | ⚠️ Document-level |
+| **Local/embedded** | ✅ Yes | ✅ Yes | ✅ Yes | ❌ Separate process |
+| **Schema evolution** | ✅ Per-collection | ❌ DIY | ⚠️ Migrations | ✅ Flexible |
+| **Memory efficiency** | ✅ Scan & stream | ✅ Manual | ⚠️ Query-dependent | ❌ Doc loading |
+
+## Real-World Use Cases Where Durable Shines
+
+### Local-First Sync Engine
+
+```rust
+// Sync state with conflict tracking
+let sync_state = DurableMap::<RecordId, DurableMap<DeviceId, Version>>::new(&db, "sync")?;
+
+// Natural conflict detection
+let versions = sync_state.get(&record_id)?;
+if versions.values().unique().count() > 1 {
+    // Conflict detected - handle naturally
+}
+```
+
+### Time-Series Analytics Cache
+
+```rust
+// Metrics by source by minute
+let metrics = DurableMap::<Source, DurableMap<UnixMinute, DurableVec<Metric>>>::new(&db, "metrics")?;
+
+// Natural windowing
+let last_hour: Vec<Metric> = metrics
+    .get(&source)?
+    .range(now - 3600..=now)?
+    .flat_map(|(_, minute_metrics)| minute_metrics.iter())
+    .collect();
+```
+
+### Feature Flag System with History
+
+```rust
+// Flags by environment with change history
+let flags = DurableMap::<Env, DurableMap<FlagName, DurableVec<(Timestamp, Value)>>>::new(&db, "flags")?;
+
+// Natural audit trail
+let history = flags.get(&Env::Prod)?.get("new-feature")?.iter().collect();
+```
+
+## The Bottom Line
+
+**Durable isn't a better database - it's the missing abstraction layer that lets you use persistent storage like in-memory collections.**
+
+Stop translating. Start building.
+
+---
+
+*Next: Read the [RFC](001.md) for implementation details, or jump to the [Quick Start Guide](quickstart.md).*
+
+================
+File: examples/vec_example.rs
+================
+use durable::{Db, DurableVec};
+use serde::{Serialize, Deserialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct Task {
+    id: u64,
+    title: String,
+    completed: bool,
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Open or create a database
+    let db = Db::open("example_db")?;
+    
+    // Create a persistent vector of tasks
+    let mut tasks = DurableVec::<Task>::new(&db, "tasks")?;
+    
+    // Add some tasks
+    tasks.push(Task {
+        id: 1,
+        title: "Build Durable library".to_string(),
+        completed: true,
+    })?;
+    
+    tasks.push(Task {
+        id: 2,
+        title: "Write comprehensive tests".to_string(),
+        completed: true,
+    })?;
+    
+    tasks.push(Task {
+        id: 3,
+        title: "Create documentation".to_string(),
+        completed: false,
+    })?;
+    
+    println!("Total tasks: {}", tasks.len()?);
+    
+    // Iterate through all tasks
+    println!("\nAll tasks:");
+    for (i, task) in tasks.iter()?.iter().enumerate() {
+        println!("  [{}] {} - {}", 
+            i, 
+            task.title, 
+            if task.completed { "✓" } else { "○" }
+        );
+    }
+    
+    // Get a specific task
+    if let Some(task) = tasks.get(1)? {
+        println!("\nTask at index 1: {:?}", task);
+    }
+    
+    // Mark the last task as completed
+    if let Some(mut last_task) = tasks.pop()? {
+        println!("\nCompleting task: {}", last_task.title);
+        last_task.completed = true;
+        tasks.push(last_task)?;
+    }
+    
+    // The data persists even after the program exits!
+    println!("\nData has been persisted to disk.");
+    
+    Ok(())
+}
+
+================
+File: src/vec.rs
+================
+use crate::{Db, Result, DurableError};
+use rocksdb::WriteBatch;
+use serde::{Serialize, Deserialize};
+use std::marker::PhantomData;
+
+/// A persistent vector backed by RocksDB
+pub struct DurableVec<T> {
+    db: Db,
+    prefix: Vec<u8>,
+    _phantom: PhantomData<T>,
+}
+
+impl<T> DurableVec<T> 
+where 
+    T: Serialize + for<'de> Deserialize<'de>
+{
+    /// Create a new DurableVec with the given name
+    pub fn new(db: &Db, name: &str) -> Result<Self> {
+        let prefix = format!("vec:{}", name).into_bytes();
+        
+        Ok(DurableVec {
+            db: db.clone(),
+            prefix,
+            _phantom: PhantomData,
+        })
+    }
+    
+    /// Get the length of the vector
+    pub fn len(&self) -> Result<usize> {
+        let key = self.meta_key("len");
+        match self.db.rocks().get(&key)? {
+            Some(bytes) => {
+                if bytes.len() != 8 {
+                    return Err(DurableError::Corruption("Invalid length bytes size".into()));
+                }
+                let len_bytes: [u8; 8] = bytes[..8].try_into()
+                    .map_err(|_| DurableError::Corruption("Invalid length bytes".into()))?;
+                Ok(u64::from_le_bytes(len_bytes) as usize)
+            }
+            None => Ok(0),
+        }
+    }
+    
+    /// Check if the vector is empty
+    pub fn is_empty(&self) -> Result<bool> {
+        Ok(self.len()? == 0)
+    }
+    
+    /// Push an element to the end of the vector
+    pub fn push(&mut self, value: T) -> Result<()> {
+        let len = self.len()?;
+        let mut batch = WriteBatch::default();
+        
+        // Serialize the value
+        let value_bytes = bincode::serialize(&value)?;
+        
+        // Write the element
+        let elem_key = self.element_key(len);
+        batch.put(&elem_key, &value_bytes);
+        
+        // Update the length
+        let new_len = (len + 1) as u64;
+        let len_key = self.meta_key("len");
+        batch.put(&len_key, &new_len.to_le_bytes());
+        
+        // Commit atomically
+        self.db.rocks().write(batch)?;
+        self.db.rocks().flush_wal(true)?;
+        
+        Ok(())
+    }
+    
+    /// Get an element at the given index
+    pub fn get(&self, index: usize) -> Result<Option<T>> {
+        let len = self.len()?;
+        if index >= len {
+            return Ok(None);
+        }
+        
+        let key = self.element_key(index);
+        match self.db.rocks().get(&key)? {
+            Some(bytes) => {
+                let value = bincode::deserialize(&bytes)?;
+                Ok(Some(value))
+            }
+            None => Err(DurableError::Corruption(
+                format!("Element at index {} not found but index < len", index)
+            )),
+        }
+    }
+    
+    /// Clear all elements from the vector
+    pub fn clear(&mut self) -> Result<()> {
+        let len = self.len()?;
+        let mut batch = WriteBatch::default();
+        
+        // Delete all elements
+        for i in 0..len {
+            let key = self.element_key(i);
+            batch.delete(&key);
+        }
+        
+        // Delete the length meta key
+        let len_key = self.meta_key("len");
+        batch.delete(&len_key);
+        
+        // Commit atomically
+        self.db.rocks().write(batch)?;
+        self.db.rocks().flush_wal(true)?;
+        
+        Ok(())
+    }
+    
+    /// Create an iterator over the vector
+    pub fn iter(&self) -> Result<Vec<T>> {
+        let len = self.len()?;
+        let mut result = Vec::with_capacity(len);
+        
+        for i in 0..len {
+            match self.get(i)? {
+                Some(value) => result.push(value),
+                None => return Err(DurableError::Corruption(
+                    format!("Missing element at index {} during iteration", i)
+                )),
+            }
+        }
+        
+        Ok(result)
+    }
+    
+    /// Push multiple elements in a single batch
+    pub fn extend<I>(&mut self, iter: I) -> Result<()>
+    where
+        I: IntoIterator<Item = T>
+    {
+        let mut batch = WriteBatch::default();
+        let mut len = self.len()?;
+        
+        for value in iter {
+            let value_bytes = bincode::serialize(&value)?;
+            let elem_key = self.element_key(len);
+            batch.put(&elem_key, &value_bytes);
+            len += 1;
+        }
+        
+        // Update length
+        let len_key = self.meta_key("len");
+        batch.put(&len_key, &(len as u64).to_le_bytes());
+        
+        // Commit atomically
+        self.db.rocks().write(batch)?;
+        self.db.rocks().flush_wal(true)?;
+        
+        Ok(())
+    }
+    
+    /// Remove and return the last element
+    pub fn pop(&mut self) -> Result<Option<T>> {
+        let len = self.len()?;
+        if len == 0 {
+            return Ok(None);
+        }
+        
+        let last_idx = len - 1;
+        let value = self.get(last_idx)?;
+        
+        let mut batch = WriteBatch::default();
+        
+        // Delete the last element
+        let elem_key = self.element_key(last_idx);
+        batch.delete(&elem_key);
+        
+        // Update length
+        let len_key = self.meta_key("len");
+        batch.put(&len_key, &(last_idx as u64).to_le_bytes());
+        
+        // Commit atomically
+        self.db.rocks().write(batch)?;
+        self.db.rocks().flush_wal(true)?;
+        
+        Ok(value)
+    }
+    
+    // Helper methods
+    
+    fn element_key(&self, index: usize) -> Vec<u8> {
+        let mut key = self.prefix.clone();
+        key.push(b':');
+        key.extend_from_slice(&(index as u64).to_be_bytes());
+        key
+    }
+    
+    fn meta_key(&self, meta_type: &str) -> Vec<u8> {
+        let mut key = self.prefix.clone();
+        key.extend_from_slice(b":__meta:");
+        key.extend_from_slice(meta_type.as_bytes());
+        key
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+    
+    fn setup_test_db() -> (TempDir, Db) {
+        let temp_dir = TempDir::new().unwrap();
+        let db = Db::open(temp_dir.path()).unwrap();
+        (temp_dir, db)
+    }
+    
+    #[test]
+    fn test_push_and_get() {
+        let (_temp, db) = setup_test_db();
+        let mut vec = DurableVec::<String>::new(&db, "test_vec").unwrap();
+        
+        // Push some values
+        vec.push("first".to_string()).unwrap();
+        vec.push("second".to_string()).unwrap();
+        vec.push("third".to_string()).unwrap();
+        
+        // Check length
+        assert_eq!(vec.len().unwrap(), 3);
+        
+        // Get values
+        assert_eq!(vec.get(0).unwrap(), Some("first".to_string()));
+        assert_eq!(vec.get(1).unwrap(), Some("second".to_string()));
+        assert_eq!(vec.get(2).unwrap(), Some("third".to_string()));
+        assert_eq!(vec.get(3).unwrap(), None);
+    }
+    
+    #[test]
+    fn test_persistence() {
+        let (temp_dir, db) = setup_test_db();
+        
+        // Create and populate vector
+        {
+            let mut vec = DurableVec::<i32>::new(&db, "persist_vec").unwrap();
+            vec.push(42).unwrap();
+            vec.push(100).unwrap();
+            vec.push(-7).unwrap();
+        }
+        
+        // Drop the database
+        drop(db);
+        
+        // Reopen and verify data persists
+        {
+            let db = Db::open(temp_dir.path()).unwrap();
+            let vec = DurableVec::<i32>::new(&db, "persist_vec").unwrap();
+            
+            assert_eq!(vec.len().unwrap(), 3);
+            assert_eq!(vec.get(0).unwrap(), Some(42));
+            assert_eq!(vec.get(1).unwrap(), Some(100));
+            assert_eq!(vec.get(2).unwrap(), Some(-7));
+        }
+    }
+    
+    #[test]
+    fn test_clear() {
+        let (_temp, db) = setup_test_db();
+        let mut vec = DurableVec::<u64>::new(&db, "clear_vec").unwrap();
+        
+        // Add some elements
+        vec.extend(vec![1, 2, 3, 4, 5]).unwrap();
+        assert_eq!(vec.len().unwrap(), 5);
+        
+        // Clear
+        vec.clear().unwrap();
+        assert_eq!(vec.len().unwrap(), 0);
+        assert!(vec.is_empty().unwrap());
+        
+        // Should be able to push again
+        vec.push(42).unwrap();
+        assert_eq!(vec.len().unwrap(), 1);
+        assert_eq!(vec.get(0).unwrap(), Some(42));
+    }
+    
+    #[test]
+    fn test_pop() {
+        let (_temp, db) = setup_test_db();
+        let mut vec = DurableVec::<String>::new(&db, "pop_vec").unwrap();
+        
+        // Empty pop
+        assert_eq!(vec.pop().unwrap(), None);
+        
+        // Push and pop
+        vec.push("a".to_string()).unwrap();
+        vec.push("b".to_string()).unwrap();
+        vec.push("c".to_string()).unwrap();
+        
+        assert_eq!(vec.pop().unwrap(), Some("c".to_string()));
+        assert_eq!(vec.len().unwrap(), 2);
+        assert_eq!(vec.pop().unwrap(), Some("b".to_string()));
+        assert_eq!(vec.len().unwrap(), 1);
+        assert_eq!(vec.pop().unwrap(), Some("a".to_string()));
+        assert_eq!(vec.len().unwrap(), 0);
+        assert_eq!(vec.pop().unwrap(), None);
+    }
+    
+    #[test]
+    fn test_iteration() {
+        let (_temp, db) = setup_test_db();
+        let mut vec = DurableVec::<i32>::new(&db, "iter_vec").unwrap();
+        
+        // Add elements
+        let values = vec![10, 20, 30, 40, 50];
+        vec.extend(values.clone()).unwrap();
+        
+        // Iterate and collect
+        let collected = vec.iter().unwrap();
+        
+        assert_eq!(collected, values);
+    }
+    
+    #[test]
+    fn test_extend() {
+        let (_temp, db) = setup_test_db();
+        let mut vec = DurableVec::<String>::new(&db, "extend_vec").unwrap();
+        
+        // Extend with iterator
+        vec.extend(vec!["a", "b", "c"].into_iter().map(String::from)).unwrap();
+        assert_eq!(vec.len().unwrap(), 3);
+        
+        // Extend again
+        vec.extend(vec!["d", "e"].into_iter().map(String::from)).unwrap();
+        assert_eq!(vec.len().unwrap(), 5);
+        
+        // Verify all elements
+        let all = vec.iter().unwrap();
+        assert_eq!(all, vec!["a", "b", "c", "d", "e"]);
+    }
+    
+    #[test]
+    fn test_large_dataset() {
+        let (_temp, db) = setup_test_db();
+        let mut vec = DurableVec::<u64>::new(&db, "large_vec").unwrap();
+        
+        // Push many elements
+        let count = 1000;
+        for i in 0..count {
+            vec.push(i).unwrap();
+        }
+        
+        assert_eq!(vec.len().unwrap(), count as usize);
+        
+        // Verify some random accesses
+        assert_eq!(vec.get(0).unwrap(), Some(0));
+        assert_eq!(vec.get(500).unwrap(), Some(500));
+        assert_eq!(vec.get(999).unwrap(), Some(999));
+        assert_eq!(vec.get(1000).unwrap(), None);
+        
+        // Verify iteration count
+        let iter_values = vec.iter().unwrap();
+        assert_eq!(iter_values.len(), count as usize);
+    }
+    
+    #[test] 
+    fn test_complex_types() {
+        use serde::{Serialize, Deserialize};
+        
+        #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+        struct User {
+            id: u64,
+            name: String,
+            email: String,
+            active: bool,
+        }
+        
+        let (_temp, db) = setup_test_db();
+        let mut vec = DurableVec::<User>::new(&db, "users").unwrap();
+        
+        let user1 = User {
+            id: 1,
+            name: "Alice".to_string(),
+            email: "alice@example.com".to_string(),
+            active: true,
+        };
+        
+        let user2 = User {
+            id: 2,
+            name: "Bob".to_string(),
+            email: "bob@example.com".to_string(),
+            active: false,
+        };
+        
+        vec.push(user1.clone()).unwrap();
+        vec.push(user2.clone()).unwrap();
+        
+        assert_eq!(vec.get(0).unwrap(), Some(user1));
+        assert_eq!(vec.get(1).unwrap(), Some(user2));
+    }
+    
+    #[test]
+    fn test_empty_vec_operations() {
+        let (_temp, db) = setup_test_db();
+        let vec = DurableVec::<i32>::new(&db, "empty_vec").unwrap();
+        
+        // Test operations on empty vec
+        assert_eq!(vec.len().unwrap(), 0);
+        assert!(vec.is_empty().unwrap());
+        assert_eq!(vec.get(0).unwrap(), None);
+        assert_eq!(vec.get(100).unwrap(), None);
+        assert_eq!(vec.iter().unwrap(), vec![]);
+    }
+    
+    #[test]
+    fn test_multiple_vecs_same_db() {
+        let (_temp, db) = setup_test_db();
+        
+        // Create multiple vectors with different names
+        let mut vec1 = DurableVec::<String>::new(&db, "vec1").unwrap();
+        let mut vec2 = DurableVec::<String>::new(&db, "vec2").unwrap();
+        
+        // Push different data to each
+        vec1.push("vec1_data".to_string()).unwrap();
+        vec2.push("vec2_data".to_string()).unwrap();
+        
+        // Verify they don't interfere
+        assert_eq!(vec1.get(0).unwrap(), Some("vec1_data".to_string()));
+        assert_eq!(vec2.get(0).unwrap(), Some("vec2_data".to_string()));
+        assert_eq!(vec1.len().unwrap(), 1);
+        assert_eq!(vec2.len().unwrap(), 1);
+    }
+    
+    #[test]
+    fn test_batch_atomicity() {
+        let (_temp, db) = setup_test_db();
+        let mut vec = DurableVec::<i32>::new(&db, "batch_vec").unwrap();
+        
+        // Add initial data
+        vec.push(1).unwrap();
+        vec.push(2).unwrap();
+        vec.push(3).unwrap();
+        
+        // Verify initial state
+        assert_eq!(vec.len().unwrap(), 3);
+        
+        // Clear should be atomic - either all elements deleted or none
+        vec.clear().unwrap();
+        assert_eq!(vec.len().unwrap(), 0);
+        
+        // Extend should be atomic - either all elements added or none
+        vec.extend(vec![10, 20, 30, 40, 50]).unwrap();
+        assert_eq!(vec.len().unwrap(), 5);
+        let all = vec.iter().unwrap();
+        assert_eq!(all, vec![10, 20, 30, 40, 50]);
+    }
+    
+    #[test]
+    fn test_unicode_strings() {
+        let (_temp, db) = setup_test_db();
+        let mut vec = DurableVec::<String>::new(&db, "unicode_vec").unwrap();
+        
+        let test_strings = vec![
+            "Hello, 世界!".to_string(),
+            "🦀 Rust 🚀".to_string(),
+            "Ñoño".to_string(),
+            "🏴‍☠️ Pirates".to_string(),
+        ];
+        
+        vec.extend(test_strings.clone()).unwrap();
+        
+        let retrieved = vec.iter().unwrap();
+        assert_eq!(retrieved, test_strings);
+    }
+}
+
+#[cfg(all(test, not(miri)))] // Skip proptest under miri
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+    use tempfile::TempDir;
+    
+    fn setup_test_db() -> (TempDir, Db) {
+        let temp_dir = TempDir::new().unwrap();
+        let db = Db::open(temp_dir.path()).unwrap();
+        (temp_dir, db)
+    }
+    
+    proptest! {
+        #[test]
+        fn prop_push_get_consistency(values: Vec<i32>) {
+            let (_temp, db) = setup_test_db();
+            let mut vec = DurableVec::<i32>::new(&db, "prop_vec").unwrap();
+            
+            // Push all values
+            for value in &values {
+                vec.push(*value).unwrap();
+            }
+            
+            // Verify length
+            prop_assert_eq!(vec.len().unwrap(), values.len());
+            
+            // Verify all values can be retrieved correctly
+            for (i, expected) in values.iter().enumerate() {
+                prop_assert_eq!(vec.get(i).unwrap(), Some(*expected));
+            }
+        }
+        
+        #[test]
+        fn prop_extend_iter_roundtrip(values: Vec<String>) {
+            let (_temp, db) = setup_test_db();
+            let mut vec = DurableVec::<String>::new(&db, "extend_vec").unwrap();
+            
+            // Extend with all values
+            vec.extend(values.clone()).unwrap();
+            
+            // Get back via iteration
+            let retrieved = vec.iter().unwrap();
+            
+            prop_assert_eq!(retrieved, values);
+        }
+        
+        #[test]
+        fn prop_pop_removes_last(mut values: Vec<u64>) {
+            let (_temp, db) = setup_test_db();
+            let mut vec = DurableVec::<u64>::new(&db, "pop_vec").unwrap();
+            
+            // Add all values
+            vec.extend(values.clone()).unwrap();
+            
+            // Pop values and verify
+            while let Some(expected) = values.pop() {
+                let popped = vec.pop().unwrap();
+                prop_assert_eq!(popped, Some(expected));
+                prop_assert_eq!(vec.len().unwrap(), values.len());
+            }
+            
+            // Vector should be empty
+            prop_assert!(vec.is_empty().unwrap());
+            prop_assert_eq!(vec.pop().unwrap(), None);
+        }
+        
+        #[test]
+        fn prop_clear_makes_empty(values: Vec<i32>) {
+            let (_temp, db) = setup_test_db();
+            let mut vec = DurableVec::<i32>::new(&db, "clear_vec").unwrap();
+            
+            // Add values
+            vec.extend(values).unwrap();
+            
+            // Clear
+            vec.clear().unwrap();
+            
+            // Should be empty
+            prop_assert_eq!(vec.len().unwrap(), 0);
+            prop_assert!(vec.is_empty().unwrap());
+            prop_assert_eq!(vec.get(0).unwrap(), None);
+        }
+    }
+}
+
+================
+File: LICENSE
+================
+Apache License
+                           Version 2.0, January 2004
+                        http://www.apache.org/licenses/
+
+   TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
+
+   1. Definitions.
+
+      "License" shall mean the terms and conditions for use, reproduction,
+      and distribution as defined by Sections 1 through 9 of this document.
+
+      "Licensor" shall mean the copyright owner or entity authorized by
+      the copyright owner that is granting the License.
+
+      "Legal Entity" shall mean the union of the acting entity and all
+      other entities that control, are controlled by, or are under common
+      control with that entity. For the purposes of this definition,
+      "control" means (i) the power, direct or indirect, to cause the
+      direction or management of such entity, whether by contract or
+      otherwise, or (ii) ownership of fifty percent (50%) or more of the
+      outstanding shares, or (iii) beneficial ownership of such entity.
+
+      "You" (or "Your") shall mean an individual or Legal Entity
+      exercising permissions granted by this License.
+
+      "Source" form shall mean the preferred form for making modifications,
+      including but not limited to software source code, documentation
+      source, and configuration files.
+
+      "Object" form shall mean any form resulting from mechanical
+      transformation or translation of a Source form, including but
+      not limited to compiled object code, generated documentation,
+      and conversions to other media types.
+
+      "Work" shall mean the work of authorship, whether in Source or
+      Object form, made available under the License, as indicated by a
+      copyright notice that is included in or attached to the work
+      (an example is provided in the Appendix below).
+
+      "Derivative Works" shall mean any work, whether in Source or Object
+      form, that is based on (or derived from) the Work and for which the
+      editorial revisions, annotations, elaborations, or other modifications
+      represent, as a whole, an original work of authorship. For the purposes
+      of this License, Derivative Works shall not include works that remain
+      separable from, or merely link (or bind by name) to the interfaces of,
+      the Work and Derivative Works thereof.
+
+      "Contribution" shall mean any work of authorship, including
+      the original version of the Work and any modifications or additions
+      to that Work or Derivative Works thereof, that is intentionally
+      submitted to Licensor for inclusion in the Work by the copyright owner
+      or by an individual or Legal Entity authorized to submit on behalf of
+      the copyright owner. For the purposes of this definition, "submitted"
+      means any form of electronic, verbal, or written communication sent
+      to the Licensor or its representatives, including but not limited to
+      communication on electronic mailing lists, source code control systems,
+      and issue tracking systems that are managed by, or on behalf of, the
+      Licensor for the purpose of discussing and improving the Work, but
+      excluding communication that is conspicuously marked or otherwise
+      designated in writing by the copyright owner as "Not a Contribution."
+
+      "Contributor" shall mean Licensor and any individual or Legal Entity
+      on behalf of whom a Contribution has been received by Licensor and
+      subsequently incorporated within the Work.
+
+   2. Grant of Copyright License. Subject to the terms and conditions of
+      this License, each Contributor hereby grants to You a perpetual,
+      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
+      copyright license to reproduce, prepare Derivative Works of,
+      publicly display, publicly perform, sublicense, and distribute the
+      Work and such Derivative Works in Source or Object form.
+
+   3. Grant of Patent License. Subject to the terms and conditions of
+      this License, each Contributor hereby grants to You a perpetual,
+      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
+      (except as stated in this section) patent license to make, have made,
+      use, offer to sell, sell, import, and otherwise transfer the Work,
+      where such license applies only to those patent claims licensable
+      by such Contributor that are necessarily infringed by their
+      Contribution(s) alone or by combination of their Contribution(s)
+      with the Work to which such Contribution(s) was submitted. If You
+      institute patent litigation against any entity (including a
+      cross-claim or counterclaim in a lawsuit) alleging that the Work
+      or a Contribution incorporated within the Work constitutes direct
+      or contributory patent infringement, then any patent licenses
+      granted to You under this License for that Work shall terminate
+      as of the date such litigation is filed.
+
+   4. Redistribution. You may reproduce and distribute copies of the
+      Work or Derivative Works thereof in any medium, with or without
+      modifications, and in Source or Object form, provided that You
+      meet the following conditions:
+
+      (a) You must give any other recipients of the Work or
+          Derivative Works a copy of this License; and
+
+      (b) You must cause any modified files to carry prominent notices
+          stating that You changed the files; and
+
+      (c) You must retain, in the Source form of any Derivative Works
+          that You distribute, all copyright, patent, trademark, and
+          attribution notices from the Source form of the Work,
+          excluding those notices that do not pertain to any part of
+          the Derivative Works; and
+
+      (d) If the Work includes a "NOTICE" text file as part of its
+          distribution, then any Derivative Works that You distribute must
+          include a readable copy of the attribution notices contained
+          within such NOTICE file, excluding those notices that do not
+          pertain to any part of the Derivative Works, in at least one
+          of the following places: within a NOTICE text file distributed
+          as part of the Derivative Works; within the Source form or
+          documentation, if provided along with the Derivative Works; or,
+          within a display generated by the Derivative Works, if and
+          wherever such third-party notices normally appear. The contents
+          of the NOTICE file are for informational purposes only and
+          do not modify the License. You may add Your own attribution
+          notices within Derivative Works that You distribute, alongside
+          or as an addendum to the NOTICE text from the Work, provided
+          that such additional attribution notices cannot be construed
+          as modifying the License.
+
+      You may add Your own copyright statement to Your modifications and
+      may provide additional or different license terms and conditions
+      for use, reproduction, or distribution of Your modifications, or
+      for any such Derivative Works as a whole, provided Your use,
+      reproduction, and distribution of the Work otherwise complies with
+      the conditions stated in this License.
+
+   5. Submission of Contributions. Unless You explicitly state otherwise,
+      any Contribution intentionally submitted for inclusion in the Work
+      by You to the Licensor shall be under the terms and conditions of
+      this License, without any additional terms or conditions.
+      Notwithstanding the above, nothing herein shall supersede or modify
+      the terms of any separate license agreement you may have executed
+      with Licensor regarding such Contributions.
+
+   6. Trademarks. This License does not grant permission to use the trade
+      names, trademarks, service marks, or product names of the Licensor,
+      except as required for reasonable and customary use in describing the
+      origin of the Work and reproducing the content of the NOTICE file.
+
+   7. Disclaimer of Warranty. Unless required by applicable law or
+      agreed to in writing, Licensor provides the Work (and each
+      Contributor provides its Contributions) on an "AS IS" BASIS,
+      WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+      implied, including, without limitation, any warranties or conditions
+      of TITLE, NON-INFRINGEMENT, MERCHANTABILITY, or FITNESS FOR A
+      PARTICULAR PURPOSE. You are solely responsible for determining the
+      appropriateness of using or redistributing the Work and assume any
+      risks associated with Your exercise of permissions under this License.
+
+   8. Limitation of Liability. In no event and under no legal theory,
+      whether in tort (including negligence), contract, or otherwise,
+      unless required by applicable law (such as deliberate and grossly
+      negligent acts) or agreed to in writing, shall any Contributor be
+      liable to You for damages, including any direct, indirect, special,
+      incidental, or consequential damages of any character arising as a
+      result of this License or out of the use or inability to use the
+      Work (including but not limited to damages for loss of goodwill,
+      work stoppage, computer failure or malfunction, or any and all
+      other commercial damages or losses), even if such Contributor
+      has been advised of the possibility of such damages.
+
+   9. Accepting Warranty or Additional Liability. While redistributing
+      the Work or Derivative Works thereof, You may choose to offer,
+      and charge a fee for, acceptance of support, warranty, indemnity,
+      or other liability obligations and/or rights consistent with this
+      License. However, in accepting such obligations, You may act only
+      on Your own behalf and on Your sole responsibility, not on behalf
+      of any other Contributor, and only if You agree to indemnify,
+      defend, and hold each Contributor harmless for any liability
+      incurred by, or claims asserted against, such Contributor by reason
+      of your accepting any such warranty or additional liability.
+
+   END OF TERMS AND CONDITIONS
+
+   APPENDIX: How to apply the Apache License to your work.
+
+      To apply the Apache License to your work, attach the following
+      boilerplate notice, with the fields enclosed by brackets "[]"
+      replaced with your own identifying information. (Don't include
+      the brackets!)  The text should be enclosed in the appropriate
+      comment syntax for the file format. We also recommend that a
+      file or class name and description of purpose be included on the
+      same "printed page" as the copyright notice for easier
+      identification within third-party archives.
+
+   Copyright [yyyy] [name of copyright owner]
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+
+================
+File: repomix.config.json
+================
+{
+  "output": {
+    "filePath": "all.txt",
+    "style": "plain",
+    "parsableStyle": false,
+    "fileSummary": true,
+    "directoryStructure": true,
+    "removeComments": false,
+    "removeEmptyLines": false,
+    "compress": false,
+    "topFilesLength": 100,
+    "showLineNumbers": false,
+    "copyToClipboard": false
+  },
+  "include": [],
+  "ignore": {
+    "useGitignore": true,
+    "useDefaultPatterns": true,
+    "customPatterns": []
+  },
+  "security": {
+    "enableSecurityCheck": true
+  },
+  "tokenCount": {
+    "encoding": "o200k_base"
+  }
+}
+
+================
+File: todo.tdsl
+================
+Add streaming iterators to avoid loading entire collections
+Implement collection nesting (e.g., DurableMap<String, DurableVec<T>>)
+Add benchmarks to measure performance
+Implement schema versioning and migrations
+
+================
+File: src/lib.rs
+================
+//! Durable - RocksDB-backed persistent data structures for Rust
+
+use std::path::Path;
+use std::sync::Arc;
+use rocksdb::{DB as RocksDB, Options, WriteBatch};
+use thiserror::Error;
+
+pub mod vec;
+pub use vec::DurableVec;
+
+/// Error types for Durable operations
+#[derive(Error, Debug)]
+pub enum DurableError {
+    #[error("RocksDB error: {0}")]
+    RocksDB(#[from] rocksdb::Error),
+    
+    #[error("Serialization error: {0}")]
+    Serialization(#[from] bincode::Error),
+    
+    #[error("Key not found")]
+    KeyNotFound,
+    
+    #[error("Collection not found: {0}")]
+    CollectionNotFound(String),
+    
+    #[error("Data corruption: {0}")]
+    Corruption(String),
+}
+
+pub type Result<T> = std::result::Result<T, DurableError>;
+
+/// The main database handle
+#[derive(Clone)]
+pub struct Db {
+    inner: Arc<RocksDB>,
+}
+
+impl Db {
+    /// Opens or creates a durable database at the given path
+    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let mut opts = Options::default();
+        opts.create_if_missing(true);
+        opts.create_missing_column_families(true);
+        
+        let db = RocksDB::open(&opts, path)?;
+        Ok(Db { 
+            inner: Arc::new(db),
+        })
+    }
+    
+    /// Create a new write batch for atomic operations
+    pub fn batch(&self) -> Batch {
+        Batch {
+            db: self.clone(),
+            inner: WriteBatch::default(),
+        }
+    }
+    
+    /// Get the underlying RocksDB handle (for advanced usage)
+    pub(crate) fn rocks(&self) -> &RocksDB {
+        &self.inner
+    }
+}
+
+/// A write batch for atomic operations
+pub struct Batch {
+    db: Db,
+    inner: WriteBatch,
+}
+
+impl Batch {
+    /// Commit all operations in this batch atomically
+    pub fn commit(self) -> Result<()> {
+        self.db.rocks().write(self.inner)?;
+        self.db.rocks().flush_wal(true)?;
+        Ok(())
+    }
+}
+
+================
+File: .gitignore
+================
+# Generated by Cargo
+# will have compiled files and executables
+debug/
+target/
+
+# These are backup files generated by rustfmt
+**/*.rs.bk
+
+# MSVC Windows builds of rustc generate these, which store debugging information
+*.pdb
+
+# Generated by cargo mutants
+# Contains mutation testing data
+**/mutants.out*/
+
+# RustRover
+#  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
+#  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
+#  and can be added to the global gitignore or merged into this file.  For a more nuclear
+#  option (not recommended) you can uncomment the following to ignore the entire idea folder.
+#.idea/
+
+
+# Added by cargo
+
+/target
+
+
+# Added by cargo
+#
+# already existing elements were commented out
+
+#/target
+
+================
+File: Cargo.toml
+================
+[package]
+name = "durable"
+version = "0.1.0"
+edition = "2021"
+authors = ["Durable Contributors"]
+description = "RocksDB-backed persistent data structures for Rust"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+rocksdb = "0.21"
+serde = { version = "1.0", features = ["derive"] }
+bincode = "1.3"
+thiserror = "1.0"
+
+[dev-dependencies]
+tempfile = "3.8"
+criterion = "0.5"
+proptest = "1.4"
+
+================
+File: README.md
+================
+# Durable
+
+RocksDB-backed persistent data structures for Rust. Think `std::collections` but on disk!
+
+## Features
+
+- **Persistent Collections**: `DurableVec`, `DurableMap` (coming soon), `DurableSet` (coming soon)
+- **Type-Safe**: Full Rust type safety with serde serialization
+- **ACID Guarantees**: All operations are atomic and crash-safe
+- **Zero-Copy Capable**: Efficient iteration without loading entire collections
+- **Embedded**: No external services required - just a directory on disk
+
+## Quick Start
+
+Add to your `Cargo.toml`:
+
+```toml
+[dependencies]
+durable = "0.1.0"
+```
+
+## Example
+
+```rust
+use durable::{Db, DurableVec};
+use serde::{Serialize, Deserialize};
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Task {
+    id: u64,
+    title: String,
+    completed: bool,
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Open or create a database
+    let db = Db::open("my_db")?;
+    
+    // Create a persistent vector
+    let mut tasks = DurableVec::<Task>::new(&db, "tasks")?;
+    
+    // Use it like a normal Vec!
+    tasks.push(Task {
+        id: 1,
+        title: "Build something amazing".to_string(),
+        completed: false,
+    })?;
+    
+    // Data persists across program restarts
+    println!("Total tasks: {}", tasks.len()?);
+    
+    Ok(())
+}
+```
+
+## Current Status
+
+### Implemented
+
+- ✅ `DurableVec<T>` with full test coverage including:
+  - Basic operations: `push`, `pop`, `get`, `len`, `clear`
+  - Batch operations: `extend`
+  - Iteration: `iter()` returns `Vec<T>` (streaming iteration coming soon)
+  - Property-based testing with proptest
+  - Unicode string support
+  - Complex type support
+
+### Coming Soon
+
+- 🚧 `DurableMap<K, V>` - Persistent HashMap
+- 🚧 `DurableSet<T>` - Persistent HashSet  
+- 🚧 Streaming iterators for better memory efficiency
+- 🚧 Collection nesting (e.g., `DurableMap<String, DurableVec<T>>`)
+- 🚧 Schema migration support
+
+## Performance
+
+DurableVec operations are designed to be efficient:
+
+- `push`: Single atomic write with WAL flush
+- `get`: Direct key lookup, O(1) 
+- `extend`: Batched writes for efficiency
+- `clear`: Atomic batch deletion
+
+## Testing
+
+Run the test suite:
+
+```bash
+cargo test
+```
+
+Run the example:
+
+```bash
+cargo run --example vec_example
+```
+
+## License
+
+Licensed under either of:
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
+
+at your option.
+
+## Contributing
+
+Contributions are welcome! Please feel free to submit a Pull Request.
+
+
+
+================================================================
+End of Codebase
+================================================================
