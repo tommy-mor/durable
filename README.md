@@ -116,13 +116,14 @@ All operations are designed to be efficient:
 - **DurableVec**:
   - `push`: Single atomic write with WAL flush
   - `get`: Direct key lookup, O(1) 
+  - `len`: Metadata lookup, O(1)
   - `extend`: Batched writes for efficiency
   - `clear`: Atomic batch deletion
 
 - **DurableMap**:
   - `insert`/`get`: Direct key lookup, O(1) average
   - `remove`: Single delete with WAL flush
-  - `len`: O(n) scan (can be optimized with metadata)
+  - `len`: Metadata lookup, O(1)
   - `extend`: Batched writes for efficiency
 
 ## Testing

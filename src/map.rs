@@ -1,4 +1,4 @@
-use crate::{Db, Result};
+use crate::{Db, Result, DurableError};
 use rocksdb::{IteratorMode, WriteBatch, Direction};
 use serde::{Serialize, Deserialize};
 use std::marker::PhantomData;
@@ -34,9 +34,21 @@ where
         // Get the old value if it exists
         let old_value = self.get(&key)?;
         
+        let mut batch = WriteBatch::default();
+        
         // Write the new value
         let db_key = self.entry_key(&key_bytes);
-        self.db.rocks().put(&db_key, &value_bytes)?;
+        batch.put(&db_key, &value_bytes);
+        
+        // Update length if this is a new key
+        if old_value.is_none() {
+            let new_len = self.len()? + 1;
+            let len_key = self.meta_key("len");
+            batch.put(&len_key, &(new_len as u64).to_le_bytes());
+        }
+        
+        // Commit atomically
+        self.db.rocks().write(batch)?;
         self.db.rocks().flush_wal(true)?;
         
         Ok(old_value)
@@ -78,9 +90,20 @@ where
             None => None,
         };
         
-        // Delete the key if it existed
+        // Delete the key if it existed and update length
         if old_value.is_some() {
-            self.db.rocks().delete(&db_key)?;
+            let mut batch = WriteBatch::default();
+            
+            // Delete the entry
+            batch.delete(&db_key);
+            
+            // Update length
+            let new_len = self.len()? - 1;
+            let len_key = self.meta_key("len");
+            batch.put(&len_key, &(new_len as u64).to_le_bytes());
+            
+            // Commit atomically
+            self.db.rocks().write(batch)?;
             self.db.rocks().flush_wal(true)?;
         }
         
@@ -89,19 +112,18 @@ where
     
     /// Get the number of entries in the map
     pub fn len(&self) -> Result<usize> {
-        let prefix = self.entry_prefix();
-        let iter = self.db.rocks().iterator(IteratorMode::From(&prefix, Direction::Forward));
-        
-        let mut count = 0;
-        for item in iter {
-            let (key, _) = item?;
-            if !key.starts_with(&prefix) {
-                break;
+        let key = self.meta_key("len");
+        match self.db.rocks().get(&key)? {
+            Some(bytes) => {
+                if bytes.len() != 8 {
+                    return Err(DurableError::Corruption("Invalid length bytes size".into()));
+                }
+                let len_bytes: [u8; 8] = bytes[..8].try_into()
+                    .map_err(|_| DurableError::Corruption("Invalid length bytes".into()))?;
+                Ok(u64::from_le_bytes(len_bytes) as usize)
             }
-            count += 1;
+            None => Ok(0),
         }
-        
-        Ok(count)
     }
     
     /// Check if the map is empty
@@ -123,6 +145,10 @@ where
             }
             batch.delete(&key);
         }
+        
+        // Reset length to 0
+        let len_key = self.meta_key("len");
+        batch.delete(&len_key);
         
         // Commit atomically
         self.db.rocks().write(batch)?;
@@ -209,12 +235,27 @@ where
         I: IntoIterator<Item = (K, V)>
     {
         let mut batch = WriteBatch::default();
+        let current_len = self.len()?;
+        let mut new_entries = 0;
         
         for (key, value) in iter {
             let key_bytes = bincode::serialize(&key)?;
             let value_bytes = bincode::serialize(&value)?;
             let db_key = self.entry_key(&key_bytes);
+            
+            // Check if this is a new key
+            if !self.contains_key(&key)? {
+                new_entries += 1;
+            }
+            
             batch.put(&db_key, &value_bytes);
+        }
+        
+        // Update length if we added new entries
+        if new_entries > 0 {
+            let new_len = current_len + new_entries;
+            let len_key = self.meta_key("len");
+            batch.put(&len_key, &(new_len as u64).to_le_bytes());
         }
         
         // Commit atomically
@@ -237,6 +278,13 @@ where
         let mut prefix = self.prefix.clone();
         prefix.extend_from_slice(b":entry:");
         prefix
+    }
+    
+    fn meta_key(&self, meta_type: &str) -> Vec<u8> {
+        let mut key = self.prefix.clone();
+        key.extend_from_slice(b":__meta:");
+        key.extend_from_slice(meta_type.as_bytes());
+        key
     }
 }
 
@@ -595,6 +643,57 @@ mod tests {
         assert_eq!(collected1.len(), 3);
         assert_eq!(collected2.len(), 1);
         assert_eq!(collected2[0], ("dave".to_string(), 400));
+    }
+    
+    #[test]
+    fn test_metadata_length_tracking() {
+        let (_temp, db) = setup_test_db();
+        let mut map = DurableMap::<String, String>::new(&db, "length_map").unwrap();
+        
+        // Empty map
+        assert_eq!(map.len().unwrap(), 0);
+        assert!(map.is_empty().unwrap());
+        
+        // Insert operations should update length
+        map.insert("key1".to_string(), "value1".to_string()).unwrap();
+        assert_eq!(map.len().unwrap(), 1);
+        
+        map.insert("key2".to_string(), "value2".to_string()).unwrap();
+        assert_eq!(map.len().unwrap(), 2);
+        
+        // Updating existing key should not change length
+        map.insert("key1".to_string(), "new_value1".to_string()).unwrap();
+        assert_eq!(map.len().unwrap(), 2);
+        
+        // Remove operations should update length
+        map.remove(&"key1".to_string()).unwrap();
+        assert_eq!(map.len().unwrap(), 1);
+        
+        // Removing non-existent key should not change length
+        map.remove(&"non_existent".to_string()).unwrap();
+        assert_eq!(map.len().unwrap(), 1);
+        
+        // Extend should update length correctly
+        let data = vec![
+            ("key3".to_string(), "value3".to_string()),
+            ("key4".to_string(), "value4".to_string()),
+            ("key5".to_string(), "value5".to_string()),
+        ];
+        map.extend(data).unwrap();
+        assert_eq!(map.len().unwrap(), 4); // key2 + 3 new keys
+        
+        // Extend with existing keys should only count new ones
+        let mixed_data = vec![
+            ("key2".to_string(), "updated_value2".to_string()), // existing
+            ("key6".to_string(), "value6".to_string()),         // new
+        ];
+        map.extend(mixed_data).unwrap();
+        assert_eq!(map.len().unwrap(), 5); // only key6 was new
+        
+        // Clear should reset length to 0
+        map.clear().unwrap();
+        assert_eq!(map.len().unwrap(), 0);
+        assert!(map.is_empty().unwrap());
     }
 }
 
