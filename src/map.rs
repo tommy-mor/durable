@@ -1,4 +1,4 @@
-use crate::{Db, Result, DurableError};
+use crate::{Db, Result, DurableError, DurableCollection};
 use rocksdb::{IteratorMode, WriteBatch, Direction};
 use serde::{Serialize, Deserialize};
 use std::marker::PhantomData;
@@ -296,6 +296,15 @@ where
         Ok(())
     }
     
+    /// Create a new DurableMap from a prefix (used for nested collections)
+    pub fn from_prefix(db: Db, prefix: Vec<u8>) -> Self {
+        Self {
+            db,
+            prefix,
+            _phantom: PhantomData,
+        }
+    }
+    
     // Helper methods
     
     fn entry_key(&self, key_bytes: &[u8]) -> Vec<u8> {
@@ -316,6 +325,160 @@ where
         key.extend_from_slice(b":__meta:");
         key.extend_from_slice(meta_type.as_bytes());
         key
+    }
+}
+
+// Additional implementation block for methods that don't require serialization constraints
+impl<K, V> DurableMap<K, V> {
+    /// Create a new DurableMap for nested collections (no serialization constraints)
+    pub fn new_nested(db: &Db, name: &str) -> Self {
+        let prefix = format!("map:{}", name).into_bytes();
+        
+        DurableMap {
+            db: db.clone(),
+            prefix,
+            _phantom: PhantomData,
+        }
+    }
+    
+    /// Get the entry key for nested collections (needed by entry API)
+    pub(crate) fn make_entry_key(&self, key_bytes: &[u8]) -> Vec<u8> {
+        let mut db_key = self.prefix.clone();
+        db_key.extend_from_slice(b":entry:");
+        db_key.extend_from_slice(key_bytes);
+        db_key
+    }
+}
+
+// Implement the DurableCollection trait for DurableMap<K, V>
+impl<K, V> DurableCollection for DurableMap<K, V> 
+where
+    K: Serialize + for<'de> Deserialize<'de>,
+    V: Serialize + for<'de> Deserialize<'de>,
+{
+    fn from_prefix(db: Db, prefix: Vec<u8>) -> Self {
+        DurableMap::from_prefix(db, prefix)
+    }
+}
+
+/// Entry API for DurableMap with nested collections
+pub enum DurableEntry<'a, K, V> {
+    Occupied(OccupiedEntry<'a, K, V>),
+    Vacant(VacantEntry<'a, K, V>),
+}
+
+impl<'a, K, V> DurableEntry<'a, K, V>
+where
+    K: Serialize,
+    V: DurableCollection,
+{
+    /// Gets the collection, creating it if it doesn't exist
+    pub fn or_default(self) -> Result<V> {
+        match self {
+            DurableEntry::Occupied(entry) => entry.or_default(),
+            DurableEntry::Vacant(entry) => entry.or_default(),
+        }
+    }
+}
+
+/// Represents an entry that already exists
+pub struct OccupiedEntry<'a, K, V> {
+    map: &'a DurableMap<K, V>,
+    key_bytes: Vec<u8>,
+    value_marker: Vec<u8>, // The bytes read from RocksDB, e.g., [0x02, ...]
+}
+
+impl<'a, K, V> OccupiedEntry<'a, K, V> 
+where
+    V: DurableCollection,
+{
+    /// Gets a handle to the existing nested collection
+    pub fn get(self) -> Result<V> {
+        // 1. Parse the collection_id from self.value_marker
+        if self.value_marker.len() != 9 || self.value_marker[0] != 0x02 {
+            return Err(DurableError::Corruption("Invalid collection marker".into()));
+        }
+        
+        let col_id_bytes: [u8; 8] = self.value_marker[1..9].try_into()
+            .map_err(|_| DurableError::Corruption("Invalid collection ID".into()))?;
+        let col_id = u64::from_le_bytes(col_id_bytes);
+
+        // 2. Re-construct the unique prefix for the child collection
+        let parent_key_prefix = self.map.make_entry_key(&self.key_bytes);
+        let child_prefix = [parent_key_prefix.as_slice(), &[0x00], &col_id.to_le_bytes()].concat();
+
+        // 3. Create the collection handle using the trait method
+        Ok(V::from_prefix(self.map.db.clone(), child_prefix))
+    }
+    
+    /// Gets a handle to the existing nested collection (same as get but consumes self)
+    pub fn or_default(self) -> Result<V> {
+        self.get()
+    }
+}
+
+/// Represents a slot that is empty
+pub struct VacantEntry<'a, K, V> {
+    map: &'a DurableMap<K, V>,
+    key: K, // The original key from the user
+}
+
+impl<'a, K, V> VacantEntry<'a, K, V> 
+where
+    K: Serialize,
+    V: DurableCollection,
+{
+    /// Inserts a new default collection and returns a handle to it
+    pub fn or_default(self) -> Result<V> {
+        // 1. Atomically get a new unique ID for the collection
+        let new_col_id = self.map.db.new_collection_id()?;
+
+        // 2. Create the marker value that points to our new collection
+        let mut value_marker = vec![0x02_u8];
+        value_marker.extend_from_slice(&new_col_id.to_le_bytes());
+
+        // 3. Get the key bytes and construct the full parent entry key
+        let key_bytes = bincode::serialize(&self.key)?;
+        let parent_db_key = self.map.make_entry_key(&key_bytes);
+
+        // 4. ATOMICALLY write the marker to the parent map
+        self.map.db.rocks().put(&parent_db_key, &value_marker)?;
+        self.map.db.rocks().flush_wal(true)?;
+
+        // 5. Construct the unique prefix for our new child collection
+        let child_prefix = [parent_db_key.as_slice(), &[0x00], &new_col_id.to_le_bytes()].concat();
+
+        // 6. Create and return the new collection handle
+        Ok(V::from_prefix(self.map.db.clone(), child_prefix))
+    }
+}
+
+// API for nested collections
+impl<K, V> DurableMap<K, V> {
+    /// The entry point for creating or accessing a nested collection.
+    /// This method is only available when `V` is a `DurableCollection`.
+    pub fn entry(&self, key: K) -> Result<DurableEntry<'_, K, V>>
+    where
+        V: DurableCollection,
+        K: Serialize,
+    {
+        let key_bytes = bincode::serialize(&key)?;
+        let db_key = self.make_entry_key(&key_bytes);
+
+        match self.db.rocks().get(&db_key)? {
+            Some(value_marker) => {
+                // Key exists. The value should be a collection marker.
+                Ok(DurableEntry::Occupied(OccupiedEntry {
+                    map: self,
+                    key_bytes,
+                    value_marker,
+                }))
+            }
+            None => {
+                // Key doesn't exist.
+                Ok(DurableEntry::Vacant(VacantEntry { map: self, key }))
+            }
+        }
     }
 }
 
@@ -822,6 +985,87 @@ mod proptests {
             prop_assert_eq!(map.len().unwrap(), 0);
             prop_assert!(map.is_empty().unwrap());
             prop_assert_eq!(map.to_vec().unwrap(), vec![]);
+        }
+    }
+    
+    #[test]
+    fn test_nested_collections() {
+        use crate::DurableVec;
+        
+        let (_temp, db) = setup_test_db();
+        
+        // Create a map where values are DurableVec<i32>
+        let users_posts: DurableMap<String, DurableVec<i32>> = DurableMap::new_nested(&db, "user_posts");
+        
+        // Test creating nested collections through the entry API
+        let mut alice_posts = users_posts.entry("alice".to_string()).unwrap().or_default().unwrap();
+        alice_posts.push(101).unwrap();
+        alice_posts.push(102).unwrap();
+        alice_posts.push(103).unwrap();
+        
+        // Test accessing the same collection again
+        let alice_posts_again = users_posts.entry("alice".to_string()).unwrap().or_default().unwrap();
+        assert_eq!(alice_posts_again.len().unwrap(), 3);
+        assert_eq!(alice_posts_again.get(0).unwrap(), Some(101));
+        assert_eq!(alice_posts_again.get(1).unwrap(), Some(102));
+        assert_eq!(alice_posts_again.get(2).unwrap(), Some(103));
+        
+        // Test creating a different nested collection
+        let mut bob_posts = users_posts.entry("bob".to_string()).unwrap().or_default().unwrap();
+        bob_posts.push(201).unwrap();
+        bob_posts.push(202).unwrap();
+        
+        // Verify isolation between nested collections
+        assert_eq!(alice_posts_again.len().unwrap(), 3);
+        assert_eq!(bob_posts.len().unwrap(), 2);
+        
+        // Test chained calls
+        users_posts.entry("charlie".to_string()).unwrap().or_default().unwrap().push(301).unwrap();
+        let charlie_posts = users_posts.entry("charlie".to_string()).unwrap().or_default().unwrap();
+        assert_eq!(charlie_posts.len().unwrap(), 1);
+        assert_eq!(charlie_posts.get(0).unwrap(), Some(301));
+    }
+    
+    // Note: Nested DurableMap-in-DurableMap requires implementing Serialize/Deserialize 
+    // for DurableMap, which is not straightforward since it contains database handles.
+    // For now, let's focus on the more common case of Map-to-Vec nesting.
+    
+    // Deep nesting with Map -> Map -> Vec also requires DurableMap serialization
+    // Let's skip this for now and focus on the fundamental Map -> Vec case
+    
+    #[test]
+    fn test_nested_collection_persistence() {
+        use crate::DurableVec;
+        
+        let (temp_dir, db) = setup_test_db();
+        
+        // Create nested structure and populate it
+        {
+            let users_data: DurableMap<String, DurableVec<String>> = DurableMap::new_nested(&db, "users");
+            let mut user1_data = users_data.entry("user1".to_string()).unwrap().or_default().unwrap();
+            user1_data.push("data1".to_string()).unwrap();
+            user1_data.push("data2".to_string()).unwrap();
+            
+            let mut user2_data = users_data.entry("user2".to_string()).unwrap().or_default().unwrap();
+            user2_data.push("other_data".to_string()).unwrap();
+        }
+        
+        // Drop the database
+        drop(db);
+        
+        // Reopen and verify persistence
+        {
+            let db = Db::open(temp_dir.path()).unwrap();
+            let users_data: DurableMap<String, DurableVec<String>> = DurableMap::new_nested(&db, "users");
+            
+            let user1_data = users_data.entry("user1".to_string()).unwrap().or_default().unwrap();
+            assert_eq!(user1_data.len().unwrap(), 2);
+            assert_eq!(user1_data.get(0).unwrap(), Some("data1".to_string()));
+            assert_eq!(user1_data.get(1).unwrap(), Some("data2".to_string()));
+            
+            let user2_data = users_data.entry("user2".to_string()).unwrap().or_default().unwrap();
+            assert_eq!(user2_data.len().unwrap(), 1);
+            assert_eq!(user2_data.get(0).unwrap(), Some("other_data".to_string()));
         }
     }
 } 

@@ -31,6 +31,16 @@ pub enum DurableError {
 
 pub type Result<T> = std::result::Result<T, DurableError>;
 
+/// A trait for types that can be used as nested collections.
+pub trait DurableCollection {
+    /// Creates a new instance of the collection from a database handle
+    /// and a pre-determined, unique key prefix.
+    /// 
+    /// This is the key method that allows `DurableMap` to instantiate
+    /// a nested collection handle.
+    fn from_prefix(db: Db, prefix: Vec<u8>) -> Self;
+}
+
 /// The main database handle
 #[derive(Clone)]
 pub struct Db {
@@ -62,6 +72,38 @@ impl Db {
     pub(crate) fn rocks(&self) -> &RocksDB {
         &self.inner
     }
+    
+    /// Get a new unique collection ID for nested collections
+    pub fn new_collection_id(&self) -> Result<u64> {
+        let key = b"__global_meta:next_collection_id";
+        
+        // Get current value
+        let current_bytes = self.rocks().get(key)?;
+        let current_id = match current_bytes {
+            Some(bytes) => {
+                if bytes.len() != 8 {
+                    return Err(DurableError::Corruption("Invalid collection ID bytes size".into()));
+                }
+                let id_bytes: [u8; 8] = bytes[..8].try_into()
+                    .map_err(|_| DurableError::Corruption("Invalid collection ID bytes".into()))?;
+                u64::from_le_bytes(id_bytes)
+            }
+            None => 0,
+        };
+        
+        let next_id = current_id + 1;
+        
+        // Try to atomically update - use compare-and-swap semantics
+        let mut batch = WriteBatch::default();
+        batch.put(key, &next_id.to_le_bytes());
+        
+        // For now, just write it directly. In a real implementation,
+        // we'd want proper compare-and-swap to handle concurrent access
+        self.rocks().write(batch)?;
+        self.rocks().flush_wal(true)?;
+        
+        Ok(current_id)
+    }
 }
 
 /// A write batch for atomic operations
@@ -77,4 +119,5 @@ impl Batch {
         self.db.rocks().flush_wal(true)?;
         Ok(())
     }
+    
 }

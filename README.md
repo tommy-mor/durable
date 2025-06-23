@@ -88,6 +88,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+### Nested Collections
+
+Durable supports nesting collections within each other for complex data structures:
+
+```rust
+use durable::{Db, DurableMap, DurableVec};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let db = Db::open("my_db")?;
+    
+    // Create a map where each user has a list of posts
+    let user_posts: DurableMap<String, DurableVec<String>> = 
+        DurableMap::new_nested(&db, "user_posts");
+    
+    // Add posts for a user
+    let mut alice_posts = user_posts.entry("alice".to_string())?.or_default()?;
+    alice_posts.push("Hello, world!".to_string())?;
+    alice_posts.push("Rust is awesome!".to_string())?;
+    
+    // Or use chained calls for convenience
+    user_posts.entry("bob".to_string())?.or_default()?.push("First post!".to_string())?;
+    
+    // Access nested data
+    let alice_posts = user_posts.entry("alice".to_string())?.or_default()?;
+    println!("Alice has {} posts", alice_posts.len()?);
+    
+    Ok(())
+}
+```
+
+The entry API automatically creates nested collections when they don't exist, providing ergonomic access patterns similar to `std::collections::HashMap::entry().or_default()`.
+
 ## Current Status
 
 ### Implemented
@@ -108,10 +140,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
   - Complex key and value types
   - Property-based testing with proptest
 
+- ✅ **Nested Collections** with entry API:
+  - `DurableMap<K, DurableVec<T>>` - Maps to vectors
+  - `entry()` method with `or_default()` for ergonomic access
+  - Automatic collection creation and management
+  - Full persistence and isolation between nested collections
+  - Type-safe compile-time enforcement
+
 ### Coming Soon
 
 - 🚧 `DurableSet<T>` - Persistent HashSet  
-- 🚧 Collection nesting (e.g., `DurableMap<String, DurableVec<T>>`)
+- 🚧 Deep nesting (e.g., `DurableMap<String, DurableMap<String, DurableVec<T>>>`)
 - 🚧 Schema migration support
 - 🚧 Batch operations across multiple collections
 
@@ -149,6 +188,7 @@ cargo run --example vec_example
 cargo run --example map_example
 cargo run --example combined_example  # Shows both collections working together
 cargo run --example streaming_demo    # Demonstrates efficient streaming iteration
+cargo run --example nested_example   # Shows nested collections (Map -> Vec)
 ```
 
 ## License

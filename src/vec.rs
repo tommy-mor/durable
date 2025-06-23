@@ -1,4 +1,4 @@
-use crate::{Db, Result, DurableError};
+use crate::{Db, Result, DurableError, DurableCollection};
 use rocksdb::WriteBatch;
 use serde::{Serialize, Deserialize};
 use std::marker::PhantomData;
@@ -23,6 +23,15 @@ where
             prefix,
             _phantom: PhantomData,
         })
+    }
+    
+    /// Create a new DurableVec from a prefix (used for nested collections)
+    pub fn from_prefix(db: Db, prefix: Vec<u8>) -> Self {
+        Self {
+            db,
+            prefix,
+            _phantom: PhantomData,
+        }
     }
     
     /// Get the length of the vector
@@ -211,6 +220,16 @@ where
         let mut prefix = self.prefix.clone();
         prefix.push(b':');
         prefix
+    }
+}
+
+// Implement the DurableCollection trait for DurableVec<T>
+impl<T> DurableCollection for DurableVec<T> 
+where
+    T: Serialize + for<'de> Deserialize<'de>
+{
+    fn from_prefix(db: Db, prefix: Vec<u8>) -> Self {
+        DurableVec::from_prefix(db, prefix)
     }
 }
 
@@ -459,7 +478,7 @@ mod tests {
         assert!(vec.is_empty().unwrap());
         assert_eq!(vec.get(0).unwrap(), None);
         assert_eq!(vec.get(100).unwrap(), None);
-        assert_eq!(vec.to_vec().unwrap(), vec![]);
+        assert_eq!(vec.to_vec().unwrap(), Vec::<i32>::new());
     }
     
     #[test]
