@@ -107,7 +107,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     // Display all users and their message counts
     println!("\n👥 Users:");
-    let mut all_users = users.iter()?;
+    let mut all_users = users.to_vec()?;
     all_users.sort_by_key(|(username, _)| username.clone());
     
     for (username, user) in all_users {
@@ -124,7 +124,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     // Show inbox for each user
     println!("\n📥 User inboxes:");
-    for (username, _) in users.iter()? {
+    for item in users.iter() {
+        let (username, _) = item?;
         if let Some(indices) = user_message_indices.get(&username)? {
             println!("\n  {}'s inbox ({} messages):", username, indices.len());
             for &idx in &indices {

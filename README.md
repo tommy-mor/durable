@@ -97,7 +97,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 - ✅ `DurableMap<K, V>` with full test coverage including:
   - Basic operations: `insert`, `get`, `remove`, `contains_key`, `len`, `clear`
   - Batch operations: `extend`
-  - Iteration: `iter()`, `keys()`, `values()`
+  - Iteration: `iter()`, `keys()`, `values()` return streaming iterators
+  - Memory loading: `to_vec()`, `keys_vec()`, `values_vec()` for convenience
   - Complex key and value types
   - Property-based testing with proptest
 
@@ -107,7 +108,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 - 🚧 Collection nesting (e.g., `DurableMap<String, DurableVec<T>>`)
 - 🚧 Schema migration support
 - 🚧 Batch operations across multiple collections
-- 🚧 Streaming iterators for `DurableMap`
 
 ## Performance
 
@@ -139,6 +139,7 @@ Run the examples:
 cargo run --example vec_example
 cargo run --example map_example
 cargo run --example combined_example  # Shows both collections working together
+cargo run --example streaming_demo    # Demonstrates efficient streaming iteration
 ```
 
 ## License

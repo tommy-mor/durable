@@ -131,69 +131,75 @@ where
         Ok(())
     }
     
-    /// Iterate over all key-value pairs
-    pub fn iter(&self) -> Result<Vec<(K, V)>> {
+    /// Iterate over all key-value pairs using a streaming iterator
+    pub fn iter(&self) -> MapIterator<'_, K, V> {
         let prefix = self.entry_prefix();
         let iter = self.db.rocks().iterator(IteratorMode::From(&prefix, Direction::Forward));
         
-        let mut result = Vec::new();
-        for item in iter {
-            let (db_key, value_bytes) = item?;
-            if !db_key.starts_with(&prefix) {
-                break;
-            }
-            
-            // Extract the key part (skip prefix and separator)
-            let key_start = prefix.len();
-            let key_bytes = &db_key[key_start..];
-            
-            let key: K = bincode::deserialize(key_bytes)?;
-            let value: V = bincode::deserialize(&value_bytes)?;
-            result.push((key, value));
+        MapIterator {
+            inner: iter,
+            prefix,
+            _phantom: PhantomData,
         }
-        
+    }
+    
+    /// Load all key-value pairs into a Vec
+    /// 
+    /// Note: This loads the entire collection into memory. For large collections,
+    /// prefer using `iter()` which streams elements.
+    pub fn to_vec(&self) -> Result<Vec<(K, V)>> {
+        let mut result = Vec::new();
+        for item in self.iter() {
+            result.push(item?);
+        }
         Ok(result)
     }
     
-    /// Iterate over all keys
-    pub fn keys(&self) -> Result<Vec<K>> {
+    /// Iterate over all keys using a streaming iterator
+    pub fn keys(&self) -> KeyIterator<'_, K, V> {
         let prefix = self.entry_prefix();
         let iter = self.db.rocks().iterator(IteratorMode::From(&prefix, Direction::Forward));
         
-        let mut result = Vec::new();
-        for item in iter {
-            let (db_key, _) = item?;
-            if !db_key.starts_with(&prefix) {
-                break;
-            }
-            
-            // Extract the key part
-            let key_start = prefix.len();
-            let key_bytes = &db_key[key_start..];
-            
-            let key: K = bincode::deserialize(key_bytes)?;
-            result.push(key);
+        KeyIterator {
+            inner: iter,
+            prefix,
+            _phantom: PhantomData,
         }
-        
+    }
+    
+    /// Load all keys into a Vec
+    /// 
+    /// Note: This loads all keys into memory. For large collections,
+    /// prefer using `keys()` which streams elements.
+    pub fn keys_vec(&self) -> Result<Vec<K>> {
+        let mut result = Vec::new();
+        for item in self.keys() {
+            result.push(item?);
+        }
         Ok(result)
     }
     
-    /// Iterate over all values
-    pub fn values(&self) -> Result<Vec<V>> {
+    /// Iterate over all values using a streaming iterator
+    pub fn values(&self) -> ValueIterator<'_, K, V> {
         let prefix = self.entry_prefix();
         let iter = self.db.rocks().iterator(IteratorMode::From(&prefix, Direction::Forward));
         
-        let mut result = Vec::new();
-        for item in iter {
-            let (db_key, value_bytes) = item?;
-            if !db_key.starts_with(&prefix) {
-                break;
-            }
-            
-            let value: V = bincode::deserialize(&value_bytes)?;
-            result.push(value);
+        ValueIterator {
+            inner: iter,
+            prefix,
+            _phantom: PhantomData,
         }
-        
+    }
+    
+    /// Load all values into a Vec
+    /// 
+    /// Note: This loads all values into memory. For large collections,
+    /// prefer using `values()` which streams elements.
+    pub fn values_vec(&self) -> Result<Vec<V>> {
+        let mut result = Vec::new();
+        for item in self.values() {
+            result.push(item?);
+        }
         Ok(result)
     }
     
@@ -231,6 +237,114 @@ where
         let mut prefix = self.prefix.clone();
         prefix.extend_from_slice(b":entry:");
         prefix
+    }
+}
+
+/// Iterator over key-value pairs in a DurableMap
+pub struct MapIterator<'a, K, V> {
+    inner: rocksdb::DBIterator<'a>,
+    prefix: Vec<u8>,
+    _phantom: PhantomData<(K, V)>,
+}
+
+impl<'a, K, V> Iterator for MapIterator<'a, K, V>
+where
+    K: for<'de> Deserialize<'de>,
+    V: for<'de> Deserialize<'de>,
+{
+    type Item = Result<(K, V)>;
+    
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.inner.next() {
+            Some(Ok((db_key, value_bytes))) => {
+                // Check if we're still within our prefix
+                if !db_key.starts_with(&self.prefix) {
+                    return None;
+                }
+                
+                // Extract the key part (skip prefix)
+                let key_start = self.prefix.len();
+                let key_bytes = &db_key[key_start..];
+                
+                // Deserialize key and value
+                match (bincode::deserialize(key_bytes), bincode::deserialize(&value_bytes)) {
+                    (Ok(key), Ok(value)) => Some(Ok((key, value))),
+                    (Err(e), _) | (_, Err(e)) => Some(Err(e.into())),
+                }
+            }
+            Some(Err(e)) => Some(Err(e.into())),
+            None => None,
+        }
+    }
+}
+
+/// Iterator over keys in a DurableMap
+pub struct KeyIterator<'a, K, V> {
+    inner: rocksdb::DBIterator<'a>,
+    prefix: Vec<u8>,
+    _phantom: PhantomData<(K, V)>,
+}
+
+impl<'a, K, V> Iterator for KeyIterator<'a, K, V>
+where
+    K: for<'de> Deserialize<'de>,
+{
+    type Item = Result<K>;
+    
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.inner.next() {
+            Some(Ok((db_key, _))) => {
+                // Check if we're still within our prefix
+                if !db_key.starts_with(&self.prefix) {
+                    return None;
+                }
+                
+                // Extract the key part (skip prefix)
+                let key_start = self.prefix.len();
+                let key_bytes = &db_key[key_start..];
+                
+                // Deserialize key
+                match bincode::deserialize(key_bytes) {
+                    Ok(key) => Some(Ok(key)),
+                    Err(e) => Some(Err(e.into())),
+                }
+            }
+            Some(Err(e)) => Some(Err(e.into())),
+            None => None,
+        }
+    }
+}
+
+/// Iterator over values in a DurableMap
+pub struct ValueIterator<'a, K, V> {
+    inner: rocksdb::DBIterator<'a>,
+    prefix: Vec<u8>,
+    _phantom: PhantomData<(K, V)>,
+}
+
+impl<'a, K, V> Iterator for ValueIterator<'a, K, V>
+where
+    V: for<'de> Deserialize<'de>,
+{
+    type Item = Result<V>;
+    
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.inner.next() {
+            Some(Ok((db_key, value_bytes))) => {
+                // Check if we're still within our prefix
+                if !db_key.starts_with(&self.prefix) {
+                    return None;
+                }
+                
+                // Deserialize value
+                match bincode::deserialize(&value_bytes) {
+                    Ok(value) => Some(Ok(value)),
+                    Err(e) => Some(Err(e.into())),
+                }
+            }
+            Some(Err(e)) => Some(Err(e.into())),
+            None => None,
+        }
     }
 }
 
@@ -354,17 +468,17 @@ mod tests {
         }
         
         // Test iter()
-        let mut items = map.iter().unwrap();
+        let mut items = map.to_vec().unwrap();
         items.sort_by_key(|(k, _)| k.clone());
         assert_eq!(items, data);
         
         // Test keys()
-        let mut keys = map.keys().unwrap();
+        let mut keys = map.keys_vec().unwrap();
         keys.sort();
         assert_eq!(keys, vec!["apple", "banana", "cherry"]);
         
         // Test values()
-        let mut values = map.values().unwrap();
+        let mut values = map.values_vec().unwrap();
         values.sort();
         assert_eq!(values, vec![1, 2, 3]);
     }
@@ -427,6 +541,60 @@ mod tests {
         // Verify isolation
         assert_eq!(map1.get(&"shared_key".to_string()).unwrap(), Some(100));
         assert_eq!(map2.get(&"shared_key".to_string()).unwrap(), Some(200));
+    }
+    
+    #[test]
+    fn test_streaming_iterators() {
+        let (_temp, db) = setup_test_db();
+        let mut map = DurableMap::<String, i32>::new(&db, "stream_map").unwrap();
+        
+        // Insert test data
+        let data = vec![
+            ("alice".to_string(), 100),
+            ("bob".to_string(), 200),
+            ("charlie".to_string(), 300),
+        ];
+        
+        for (k, v) in &data {
+            map.insert(k.clone(), *v).unwrap();
+        }
+        
+        // Test streaming iteration
+        let mut collected = Vec::new();
+        for item in map.iter() {
+            let (k, v) = item.unwrap();
+            collected.push((k, v));
+        }
+        collected.sort_by_key(|(k, _)| k.clone());
+        assert_eq!(collected, data);
+        
+        // Test keys iterator
+        let mut keys = Vec::new();
+        for key in map.keys() {
+            keys.push(key.unwrap());
+        }
+        keys.sort();
+        assert_eq!(keys, vec!["alice", "bob", "charlie"]);
+        
+        // Test values iterator
+        let mut values = Vec::new();
+        for value in map.values() {
+            values.push(value.unwrap());
+        }
+        values.sort();
+        assert_eq!(values, vec![100, 200, 300]);
+        
+        // Test that iterators properly handle prefix boundaries
+        let mut map2 = DurableMap::<String, i32>::new(&db, "stream_map2").unwrap();
+        map2.insert("dave".to_string(), 400).unwrap();
+        
+        // Each iterator should only see its own data
+        let collected1: Vec<_> = map.iter().map(Result::unwrap).collect();
+        let collected2: Vec<_> = map2.iter().map(Result::unwrap).collect();
+        
+        assert_eq!(collected1.len(), 3);
+        assert_eq!(collected2.len(), 1);
+        assert_eq!(collected2[0], ("dave".to_string(), 400));
     }
 }
 
@@ -491,7 +659,7 @@ mod proptests {
             
             prop_assert_eq!(map.len().unwrap(), 0);
             prop_assert!(map.is_empty().unwrap());
-            prop_assert_eq!(map.iter().unwrap(), vec![]);
+            prop_assert_eq!(map.to_vec().unwrap(), vec![]);
         }
     }
 } 

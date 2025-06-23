@@ -62,7 +62,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     // Iterate over all users
     println!("\nAll users (sorted by username):");
-    let mut all_users = users.iter()?;
+    let mut all_users = users.to_vec()?;
     all_users.sort_by_key(|(username, _)| username.clone());
     
     for (username, profile) in all_users {
@@ -70,12 +70,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     
     // Get just the usernames
-    let mut usernames = users.keys()?;
+    let mut usernames = users.keys_vec()?;
     usernames.sort();
     println!("\nAll usernames: {:?}", usernames);
     
     // Find the highest scoring user
-    let profiles = users.values()?;
+    let profiles = users.values_vec()?;
     if let Some(top_user) = profiles.iter().max_by_key(|p| p.score) {
         println!("\nTop scorer: {} with {} points", top_user.name, top_user.score);
     }
