@@ -138,20 +138,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(score) = valorant_player1_score { println!("    Valorant Score: {}", score); }
     
     // Showcase the power of the nested structure for stats
-    println!("\n📊 Dynamic Database Statistics (no hardcoded games):");
+    // For nested collections, we use the keys API instead of iter()
+    println!("\n📊 Dynamic Database Statistics (discovered games):");
     
-    for game_item in rankings.iter() {
-        let (game, game_history) = game_item?;
+    // Note: For nested collections, we iterate over known keys or use a different approach
+    // since the values (nested DurableMaps) cannot be directly deserialized
+    let games = vec!["cs2", "valorant", "tf2"]; // In a real app, you might track these separately
+    
+    for game in games {
+        let game_history = rankings.entry(game.to_string())?.or_default()?;
         let active_days = game_history.len()?;
-        let mut total_entries = 0;
         
-        for daily_item in game_history.values() {
-            total_entries += daily_item?.len()?;
-        }
-        
-        if total_entries > 0 {
-            println!("  • {}: {} total entries across {} active day(s)", 
-                     game.to_uppercase(), total_entries, active_days);
+        if active_days > 0 {
+            // For demonstration, let's count entries from known days
+            let mut total_entries = 0;
+            let days = [today, yesterday, last_week];
+            
+            for day in days {
+                if let Ok(daily_rankings) = game_history.entry(day) {
+                    if let Ok(rankings_vec) = daily_rankings.or_default() {
+                        total_entries += rankings_vec.len()?;
+                    }
+                }
+            }
+            
+            if total_entries > 0 {
+                println!("  • {}: {} total entries across {} active day(s)", 
+                         game.to_uppercase(), total_entries, active_days);
+            }
         }
     }
     

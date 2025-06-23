@@ -141,26 +141,7 @@ where
         Ok(old_value)
     }
     
-    /// Get the number of entries in the map
-    pub fn len(&self) -> Result<usize> {
-        let key = self.meta_key("len");
-        match self.db.rocks().get(&key)? {
-            Some(bytes) => {
-                if bytes.len() != 8 {
-                    return Err(DurableError::Corruption("Invalid length bytes size".into()));
-                }
-                let len_bytes: [u8; 8] = bytes[..8].try_into()
-                    .map_err(|_| DurableError::Corruption("Invalid length bytes".into()))?;
-                Ok(u64::from_le_bytes(len_bytes) as usize)
-            }
-            None => Ok(0),
-        }
-    }
-    
-    /// Check if the map is empty
-    pub fn is_empty(&self) -> Result<bool> {
-        Ok(self.len()? == 0)
-    }
+
     
     /// Clear all entries from the map
     pub fn clear(&mut self) -> Result<()> {
@@ -296,14 +277,7 @@ where
         Ok(())
     }
     
-    /// Create a new DurableMap from a prefix (used for nested collections)
-    pub fn from_prefix(db: Db, prefix: Vec<u8>) -> Self {
-        Self {
-            db,
-            prefix,
-            _phantom: PhantomData,
-        }
-    }
+
     
     // Helper methods
     
@@ -318,13 +292,6 @@ where
         let mut prefix = self.prefix.clone();
         prefix.extend_from_slice(b":entry:");
         prefix
-    }
-    
-    fn meta_key(&self, meta_type: &str) -> Vec<u8> {
-        let mut key = self.prefix.clone();
-        key.extend_from_slice(b":__meta:");
-        key.extend_from_slice(meta_type.as_bytes());
-        key
     }
 }
 
@@ -341,6 +308,36 @@ impl<K, V> DurableMap<K, V> {
         }
     }
     
+    /// Create a new DurableMap from a prefix (used for nested collections)
+    pub fn from_prefix(db: Db, prefix: Vec<u8>) -> Self {
+        Self {
+            db,
+            prefix,
+            _phantom: PhantomData,
+        }
+    }
+    
+    /// Get the number of entries in the map (unconstrained version for nested collections)
+    pub fn len(&self) -> Result<usize> {
+        let key = self.meta_key("len");
+        match self.db.rocks().get(&key)? {
+            Some(bytes) => {
+                if bytes.len() != 8 {
+                    return Err(DurableError::Corruption("Invalid length bytes size".into()));
+                }
+                let len_bytes: [u8; 8] = bytes[..8].try_into()
+                    .map_err(|_| DurableError::Corruption("Invalid length bytes".into()))?;
+                Ok(u64::from_le_bytes(len_bytes) as usize)
+            }
+            None => Ok(0),
+        }
+    }
+    
+    /// Check if the map is empty (unconstrained version for nested collections)
+    pub fn is_empty(&self) -> Result<bool> {
+        Ok(self.len()? == 0)
+    }
+
     /// Get the entry key for nested collections (needed by entry API)
     pub(crate) fn make_entry_key(&self, key_bytes: &[u8]) -> Vec<u8> {
         let mut db_key = self.prefix.clone();
@@ -348,14 +345,19 @@ impl<K, V> DurableMap<K, V> {
         db_key.extend_from_slice(key_bytes);
         db_key
     }
+    
+    fn meta_key(&self, meta_type: &str) -> Vec<u8> {
+        let mut key = self.prefix.clone();
+        key.extend_from_slice(b":__meta:");
+        key.extend_from_slice(meta_type.as_bytes());
+        key
+    }
 }
 
 // Implement the DurableCollection trait for DurableMap<K, V>
-impl<K, V> DurableCollection for DurableMap<K, V> 
-where
-    K: Serialize + for<'de> Deserialize<'de>,
-    V: Serialize + for<'de> Deserialize<'de>,
-{
+// This implementation is used for nested collections and doesn't require
+// serialization bounds since nested maps use collection markers, not direct serialization
+impl<K, V> DurableCollection for DurableMap<K, V> {
     fn from_prefix(db: Db, prefix: Vec<u8>) -> Self {
         DurableMap::from_prefix(db, prefix)
     }
