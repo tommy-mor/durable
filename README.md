@@ -89,7 +89,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 - ✅ `DurableVec<T>` with full test coverage including:
   - Basic operations: `push`, `pop`, `get`, `len`, `clear`
   - Batch operations: `extend`
-  - Iteration: `iter()` returns `Vec<T>` (streaming iteration coming soon)
+  - Iteration: `iter()` returns a streaming iterator, `to_vec()` loads into memory
   - Property-based testing with proptest
   - Unicode string support
   - Complex type support
@@ -104,10 +104,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ### Coming Soon
 
 - 🚧 `DurableSet<T>` - Persistent HashSet  
-- 🚧 Streaming iterators for better memory efficiency
 - 🚧 Collection nesting (e.g., `DurableMap<String, DurableVec<T>>`)
 - 🚧 Schema migration support
 - 🚧 Batch operations across multiple collections
+- 🚧 Streaming iterators for `DurableMap`
 
 ## Performance
 

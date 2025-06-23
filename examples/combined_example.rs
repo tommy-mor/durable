@@ -117,7 +117,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     // Display all messages
     println!("\n📨 All messages:");
-    for (i, msg) in messages.iter()?.iter().enumerate() {
+    for (i, msg) in messages.iter()?.enumerate() {
+        let msg = msg?;
         println!("  [{}] {} → {}: {}", i, msg.from, msg.to, msg.content);
     }
     

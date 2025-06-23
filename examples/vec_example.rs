@@ -38,7 +38,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     // Iterate through all tasks
     println!("\nAll tasks:");
-    for (i, task) in tasks.iter()?.iter().enumerate() {
+    for (i, task) in tasks.iter()?.enumerate() {
+        let task = task?;
         println!("  [{}] {} - {}", 
             i, 
             task.title, 

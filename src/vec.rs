@@ -111,18 +111,28 @@ where
         Ok(())
     }
     
-    /// Create an iterator over the vector
-    pub fn iter(&self) -> Result<Vec<T>> {
+    /// Create a streaming iterator over the vector
+    pub fn iter(&self) -> Result<impl Iterator<Item = Result<T>> + '_> {
+        let prefix = self.element_prefix();
+        let iter = self.db.rocks().iterator(rocksdb::IteratorMode::From(&prefix, rocksdb::Direction::Forward));
+        
+        Ok(VecIterator {
+            inner: iter,
+            prefix,
+            _phantom: PhantomData,
+        })
+    }
+    
+    /// Convert the entire vector to a Vec<T> in memory
+    /// 
+    /// Note: This loads the entire collection into memory. For large collections,
+    /// prefer using `iter()` which streams elements.
+    pub fn to_vec(&self) -> Result<Vec<T>> {
         let len = self.len()?;
         let mut result = Vec::with_capacity(len);
         
-        for i in 0..len {
-            match self.get(i)? {
-                Some(value) => result.push(value),
-                None => return Err(DurableError::Corruption(
-                    format!("Missing element at index {} during iteration", i)
-                )),
-            }
+        for item in self.iter()? {
+            result.push(item?);
         }
         
         Ok(result)
@@ -195,6 +205,54 @@ where
         key.extend_from_slice(b":__meta:");
         key.extend_from_slice(meta_type.as_bytes());
         key
+    }
+    
+    fn element_prefix(&self) -> Vec<u8> {
+        let mut prefix = self.prefix.clone();
+        prefix.push(b':');
+        prefix
+    }
+}
+
+/// Iterator over a DurableVec
+pub struct VecIterator<'a, T> {
+    inner: rocksdb::DBIterator<'a>,
+    prefix: Vec<u8>,
+    _phantom: PhantomData<T>,
+}
+
+impl<'a, T> Iterator for VecIterator<'a, T>
+where
+    T: for<'de> Deserialize<'de>
+{
+    type Item = Result<T>;
+    
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            match self.inner.next() {
+                Some(Ok((key, value))) => {
+                    // Check if we're still within our prefix
+                    if !key.starts_with(&self.prefix) {
+                        return None;
+                    }
+                    
+                    // Check if this is a meta key (skip it)
+                    // The key pattern is: prefix:element_index or prefix:__meta:type
+                    // We want to skip any key that contains "__meta:"
+                    if key.windows(7).any(|w| w == b"__meta:") {
+                        continue; // Skip this key and try the next one
+                    }
+                    
+                    // Deserialize the value
+                    match bincode::deserialize(&value) {
+                        Ok(item) => return Some(Ok(item)),
+                        Err(e) => return Some(Err(e.into())),
+                    }
+                }
+                Some(Err(e)) => return Some(Err(e.into())),
+                None => return None,
+            }
+        }
     }
 }
 
@@ -308,7 +366,7 @@ mod tests {
         vec.extend(values.clone()).unwrap();
         
         // Iterate and collect
-        let collected = vec.iter().unwrap();
+        let collected = vec.to_vec().unwrap();
         
         assert_eq!(collected, values);
     }
@@ -327,7 +385,7 @@ mod tests {
         assert_eq!(vec.len().unwrap(), 5);
         
         // Verify all elements
-        let all = vec.iter().unwrap();
+        let all = vec.to_vec().unwrap();
         assert_eq!(all, vec!["a", "b", "c", "d", "e"]);
     }
     
@@ -351,8 +409,8 @@ mod tests {
         assert_eq!(vec.get(1000).unwrap(), None);
         
         // Verify iteration count
-        let iter_values = vec.iter().unwrap();
-        assert_eq!(iter_values.len(), count as usize);
+        let all_values = vec.to_vec().unwrap();
+        assert_eq!(all_values.len(), count as usize);
     }
     
     #[test] 
@@ -401,7 +459,7 @@ mod tests {
         assert!(vec.is_empty().unwrap());
         assert_eq!(vec.get(0).unwrap(), None);
         assert_eq!(vec.get(100).unwrap(), None);
-        assert_eq!(vec.iter().unwrap(), vec![]);
+        assert_eq!(vec.to_vec().unwrap(), vec![]);
     }
     
     #[test]
@@ -443,7 +501,7 @@ mod tests {
         // Extend should be atomic - either all elements added or none
         vec.extend(vec![10, 20, 30, 40, 50]).unwrap();
         assert_eq!(vec.len().unwrap(), 5);
-        let all = vec.iter().unwrap();
+        let all = vec.to_vec().unwrap();
         assert_eq!(all, vec![10, 20, 30, 40, 50]);
     }
     
@@ -461,8 +519,37 @@ mod tests {
         
         vec.extend(test_strings.clone()).unwrap();
         
-        let retrieved = vec.iter().unwrap();
+        let retrieved = vec.to_vec().unwrap();
         assert_eq!(retrieved, test_strings);
+    }
+    
+    #[test]
+    fn test_streaming_iterator() {
+        let (_temp, db) = setup_test_db();
+        let mut vec = DurableVec::<i32>::new(&db, "stream_vec").unwrap();
+        
+        // Add test data
+        let values = vec![1, 2, 3, 4, 5];
+        vec.extend(values.clone()).unwrap();
+        
+        // Test streaming iteration
+        let mut collected = Vec::new();
+        for item in vec.iter().unwrap() {
+            collected.push(item.unwrap());
+        }
+        
+        assert_eq!(collected, values);
+        
+        // Test that iterator properly handles prefix boundaries
+        let mut vec2 = DurableVec::<i32>::new(&db, "stream_vec2").unwrap();
+        vec2.extend(vec![10, 20, 30]).unwrap();
+        
+        // Each iterator should only see its own data
+        let collected1: Vec<_> = vec.iter().unwrap().collect::<Result<Vec<_>>>().unwrap();
+        let collected2: Vec<_> = vec2.iter().unwrap().collect::<Result<Vec<_>>>().unwrap();
+        
+        assert_eq!(collected1, values);
+        assert_eq!(collected2, vec![10, 20, 30]);
     }
 }
 
@@ -507,7 +594,7 @@ mod proptests {
             vec.extend(values.clone()).unwrap();
             
             // Get back via iteration
-            let retrieved = vec.iter().unwrap();
+            let retrieved = vec.to_vec().unwrap();
             
             prop_assert_eq!(retrieved, values);
         }
