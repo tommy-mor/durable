@@ -1,0 +1,4 @@
+Add streaming iterators to avoid loading entire collections
+Implement collection nesting (e.g., DurableMap<String, DurableVec<T>>)
+Add benchmarks to measure performance
+Implement schema versioning and migrations
