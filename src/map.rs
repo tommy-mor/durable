@@ -54,6 +54,37 @@ where
         Ok(old_value)
     }
     
+    /// Put a key-value pair into the map without returning the old value
+    /// 
+    /// This is more efficient than `insert` when you don't need the old value,
+    /// as it only checks for key existence without deserializing the value.
+    pub fn put(&mut self, key: K, value: V) -> Result<()> {
+        let key_bytes = bincode::serialize(&key)?;
+        let value_bytes = bincode::serialize(&value)?;
+        let db_key = self.entry_key(&key_bytes);
+        
+        let mut batch = WriteBatch::default();
+        
+        // Check if this is a new key (without deserializing the value)
+        let is_new = self.db.rocks().get_pinned(&db_key)?.is_none();
+        
+        // Write the new value
+        batch.put(&db_key, &value_bytes);
+        
+        // Update length if this is a new key
+        if is_new {
+            let new_len = self.len()? + 1;
+            let len_key = self.meta_key("len");
+            batch.put(&len_key, &(new_len as u64).to_le_bytes());
+        }
+        
+        // Commit atomically
+        self.db.rocks().write(batch)?;
+        self.db.rocks().flush_wal(true)?;
+        
+        Ok(())
+    }
+    
     /// Get a value by key
     pub fn get(&self, key: &K) -> Result<Option<V>> {
         let key_bytes = bincode::serialize(key)?;
@@ -694,6 +725,38 @@ mod tests {
         map.clear().unwrap();
         assert_eq!(map.len().unwrap(), 0);
         assert!(map.is_empty().unwrap());
+    }
+    
+    #[test]
+    fn test_put_method() {
+        let (_temp, db) = setup_test_db();
+        let mut map = DurableMap::<String, i32>::new(&db, "put_map").unwrap();
+        
+        // Put new entries
+        map.put("a".to_string(), 1).unwrap();
+        map.put("b".to_string(), 2).unwrap();
+        map.put("c".to_string(), 3).unwrap();
+        
+        // Verify entries exist and length is correct
+        assert_eq!(map.get(&"a".to_string()).unwrap(), Some(1));
+        assert_eq!(map.get(&"b".to_string()).unwrap(), Some(2));
+        assert_eq!(map.get(&"c".to_string()).unwrap(), Some(3));
+        assert_eq!(map.len().unwrap(), 3);
+        
+        // Update existing entry with put
+        map.put("b".to_string(), 20).unwrap();
+        assert_eq!(map.get(&"b".to_string()).unwrap(), Some(20));
+        assert_eq!(map.len().unwrap(), 3); // Length should not change
+        
+        // Compare put vs insert performance characteristics
+        // put() doesn't return old value but is more efficient
+        map.put("d".to_string(), 4).unwrap();
+        assert_eq!(map.len().unwrap(), 4);
+        
+        // insert() returns old value
+        let old = map.insert("d".to_string(), 40).unwrap();
+        assert_eq!(old, Some(4));
+        assert_eq!(map.len().unwrap(), 4);
     }
 }
 

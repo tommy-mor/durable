@@ -65,8 +65,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut scores = DurableMap::<String, u32>::new(&db, "scores")?;
     
     // Use it like a HashMap!
-    scores.insert("Alice".to_string(), 100)?;
-    scores.insert("Bob".to_string(), 85)?;
+    // Use put() when you don't need the old value (more efficient)
+    scores.put("Alice".to_string(), 100)?;
+    scores.put("Bob".to_string(), 85)?;
+    
+    // Use insert() when you need to know the old value
+    if let Some(old_score) = scores.insert("Alice".to_string(), 120)? {
+        println!("Alice's previous score was: {}", old_score);
+    }
     
     // Get values
     if let Some(score) = scores.get(&"Alice".to_string())? {
@@ -95,7 +101,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
   - Complex type support
 
 - ✅ `DurableMap<K, V>` with full test coverage including:
-  - Basic operations: `insert`, `get`, `remove`, `contains_key`, `len`, `clear`
+  - Basic operations: `insert`, `put`, `get`, `remove`, `contains_key`, `len`, `clear`
   - Batch operations: `extend`
   - Iteration: `iter()`, `keys()`, `values()` return streaming iterators
   - Memory loading: `to_vec()`, `keys_vec()`, `values_vec()` for convenience
@@ -121,7 +127,9 @@ All operations are designed to be efficient:
   - `clear`: Atomic batch deletion
 
 - **DurableMap**:
-  - `insert`/`get`: Direct key lookup, O(1) average
+  - `insert`: Returns old value (2 ops: get + put), O(1) average
+  - `put`: No return value (1 op: existence check + put), O(1) average
+  - `get`: Direct key lookup, O(1) average
   - `remove`: Single delete with WAL flush
   - `len`: Metadata lookup, O(1)
   - `extend`: Batched writes for efficiency

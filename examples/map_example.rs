@@ -16,7 +16,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut users = DurableMap::<String, UserProfile>::new(&db, "users")?;
     
     // Insert some users
-    users.insert(
+    // Using put() when we don't need the old value - more efficient!
+    users.put(
         "alice".to_string(),
         UserProfile {
             name: "Alice Smith".to_string(),
@@ -25,7 +26,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     )?;
     
-    users.insert(
+    users.put(
         "bob".to_string(),
         UserProfile {
             name: "Bob Johnson".to_string(),
@@ -34,7 +35,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     )?;
     
-    users.insert(
+    // Using insert() when we might need the old value
+    let old_charlie = users.insert(
         "charlie".to_string(),
         UserProfile {
             name: "Charlie Brown".to_string(),
@@ -42,6 +44,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             score: 1800,
         },
     )?;
+    
+    if old_charlie.is_some() {
+        println!("Replaced existing charlie entry");
+    }
     
     println!("Total users: {}", users.len()?);
     
@@ -56,7 +62,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Update a user's score
     if let Some(mut bob) = users.get(&"bob".to_string())? {
         bob.score += 100;
-        users.insert("bob".to_string(), bob)?;
+        // Use put() here since we don't need the old value back
+        users.put("bob".to_string(), bob)?;
         println!("Updated Bob's score!");
     }
     
