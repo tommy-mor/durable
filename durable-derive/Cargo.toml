@@ -1,0 +1,15 @@
+[package]
+name = "durable-derive"
+version = "0.2.0"
+edition = "2021"
+authors = ["Durable Contributors"]
+description = "#[derive(Durable)] macro for the durable crate"
+license = "MIT OR Apache-2.0"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "2.0", features = ["full"] }
+quote = "1.0"
+proc-macro2 = "1.0"
