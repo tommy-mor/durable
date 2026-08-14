@@ -61,8 +61,26 @@ pub fn derive_durable(input: TokenStream) -> TokenStream {
     let trait_name = Ident::new(&format!("{name}Fields"), name.span());
     let trait_doc = format!("Field navigators for [`{name}`], implemented for `durable::Path<{name}>`.");
 
+    let mut describe_fields = Vec::new();
+    for field in fields.iter() {
+        let field_ident = field.ident.as_ref().expect("named field");
+        let field_ty = &field.ty;
+        let field_name = field_ident.to_string();
+        describe_fields.push(quote! {
+            (#field_name.to_string(), <#field_ty as ::durable::Describe>::shape())
+        });
+    }
+
     let expanded = quote! {
         impl #impl_generics ::durable::Schema for #name #ty_generics #where_clause {}
+
+        impl #impl_generics ::durable::Describe for #name #ty_generics #where_clause {
+            fn shape() -> ::durable::Shape {
+                ::durable::Shape::record(vec![
+                    #(#describe_fields),*
+                ])
+            }
+        }
 
         #[doc = #trait_doc]
         #vis trait #trait_name {

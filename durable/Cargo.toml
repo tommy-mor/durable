@@ -1,9 +1,9 @@
 [package]
 name = "durable"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 authors = ["Durable Contributors"]
-description = "Deeply nested, precisely updatable RocksDB-backed data structures with paths-as-data"
+description = "Event-sourced application-state runtime with typed reducers and a serializable read language"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
@@ -11,7 +11,8 @@ rocksdb = "0.21"
 serde = { version = "1.0", features = ["derive"] }
 thiserror = "1.0"
 ciborium = "0.2.2"
-durable-derive = { path = "../durable-derive", version = "0.2.0" }
+serde_json = "1.0"
+durable-derive = { path = "../durable-derive", version = "0.3.0" }
 
 [dev-dependencies]
 tempfile = "3.8"

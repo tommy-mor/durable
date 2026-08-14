@@ -1,6 +1,6 @@
 [package]
 name = "durable-derive"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 authors = ["Durable Contributors"]
 description = "#[derive(Durable)] macro for the durable crate"

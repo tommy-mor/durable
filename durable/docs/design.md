@@ -91,3 +91,31 @@ unclean crash.
 `durable` is deliberately not a recovery plan on its own. Pair it with a
 canonical log if you need crash recovery, and prefer "drop and replay" over
 in-place migration when a schema changes.
+
+## Runtime
+
+[`Runtime<E>`](../src/runtime.rs) is that pairing. The JSONL log is the source
+of truth (appended and fsynced first). The reducer receives a [`Tx`] and writes
+typed paths. The applied offset is committed in the same RocksDB batch as the
+event's projection writes, so a crash before commit replays the event against
+the previous projection. `DisableWal` is the right durability for the
+projection: it is rebuildable.
+
+`rebuild()` range-deletes the projection and reduces from event 0.
+`verify()` checks the live projection against a fresh replay. The property
+that matters is incremental execution == replay from zero.
+
+## Query language
+
+Reads are a closed algebra ([`query`](../src/query.rs)): `Field`, `Key`,
+`Index`, `All`, `Where`, `First`/`Last`/`Slice`, and a predicate language of
+comparisons, `And`/`Or`/`Not`, and `Exists`. No callables. The wire form is a
+tagged-array CBOR encoding shared with the Python frontend.
+
+A path does not imply how to collect. Terminals are explicit: `one`, `select`,
+`subtree`, `entries`, `project`. `explain` reports `POINT` / `BOUNDED` /
+`SCAN` so a prefix scan cannot pretend to be a point get.
+
+Once navigation enters a `Leaf`, remaining field/key steps run against the
+decoded CBOR value. That is how `ROOT.evidence_by_id[id].payload` works when
+the stored value is a dict.

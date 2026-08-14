@@ -1,7 +1,11 @@
 //! # durable
 //!
-//! Deeply nested, precisely updatable RocksDB-backed data structures for Rust,
-//! built around **paths as data**.
+//! Event-sourced application state: a typed reducer writes a RocksDB
+//! projection; a serializable query language reads it. Clients append events
+//! and issue queries. They do not mutate indexes.
+//!
+//! The projection itself is still deeply nested, precisely updatable
+//! RocksDB-backed data, built around **paths as data**.
 //!
 //! Instead of serializing a big struct into one blob, you describe your data with
 //! a *schema* of composable types — [`Leaf`], [`Map`], [`List`], [`Deque`],
@@ -48,7 +52,10 @@
 
 mod codec;
 mod path;
+pub mod query;
+pub mod runtime;
 mod schema;
+mod shape;
 
 use std::path::Path as FsPath;
 use std::sync::Arc;
@@ -59,7 +66,13 @@ use thiserror::Error;
 
 pub use durable_derive::Durable;
 pub use path::Path;
+pub use query::{
+    entries, explain, one, project, select, subtree, CostClass, Expr, Nav, Plan, Predicate, Query,
+    Terminal,
+};
+pub use runtime::{JsonlLog, Runtime, Tx};
 pub use schema::{Deque, Leaf, List, Map, Schema, Sum, Summable};
+pub use shape::{Describe, Shape};
 
 /// Errors returned by durable operations.
 #[derive(Error, Debug)]
@@ -72,6 +85,10 @@ pub enum Error {
     Deserialize(String),
     #[error("data corruption: {0}")]
     Corruption(String),
+    #[error("query error: {0}")]
+    Query(String),
+    #[error("event log error: {0}")]
+    Log(String),
 }
 
 /// Result alias used throughout the crate.
@@ -115,6 +132,12 @@ pub enum Op {
     DeletePrefix { prefix: Vec<u8> },
     /// Blind associative merge (used by [`Sum`]).
     Merge { key: Vec<u8>, value: Vec<u8> },
+    /// Append to a list; resolved against the current length at commit.
+    ListPush { prefix: Vec<u8>, value: Vec<u8> },
+    /// Append to a deque back; resolved at commit.
+    DequePushBack { prefix: Vec<u8>, value: Vec<u8> },
+    /// Push to a deque front; resolved at commit.
+    DequePushFront { prefix: Vec<u8>, value: Vec<u8> },
 }
 
 /// A typed, reified mutation produced by a terminal path operation.
@@ -232,7 +255,28 @@ impl Batch {
             Op::Delete { key } => self.inner.delete(key),
             Op::Merge { key, value } => self.inner.merge(key, value),
             Op::DeletePrefix { prefix } => self.prefix_deletes.push(prefix),
+            Op::ListPush { prefix, value } => self.appends.push(PendingAppend {
+                coll_prefix: prefix,
+                end: AppendEnd::ListBack,
+                value,
+            }),
+            Op::DequePushBack { prefix, value } => self.appends.push(PendingAppend {
+                coll_prefix: prefix,
+                end: AppendEnd::DequeBack,
+                value,
+            }),
+            Op::DequePushFront { prefix, value } => self.appends.push(PendingAppend {
+                coll_prefix: prefix,
+                end: AppendEnd::DequeFront,
+                value,
+            }),
         }
+    }
+
+    /// The database this batch will commit against. Reducers use this for
+    /// committed-state reads; in-batch writes are not visible until commit.
+    pub fn db(&self) -> &Db {
+        &self.db
     }
 
     /// Record several reified writes.

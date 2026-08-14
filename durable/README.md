@@ -1,5 +1,65 @@
 # durable
 
+A Rust event-sourced application-state runtime: a typed reducer, a rebuildable
+RocksDB projection, and a serializable Specter-shaped read language.
+
+Python (or any other client) may **append an event** and **query**. It cannot
+mutate the projection. The only legal state transition is an event the Rust
+state machine recognizes.
+
+```text
+WRITE:  Event → reducer → Tx → projection
+READ:   Query path → engine → value(s)
+```
+
+The storage layer underneath is still what durable has always been: deeply
+nested, precisely updatable RocksDB structures, built around **paths as data**.
+The reducer uses those typed paths directly. There is no generic mutation IR
+on the client side of the boundary.
+
+```rust
+fn reduce(tx: &mut Tx, event: &Event) -> Result<()> {
+    let root = Store::root();
+    match event {
+        Event::Evidence(e) => {
+            tx.write(root.events().push_op(e));
+            tx.write(root.evidence_by_id().key(&e.id).set(e));
+            tx.write(root.event_ids_by_kind().key(&e.kind).push_op(&e.id));
+        }
+        Event::Emission(em) => {
+            tx.write(root.latest_emission().set(em));
+        }
+    }
+    Ok(())
+}
+```
+
+```python
+view.one(ROOT.evidence_by_id[event_id].payload)
+view.select(ROOT.events[WHERE(F.epoch > 4)].kind)
+view.query({
+    "latest": ROOT.latest_emission,
+    "kinds": ROOT.events[ALL].kind,
+})
+```
+
+What crosses the boundary is plain data — a closed algebra, not a callable:
+
+```text
+[null, [[0, "events"], [7, [4, [0, "epoch"], [1, 4]]], [0, "kind"]]]
+```
+
+`one` / `select` / `subtree` / `entries` / `project` are explicit terminals.
+`q.explain()` tells you whether you bought a point get or a prefix scan.
+
+Startup replays `eventlog[offset+1..]`. Rebuild destroys the projection and
+reduces from event 0. The important property test is
+`incremental execution == replay from zero`.
+
+The rest of this document is the implementation layer the reducer sits on.
+
+---
+
 Deeply nested, precisely updatable RocksDB-backed data structures for Rust,
 built around **paths as data**.
 
@@ -164,5 +224,11 @@ cargo test -p durable
 ```
 
 Covers the codec, the merge operator, every collection kind end-to-end, atomic
-batches, durability modes, persistence across reopen, and property tests against
-`BTreeMap`/`VecDeque`/sum-of-deltas models.
+batches, durability modes, persistence across reopen, property tests against
+`BTreeMap`/`VecDeque`/sum-of-deltas models, the query engine (point / scan /
+filter / project / explain), and the runtime property
+`incremental execution == replay from zero`.
+
+```bash
+cargo run -p durable --example runtime
+```

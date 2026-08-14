@@ -394,6 +394,18 @@ impl<T: Serialize + DeserializeOwned> Path<List<Leaf<T>>> {
         self.at(index).get(db)
     }
 
+    /// A reified list append, resolved against the collection length at commit.
+    ///
+    /// This is the form a reducer hands to [`crate::Tx::write`]. It does not
+    /// touch the database.
+    pub fn push_op(&self, value: &T) -> Write {
+        let bytes = encode_value(value).expect("durable: list value serialization failed");
+        Write::new(Op::ListPush {
+            prefix: self.prefix.clone(),
+            value: bytes,
+        })
+    }
+
     /// Append `value`, returning its index. Commits with `SyncWal`.
     pub fn push(&self, db: &Db, value: &T) -> Result<u64> {
         let mut batch = db.batch();
@@ -464,6 +476,24 @@ impl<V: Schema> Path<Deque<V>> {
 }
 
 impl<T: Serialize + DeserializeOwned> Path<Deque<Leaf<T>>> {
+    /// A reified deque-back append, resolved at commit.
+    pub fn push_back_op(&self, value: &T) -> Write {
+        let bytes = encode_value(value).expect("durable: deque value serialization failed");
+        Write::new(Op::DequePushBack {
+            prefix: self.prefix.clone(),
+            value: bytes,
+        })
+    }
+
+    /// A reified deque-front push, resolved at commit.
+    pub fn push_front_op(&self, value: &T) -> Write {
+        let bytes = encode_value(value).expect("durable: deque value serialization failed");
+        Write::new(Op::DequePushFront {
+            prefix: self.prefix.clone(),
+            value: bytes,
+        })
+    }
+
     /// Push to the back. Commits with `SyncWal`.
     pub fn push_back(&self, db: &Db, value: &T) -> Result<()> {
         let mut batch = db.batch();
