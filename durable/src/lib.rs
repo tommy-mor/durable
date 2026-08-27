@@ -51,6 +51,7 @@
 //! ```
 
 mod codec;
+pub mod dynpath;
 mod path;
 pub mod query;
 pub mod runtime;
@@ -65,6 +66,7 @@ use serde::{de::DeserializeOwned, Serialize};
 use thiserror::Error;
 
 pub use durable_derive::Durable;
+pub use dynpath::{cbor_to_json, json_to_cbor, navs_for, Location};
 pub use path::Path;
 pub use query::{
     entries, explain, one, project, select, subtree, CostClass, Expr, Nav, Plan, Predicate, Query,
@@ -89,6 +91,8 @@ pub enum Error {
     Query(String),
     #[error("event log error: {0}")]
     Log(String),
+    #[error("reducer error: {0}")]
+    Reducer(String),
 }
 
 /// Result alias used throughout the crate.

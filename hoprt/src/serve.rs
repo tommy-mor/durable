@@ -15,10 +15,13 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::net::{TcpListener, TcpStream};
+use std::path::Path;
 use std::rc::Rc;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
+
+use crate::store;
 
 use mlua::{Function, Lua, LuaSerdeExt, Value as LuaValue};
 use tungstenite::Message;
@@ -139,8 +142,14 @@ fn route(sessions: &HashMap<String, mpsc::Sender<String>>, pkt: &serde_json::Val
 }
 
 /// Run the hop server forever: compile-side callers pass the already
-/// compiled Lua chunk for the app.
-pub fn serve(app_code: String, http_port: u16, ws_port: u16) -> mlua::Result<()> {
+/// compiled Lua chunk for the app. `data_dir` holds the JSONL log and
+/// RocksDB projection when the app declares `schema` + `reduce`.
+pub fn serve(
+    app_code: String,
+    http_port: u16,
+    ws_port: u16,
+    data_dir: impl AsRef<Path>,
+) -> mlua::Result<()> {
     {
         let app = app_code.clone();
         thread::spawn(move || http_thread(http_port, app));
@@ -169,7 +178,15 @@ pub fn serve(app_code: String, http_port: u16, ws_port: u16) -> mlua::Result<()>
     lua.globals().set("__print", print_fn)?;
     lua.load(HOPRT_LUA).set_name("hoprt.lua").exec()?;
     lua.load(HUI_LUA).set_name("hui.lua").exec()?;
+    store::install_constructors(&lua)?;
     lua.load(&app_code).set_name("app.lua").exec()?;
+    let bound = store::bind(&lua, data_dir.as_ref())?;
+    if bound {
+        println!(
+            "[hopd] durable store at {}  (log.jsonl + proj/)",
+            data_dir.as_ref().display()
+        );
+    }
 
     let mut sessions: HashMap<String, mpsc::Sender<String>> = HashMap::new();
     println!("[hopd] serving http://localhost:{http_port}  (ws on :{ws_port})");

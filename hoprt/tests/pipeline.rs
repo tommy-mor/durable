@@ -123,7 +123,7 @@ fn lambda_with_marks_ships_only_its_captures() {
     let lua = compiler::compile(src).expect("hopc compile");
     // the onclick lambda hops to the server carrying only the loop index it
     // captured — not item, rows, or the items array
-    assert!(lua.contains(r#"return rt.at("server", "todo_view:l1:1", { i = i })"#), "{lua}");
+    assert!(lua.contains(r#"return rt.at("server", "todo_view:l1:1", { id = id })"#), "{lua}");
     // its server segment is registered like any other, and the cast inside
     // it carries the snapshot
     assert!(lua.contains(r#"rt.register("todo_view:l1:1""#), "{lua}");

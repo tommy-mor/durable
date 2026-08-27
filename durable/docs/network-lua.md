@@ -15,7 +15,7 @@ semantics survived the language change; the implementation got simpler.
 │ Luau VM (WASM)           │  wire  │ Rust host                    │
 │ same compiled program    │ ◄────► │  ├ mlua/Luau (same program)  │
 │ DOM bindings             │  WS    │  ├ WebSocket + static serve  │
-└──────────────────────────┘        │  └ (later: durable runtime)  │
+└──────────────────────────┘        │  └ durable Runtime (JSONL + projection) │
                                     └──────────────────────────────┘
 ```
 
@@ -273,13 +273,75 @@ And running for real: `hoprt/hop/todo.hop` is the multiplayer todo app —
 hiccup views, marked lambdas as click handlers, served to actual browsers
 by `hopd` (`cargo run -p hoprt --bin hopd -- hoprt/hop/todo.hop`).
 
+## Storage: the durable store is a server library
+
+A hop app that wants to *keep* state declares a schema and a reducer.
+`hopd` opens a [`Runtime`](../src/runtime.rs) on the server VM only:
+JSONL log first, RocksDB projection rebuildable from it. Browser VMs
+never see the store. The only legal write is `store.append(event)` from
+a server segment — the hop spelling of ramalite's `(server! …)`.
+
+```text
+server let schema = store.record([
+  ["todos", store.map(store.record([
+    ["text", store.leaf],
+    ["done", store.leaf]
+  ]))],
+  ["stats", store.record([
+    ["created", store.sum],
+    ["completed", store.sum]
+  ])]
+]);
+
+fn reduce(tx, event) {
+  if event.type == "add" {
+    tx.put(["todos", tx.seq], { text = event.text, done = false });
+    tx.add(["stats", "created"], 1);
+  }
+}
+
+fn add_todo(text) {
+  server!();
+  store.append({ type = "add", text = text });
+  let snapshot = store.items(["todos"]);
+  cast browsers { hui.render("#todos", todo_view(snapshot)); }
+}
+```
+
+What this is, mechanically:
+
+- **`schema`** is data. `store.record` / `store.map` / `store.leaf` /
+  `store.sum` / `store.list` / `store.deque` are constructors; field
+  order is the array order, the same declaration-order ids the Rust
+  `#[derive(Durable)]` layout uses.
+- **`fn reduce(tx, event)`** is a Lua reducer. `tx.put` / `tx.add` /
+  `tx.delete` / `tx.push` / `tx.clear` emit reified writes; `tx.peek`
+  reads committed state; `tx.seq` is the log index (server-assigned
+  ids — never take them from the browser). The Rust host lowers those
+  writes through the untyped path algebra
+  ([`dynpath`](../src/dynpath.rs)) and commits them atomically with
+  the applied offset.
+- **`store.append` / `store.one` / `store.entries` / `store.items` /
+  `store.subtree` / `store.explain` / `store.rebuild` / `store.verify`**
+  are the ramalite surface, now hanging off the hop server VM.
+- **Restart** is `catch_up`. The tape is `hop-data/log.jsonl`;
+  `hopd --data <dir>` sets the directory.
+
+`hoprt/hop/todo.hop` is the running proof: the same multiplayer todo
+app, but a crash or a hopd restart no longer empties the board, and
+`store.verify()` still holds incremental == replay from zero.
+
+Reactive queries (write-key ∩ subscribed range → `cast browsers`) are
+still a library on top of this, not a language feature. hopc checking
+paths against the declared schema is the next compiler pass — the
+runtime already speaks the same navs.
+
 ## Later, not now
 
-- **Storage**: a server segment that appends to durable's event log is the
-  ramalite hookup; reactive queries are a server watcher that
-  `cast browsers` invalidations. Libraries over these semantics, not
-  language features. Next up, with a design of its own: typed paths — the
-  Rust side's path algebra, checked by hopc against a declared schema.
+- **Reactive invalidation**: a server watcher that `cast browsers`
+  only the queries whose key ranges intersect the event's write set.
+- **hopc path check**: typed paths against the declared schema, so a
+  mistyped `store.one({"todoes", id})` is a compile error.
 - **Syntax**: deferred on purpose. Requirements recorded: braces, no
   whitespace sensitivity, no mandatory type annotations, MoonScript-level
   sugar. (Hiccup data literals: done, see above.)

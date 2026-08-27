@@ -42,8 +42,10 @@ fn recv_json(ws: &mut Ws) -> serde_json::Value {
 fn hopd_serves_the_todo_app_over_real_sockets() {
     let src = include_str!("../hop/todo.hop");
     let lua = hoprt::compiler::compile(src).expect("hopc compile");
+    let data = tempfile::tempdir().unwrap();
+    let data_path = data.path().to_path_buf();
     thread::spawn(move || {
-        let _ = hoprt::serve::serve(lua, HTTP_PORT, WS_PORT);
+        let _ = hoprt::serve::serve(lua, HTTP_PORT, WS_PORT, data_path);
     });
 
     // ── tab A connects: hello, then the on_connect snapshot (empty board)
@@ -85,7 +87,7 @@ fn hopd_serves_the_todo_app_over_real_sockets() {
     // is exactly this packet); the broadcast reaches BOTH tabs
     let call = serde_json::json!({
         "kind": "call", "flow": "B#1", "to": "server", "hop": "todo_view:l1:1",
-        "vars": { "i": 1 },
+        "vars": { "id": 0 },
         // a forged origin: hopd must overwrite it with the connection's id
         "origin": "A", "reply_to": "A",
     });

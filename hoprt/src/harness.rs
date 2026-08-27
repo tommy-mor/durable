@@ -5,9 +5,12 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use mlua::{Function, Lua, LuaSerdeExt, Value as LuaValue};
+
+use crate::store;
 
 type Queue = Rc<RefCell<VecDeque<serde_json::Value>>>;
 type Log = Rc<RefCell<Vec<String>>>;
@@ -20,6 +23,8 @@ pub struct Host {
     queue: Queue,
     log: Log,
     verbose: bool,
+    data_dir: PathBuf,
+    _keep: Option<tempfile::TempDir>,
 }
 
 fn compact(v: &serde_json::Value) -> String {
@@ -35,17 +40,69 @@ fn emit(log: &Log, verbose: bool, line: String) {
 
 impl Host {
     /// Build the cluster. Every VM loads the identical `app_code` program.
+    /// The server VM gets a fresh durable data dir (temp).
     pub fn new(sessions: &[&str], app_code: &str, verbose: bool) -> mlua::Result<Self> {
+        let keep = tempfile::tempdir().map_err(mlua::Error::external)?;
+        let data_dir = keep.path().to_path_buf();
+        Self::with_data(sessions, app_code, verbose, data_dir, Some(keep))
+    }
+
+    /// Build the cluster against an existing data directory (reopen / persist).
+    pub fn with_data_dir(
+        sessions: &[&str],
+        app_code: &str,
+        verbose: bool,
+        data_dir: impl AsRef<Path>,
+    ) -> mlua::Result<Self> {
+        Self::with_data(
+            sessions,
+            app_code,
+            verbose,
+            data_dir.as_ref().to_path_buf(),
+            None,
+        )
+    }
+
+    fn with_data(
+        sessions: &[&str],
+        app_code: &str,
+        verbose: bool,
+        data_dir: PathBuf,
+        keep: Option<tempfile::TempDir>,
+    ) -> mlua::Result<Self> {
         let queue: Queue = Rc::new(RefCell::new(VecDeque::new()));
         let log: Log = Rc::new(RefCell::new(Vec::new()));
         let mut vms = HashMap::new();
         let mut addrs = vec!["server".to_string()];
         addrs.extend(sessions.iter().map(|s| s.to_string()));
         for addr in addrs {
-            let vm = Self::make_vm(&addr, app_code, queue.clone(), log.clone(), verbose)?;
+            let vm = Self::make_vm(
+                &addr,
+                app_code,
+                queue.clone(),
+                log.clone(),
+                verbose,
+                &data_dir,
+            )?;
             vms.insert(addr, vm);
         }
-        Ok(Self { vms, queue, log, verbose })
+        Ok(Self {
+            vms,
+            queue,
+            log,
+            verbose,
+            data_dir,
+            _keep: keep,
+        })
+    }
+
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
+    }
+
+    /// Evaluate a Lua chunk on the server VM. Used by persistence tests.
+    pub fn eval_server<R: mlua::FromLuaMulti>(&self, code: &str) -> mlua::Result<R> {
+        self.vms["server"].load(code).set_name("eval-server").call(())
     }
 
     fn make_vm(
@@ -54,6 +111,7 @@ impl Host {
         queue: Queue,
         log: Log,
         verbose: bool,
+        data_dir: &Path,
     ) -> mlua::Result<Lua> {
         let lua = Lua::new();
         let is_server = addr == "server";
@@ -97,7 +155,13 @@ impl Host {
 
         lua.load(HOPRT_LUA).set_name("hoprt.lua").exec()?;
         lua.load(HUI_LUA).set_name("hui.lua").exec()?;
+        if is_server {
+            store::install_constructors(&lua)?;
+        }
         lua.load(app_code).set_name("app.lua").exec()?;
+        if is_server {
+            store::bind(&lua, data_dir)?;
+        }
         Ok(lua)
     }
 

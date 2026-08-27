@@ -1,24 +1,52 @@
-// todo.hop — a multiplayer todo app: hiccup UI, no HTML strings.
+// todo.hop — multiplayer todos on the durable store.
 //
 //   cargo run -p hoprt --bin hopd -- hoprt/hop/todo.hop
 //   open http://localhost:9000 in two tabs — they stay in sync.
+//   restart hopd: the JSONL tape restores the board.
 //
-// The view is data. The click handler is a real closure sitting in an
-// attribute — it captures the loop variable `i` lexically (it never
-// crosses the wire), and its body hops: mutate on the server, broadcast
-// the new state to every tab.
+// Schema + reducer are server-side. Clicks append events; the reducer
+// decides what they mean; queries read the projection. The view is still
+// data, and the click handler is still a real closure — only the mutation
+// crossed the line from `todos[i] = …` to `store.append`.
 
-server let todos = [];
+server let schema = store.record([
+  ["todos", store.map(store.record([
+    ["text", store.leaf],
+    ["done", store.leaf]
+  ]))],
+  ["stats", store.record([
+    ["created", store.sum],
+    ["completed", store.sum]
+  ])]
+]);
+
+fn reduce(tx, event) {
+  if event.type == "add" {
+    tx.put(["todos", tx.seq], { text = event.text, done = false });
+    tx.add(["stats", "created"], 1);
+  } else {
+    if event.type == "toggle" {
+      let done = tx.peek(["todos", event.id, "done"]);
+      tx.put(["todos", event.id, "done"], !done);
+      if done {
+        tx.add(["stats", "completed"], -1);
+      } else {
+        tx.add(["stats", "completed"], 1);
+      }
+    }
+  }
+}
 
 fn todo_view(items) {
   let rows = [];
   for i, item in items {
+    let id = item.id;
     table.insert(rows, [:li, {
       class = item.done && "done",
       onclick = fn(e) {
-        server!();                              // ships {i}
-        todos[i].done = !todos[i].done;
-        let snapshot = todos;
+        server!();                              // ships {id}
+        store.append({ type = "toggle", id = id });
+        let snapshot = store.items(["todos"]);
         cast browsers {
           hui.render("#todos", todo_view(snapshot));
         }
@@ -30,8 +58,8 @@ fn todo_view(items) {
 
 fn add_todo(text) {
   server!();                                    // ships {text}
-  table.insert(todos, { text = text, done = false });
-  let snapshot = todos;
+  store.append({ type = "add", text = text });
+  let snapshot = store.items(["todos"]);
   cast browsers {
     hui.render("#todos", todo_view(snapshot));
   }
@@ -39,7 +67,7 @@ fn add_todo(text) {
 
 // hopd invokes this when a tab connects: bring the newcomer up to date.
 fn on_connect(sid) {
-  let snapshot = todos;
+  let snapshot = store.items(["todos"]);
   cast session(sid) {
     hui.render("#todos", todo_view(snapshot));
   }
