@@ -75,6 +75,11 @@ export async function waitConnected(page: Page): Promise<string> {
     () => (document.getElementById('status')?.textContent || '').includes('connected'),
     { timeout: 60_000 },
   );
+  // on_connect paints #app; wait so tests don't race a still-empty shell
+  await page.waitForFunction(
+    () => (document.getElementById('app')?.childElementCount || 0) > 0,
+    { timeout: 30_000 },
+  );
   const text = await page.locator('#status').textContent();
   const m = /session (\S+)/.exec(text || '');
   return m?.[1] || '';
