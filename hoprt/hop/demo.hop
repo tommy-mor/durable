@@ -1,0 +1,88 @@
+// demo.hop — the pipeline demo, in hopc v0 syntax.
+//
+// Compiled by hopc into the Lua that lua/app.lua previously hand-wrote,
+// then run on the hoprt cluster. Placement marks split function bodies;
+// what crosses each hop is computed by the compiler (liveness), not
+// declared by the programmer.
+
+server let taken = { alice = true, bob = true, root = true };
+server let members = { };
+server let palette = ["tomato", "steelblue", "seagreen", "orchid"];
+server let n_members = 0;
+
+fn check_handle(handle) {
+  print("check '" .. handle .. "' ...");
+  server!();                                  // ships {handle}
+  if handle == "root" {
+    error("reserved handle");                 // unwinds across the wire
+  }
+  let ok = !taken[handle];
+  browser!();                                 // ships {handle, ok} — handle
+                                              // is still live (echoed below)
+  if ok {
+    print("  -> '" .. handle .. "' is available");
+  } else {
+    print("  -> '" .. handle .. "' is taken");
+  }
+  return ok;
+}
+
+// Unmarked: location-agnostic, runs wherever it is called — here, in a
+// browser segment of delete_account.
+fn confirm_dialog(n) {
+  print("  [dialog] really delete " .. n .. " items? (user clicks yes)");
+  return true;
+}
+
+// Four marks, five segments: n must ship through the middle hops to reach
+// the segments that use it — the chain liveness case.
+fn delete_account() {
+  server!();
+  let n = 3;
+  browser!();                                 // ships {n}
+  let yes = confirm_dialog(n);
+  server!();                                  // ships {n, yes}
+  let msg = "kept";
+  if yes {
+    print("purged data for session " .. session());
+    msg = "deleted " .. n .. " items";
+  }
+  browser!();                                 // ships {msg}
+  print("account: " .. msg);
+}
+
+fn wb_connect() {
+  server!();
+  n_members = n_members + 1;
+  let color = palette[((n_members - 1) % 4) + 1];
+  members[session()] = color;
+  print("session " .. session() .. " joins as " .. color);
+}
+
+// Nested casts: the outer body captures {from, to}; the inner body
+// captures {from, to, color} — color exists only server-side.
+fn stroke(from, to) {
+  print("draw " .. from .. " -> " .. to .. " in silver (optimistic echo)");
+  cast server {
+    let color = members[session()];
+    cast browsers {
+      print("draw " .. from .. " -> " .. to .. " in " .. color);
+    }
+  }
+}
+
+// Entry points the host fires; each spawn is "a DOM event".
+fn demo_join() {
+  spawn wb_connect();
+}
+
+fn demo_flows() {
+  spawn check_handle("carol");
+  spawn check_handle("alice");
+  spawn check_handle("root");
+  spawn delete_account();
+}
+
+fn demo_stroke() {
+  spawn stroke("(1,1)", "(2,3)");
+}

@@ -188,6 +188,26 @@ every VM must have zero suspended flows once the queue drains.
 Swapping the in-process queue for a WebSocket changes no semantics; that is
 the claim the spike exists to test.
 
+**hopc v0 exists and closes the loop.** `hoprt/src/compiler.rs` compiles a
+v0 subset of the brace layer — `fn`, `let`, `if`/`else`, assignment,
+placement marks, nested `cast` blocks, `spawn`, `server let` globals — into
+exactly the segment-closure form above. Liveness is computed statically
+(the variables the remainder references, intersected with scope), marks
+inside branches are rejected at compile time, and the same demo runs
+compiled from source:
+
+```text
+cargo run -p hoprt -- hoprt/hop/demo.hop    # .hop → hopc → cluster
+cargo run -p hoprt                          # hand-compiled app.lua
+cargo test -p hoprt                         # pipeline + liveness assertions
+```
+
+The wire log of the compiled run shows the analysis working: the
+`delete_account` chain ships `{} → {n} → {n, yes} → {msg}` across its four
+hops, and the phase-2 tail of `reply` packets unwinding segment by segment
+is the naive return chain — the tail-hop optimization deferred above,
+visible in a transcript.
+
 ## Examples
 
 In [`../examples/netlua/`](../examples/netlua/), written in the brace layer

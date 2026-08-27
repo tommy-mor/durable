@@ -2,6 +2,7 @@
 name = "hoprt"
 version = "0.1.0"
 edition = "2021"
+default-run = "hoprt"
 description = "Spike: hop runtime for network-aware Lua — segment closures, coroutine flows, and a simulated browser/server wire, before the compiler exists"
 license = "MIT OR Apache-2.0"
 
