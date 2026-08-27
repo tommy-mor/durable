@@ -13,6 +13,7 @@ type Queue = Rc<RefCell<VecDeque<serde_json::Value>>>;
 type Log = Rc<RefCell<Vec<String>>>;
 
 const HOPRT_LUA: &str = include_str!("../lua/hoprt.lua");
+const HUI_LUA: &str = include_str!("../lua/hui.lua");
 
 pub struct Host {
     vms: HashMap<String, Lua>,
@@ -95,6 +96,7 @@ impl Host {
         lua.globals().set("__print", print_fn)?;
 
         lua.load(HOPRT_LUA).set_name("hoprt.lua").exec()?;
+        lua.load(HUI_LUA).set_name("hui.lua").exec()?;
         lua.load(app_code).set_name("app.lua").exec()?;
         Ok(lua)
     }
@@ -102,6 +104,12 @@ impl Host {
     /// Simulate an event: call a global entry point on one VM.
     pub fn fire(&self, addr: &str, entry: &str) -> mlua::Result<()> {
         self.vms[addr].globals().get::<Function>(entry)?.call::<()>(())
+    }
+
+    /// Like `fire`, with one argument — e.g. clicking a rendered hui
+    /// handler by calling `__handler_fire(id)`.
+    pub fn fire_with(&self, addr: &str, entry: &str, arg: i64) -> mlua::Result<()> {
+        self.vms[addr].globals().get::<Function>(entry)?.call::<()>(arg)
     }
 
     fn deliver(&self, addr: &str, pkt: &serde_json::Value) -> mlua::Result<()> {

@@ -26,6 +26,7 @@ use tungstenite::Message;
 const INDEX_HTML: &str = include_str!("../web/index.html");
 const GLUE_JS: &str = include_str!("../web/glue.js");
 const HOPRT_LUA: &str = include_str!("../lua/hoprt.lua");
+const HUI_LUA: &str = include_str!("../lua/hui.lua");
 
 enum Ev {
     Conn(String, mpsc::Sender<String>),
@@ -48,6 +49,7 @@ fn http_thread(port: u16, app_code: String) {
             "/" | "/index.html" => (INDEX_HTML, "text/html; charset=utf-8"),
             "/glue.js" => (GLUE_JS, "application/javascript"),
             "/hoprt.lua" => (HOPRT_LUA, "text/plain; charset=utf-8"),
+            "/hui.lua" => (HUI_LUA, "text/plain; charset=utf-8"),
             "/app.lua" => (app_code.as_str(), "text/plain; charset=utf-8"),
             _ => {
                 let _ = req.respond(tiny_http::Response::empty(404));
@@ -166,6 +168,7 @@ pub fn serve(app_code: String, http_port: u16, ws_port: u16) -> mlua::Result<()>
     })?;
     lua.globals().set("__print", print_fn)?;
     lua.load(HOPRT_LUA).set_name("hoprt.lua").exec()?;
+    lua.load(HUI_LUA).set_name("hui.lua").exec()?;
     lua.load(&app_code).set_name("app.lua").exec()?;
 
     let mut sessions: HashMap<String, mpsc::Sender<String>> = HashMap::new();

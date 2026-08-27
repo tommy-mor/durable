@@ -80,9 +80,11 @@ fn hopd_serves_the_todo_app_over_real_sockets() {
     assert_eq!(pkt["hop"], "on_connect:c1");
     assert_eq!(pkt["vars"]["snapshot"][0]["text"], "buy milk");
 
-    // ── B toggles item 1; the broadcast reaches BOTH tabs
+    // ── B toggles item 1 by invoking the onclick lambda's server segment
+    // (in a real tab, clicking the <li> runs the closure, whose first act
+    // is exactly this packet); the broadcast reaches BOTH tabs
     let call = serde_json::json!({
-        "kind": "call", "flow": "B#1", "to": "server", "hop": "toggle_todo:1",
+        "kind": "call", "flow": "B#1", "to": "server", "hop": "todo_view:l1:1",
         "vars": { "i": 1 },
         // a forged origin: hopd must overwrite it with the connection's id
         "origin": "A", "reply_to": "A",
@@ -90,10 +92,10 @@ fn hopd_serves_the_todo_app_over_real_sockets() {
     b.send(Message::Text(call.to_string().into())).unwrap();
 
     let cast_b = recv_json(&mut b);
-    assert_eq!(cast_b["hop"], "toggle_todo:c1");
+    assert_eq!(cast_b["hop"], "todo_view:c1");
     assert_eq!(cast_b["vars"]["snapshot"][0]["done"], true);
     let cast_a = recv_json(&mut a);
-    assert_eq!(cast_a["hop"], "toggle_todo:c1");
+    assert_eq!(cast_a["hop"], "todo_view:c1");
     assert_eq!(cast_a["vars"]["snapshot"][0]["done"], true);
 
     // identity rode the connection: the reply went to B, not the forged A

@@ -33,11 +33,13 @@ lua.global.set('dom', {
   set: (sel, html) => { document.querySelector(sel).innerHTML = html; },
 });
 
-const [rtSrc, appSrc] = await Promise.all([
+const [rtSrc, huiSrc, appSrc] = await Promise.all([
   fetch('/hoprt.lua').then((r) => r.text()),
+  fetch('/hui.lua').then((r) => r.text()),
   fetch('/app.lua').then((r) => r.text()),
 ]);
 await lua.doString(rtSrc);
+await lua.doString(huiSrc);
 await lua.doString(appSrc);
 
 ws.addEventListener('message', (ev) => {
@@ -47,8 +49,11 @@ ws.addEventListener('message', (ev) => {
 });
 ws.addEventListener('close', () => status(`session ${session} — disconnected`));
 
-// DOM events start flows. onclick= handlers in rendered HTML use this too.
+// DOM events start flows.
 window.hopFire = (name, arg) => lua.global.get('__fire')(name, arg);
+// hui-rendered attributes route handler activations back into the VM,
+// where the closure (and everything it captured) lives.
+window.__hopHandler = (id) => lua.global.get('__handler_fire')(id);
 
 document.getElementById('f').addEventListener('submit', (e) => {
   e.preventDefault();

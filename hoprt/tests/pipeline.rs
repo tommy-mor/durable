@@ -94,18 +94,40 @@ fn todo_app_runs_on_simulated_cluster() {
     let host = Host::new(&["A", "B"], &code, false).expect("host");
     host.fire("A", "sim_demo").unwrap();
     host.pump().unwrap();
+
+    // "Click" the first todo on tab A. Handler ids are deterministic here:
+    // render 1 minted id 1 (one item), render 2 released it and minted 2, 3
+    // — so id 2 is the first <li>'s onclick closure, which captured i = 1.
+    host.fire_with("A", "__handler_fire", 2).unwrap();
+    host.pump().unwrap();
     host.assert_quiescent().unwrap();
 
     let all = host.log().join("\n");
-    // final state rendered on BOTH tabs: item 1 toggled done, item 2 not
-    let final_html = "<li class=\"done\" onclick=\"hopFire('toggle_todo', 1)\">buy milk</li>\
-                      <li onclick=\"hopFire('toggle_todo', 2)\">write the compiler</li>";
+    // final render on BOTH tabs: item 1 struck through, item 2 not.
+    // (render 3 released ids 2 and 3, minted 4 and 5 — never reused.)
+    let final_html = "<ul>\
+                      <li class=\"done\" onclick=\"__hopHandler(4)\">buy milk</li>\
+                      <li onclick=\"__hopHandler(5)\">write the compiler</li>\
+                      </ul>";
     for tab in ["A", "B"] {
         assert!(
             all.contains(&format!("[browser {tab}] [dom] #todos := {final_html}")),
             "tab {tab} missing final render:\n{all}"
         );
     }
+}
+
+#[test]
+fn lambda_with_marks_ships_only_its_captures() {
+    let src = include_str!("../hop/todo.hop");
+    let lua = compiler::compile(src).expect("hopc compile");
+    // the onclick lambda hops to the server carrying only the loop index it
+    // captured — not item, rows, or the items array
+    assert!(lua.contains(r#"return rt.at("server", "todo_view:l1:1", { i = i })"#), "{lua}");
+    // its server segment is registered like any other, and the cast inside
+    // it carries the snapshot
+    assert!(lua.contains(r#"rt.register("todo_view:l1:1""#), "{lua}");
+    assert!(lua.contains(r#"rt.cast("browsers", "todo_view:c1", { snapshot = snapshot })"#), "{lua}");
 }
 
 #[test]

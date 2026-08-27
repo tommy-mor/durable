@@ -13,8 +13,11 @@
 //!        | "spawn" call ";"                        start a flow (an "event")
 //!        | "return" expr? ";"
 //!        | "if" expr block ("else" (block|if))?
+//!        | "for" k "," v "in" expr block           array iteration (ipairs)
 //!        | lvalue "=" expr ";"                     assignment
 //!        | expr ";"
+//! expr  := ... | ":name"                           keyword → string literal
+//!        | "fn" "(" params ")" block               lambda; may contain marks
 //! ```
 //!
 //! Compilation of a marked function: the body splits into segments at the
@@ -25,9 +28,16 @@
 //! that are in scope before the mark. Cast bodies compile the same way
 //! under `name:cN` ids with their own captured-vars set.
 //!
+//! Lambdas may contain marks. A lambda's segment 0 is emitted inline as a
+//! real Lua closure, so whatever it captures (loop variables, locals) is
+//! captured by Lua's own lexical scoping on the VM where the lambda was
+//! built — closures never cross the wire. Only the marked remainder ships,
+//! as usual, under `enclosing:lN:i` hop ids. This is what makes hiccup
+//! attributes like `onclick = fn(e) { server!(); ... }` work.
+//!
 //! v0 restrictions (deliberate): marks only at the top level of a function
-//! body; flows originate on the browser; no while/for; no try/catch
-//! (errors still propagate — they surface at the flow origin).
+//! or lambda body; flows originate on the browser; no while loops; no
+//! try/catch (errors still propagate — they surface at the flow origin).
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
@@ -41,6 +51,7 @@ enum Tok {
     Ident(String),
     Num(String),
     Str(String),
+    Keyword(String),
     LParen,
     RParen,
     LBrace,
@@ -107,6 +118,17 @@ fn lex(src: &str) -> Result<Vec<Tok>, String> {
             '>' => { out.push(Tok::Gt); i += 1 }
             '&' if two('&') => { out.push(Tok::AndAnd); i += 2 }
             '|' if two('|') => { out.push(Tok::OrOr); i += 2 }
+            ':' => {
+                i += 1;
+                let start = i;
+                while i < cs.len() && (cs[i].is_ascii_alphanumeric() || cs[i] == '_' || cs[i] == '-') {
+                    i += 1;
+                }
+                if i == start {
+                    return Err("expected identifier after ':'".into());
+                }
+                out.push(Tok::Keyword(cs[start..i].iter().collect()));
+            }
             '"' => {
                 i += 1;
                 let mut s = String::new();
@@ -171,6 +193,8 @@ enum Expr {
     Binary(&'static str, Box<Expr>, Box<Expr>),
     Table(Vec<(String, Expr)>),
     Array(Vec<Expr>),
+    /// `fn (params) { ... }` in expression position; body may contain marks
+    Fn(Vec<String>, Vec<Stmt>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -259,6 +283,19 @@ impl Parser {
         }
     }
 
+    fn params(&mut self) -> Result<Vec<String>, String> {
+        self.expect(Tok::LParen)?;
+        let mut params = Vec::new();
+        while !matches!(self.peek(), Some(Tok::RParen)) {
+            params.push(self.ident()?);
+            if matches!(self.peek(), Some(Tok::Comma)) {
+                self.pos += 1;
+            }
+        }
+        self.expect(Tok::RParen)?;
+        Ok(params)
+    }
+
     fn items(&mut self) -> Result<Vec<Item>, String> {
         let mut out = Vec::new();
         while self.peek().is_some() {
@@ -273,15 +310,7 @@ impl Parser {
             } else if self.at_kw("fn") {
                 self.eat_kw("fn")?;
                 let name = self.ident()?;
-                self.expect(Tok::LParen)?;
-                let mut params = Vec::new();
-                while !matches!(self.peek(), Some(Tok::RParen)) {
-                    params.push(self.ident()?);
-                    if matches!(self.peek(), Some(Tok::Comma)) {
-                        self.pos += 1;
-                    }
-                }
-                self.expect(Tok::RParen)?;
+                let params = self.params()?;
                 let body = self.block()?;
                 out.push(Item::Fn(name, params, body));
             } else {
@@ -537,9 +566,17 @@ impl Parser {
     }
 
     fn primary(&mut self) -> Result<Expr, String> {
+        // lambda: `fn (params) { ... }`
+        if self.at_kw("fn") {
+            self.eat_kw("fn")?;
+            let params = self.params()?;
+            let body = self.block()?;
+            return Ok(Expr::Fn(params, body));
+        }
         match self.next()? {
             Tok::Num(n) => Ok(Expr::Num(n)),
             Tok::Str(s) => Ok(Expr::Str(s)),
+            Tok::Keyword(k) => Ok(Expr::Str(k)),
             Tok::Ident(s) if s == "true" => Ok(Expr::Bool(true)),
             Tok::Ident(s) if s == "false" => Ok(Expr::Bool(false)),
             Tok::Ident(s) if s == "nil" => Ok(Expr::Nil),
@@ -615,6 +652,8 @@ fn refs_expr(e: &Expr, out: &mut BTreeSet<String>) {
                 refs_expr(v, out);
             }
         }
+        // a lambda's captures are whatever its body references
+        Expr::Fn(_, body) => refs_stmts(body, out),
         _ => {}
     }
 }
@@ -662,6 +701,36 @@ fn toplevel_lets(ss: &[Stmt]) -> Vec<String> {
         .collect()
 }
 
+/// Marks are only legal at the top level of a (fn or lambda) body — not in
+/// branches, loops, or cast bodies. Lambda bodies are separate flow bodies
+/// and are checked when the lambda itself is compiled.
+fn check_no_nested_marks(ss: &[Stmt]) -> Result<(), String> {
+    let reject = |body: &[Stmt], what: &str| -> Result<(), String> {
+        for st in body {
+            if matches!(st, Stmt::Mark(_)) {
+                return Err(format!("v0: placement marks are not allowed inside {what}"));
+            }
+        }
+        check_no_nested_marks(body)
+    };
+    for s in ss {
+        match s {
+            Stmt::If(_, t, e) => {
+                reject(t, "branches; marks must be at the top level of a function body")?;
+                if let Some(e) = e {
+                    reject(e, "branches; marks must be at the top level of a function body")?;
+                }
+            }
+            Stmt::For(_, _, _, body) => {
+                reject(body, "loop bodies; marks must be at the top level of a function body")?
+            }
+            Stmt::Cast(_, body) => reject(body, "cast bodies")?,
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Codegen
 // ---------------------------------------------------------------------------
@@ -669,50 +738,14 @@ fn toplevel_lets(ss: &[Stmt]) -> Vec<String> {
 struct Gen {
     /// rt.register(...) blocks, emitted after all function definitions.
     regs: Vec<String>,
-    /// per-function cast counter for stable `name:cN` hop ids
+    /// per-function counters for stable `name:cN` / `name:lN` hop ids
     cast_n: u32,
+    lambda_n: u32,
     fn_name: String,
 }
 
 fn lua_str(s: &str) -> String {
     format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n"))
-}
-
-fn emit_expr(e: &Expr) -> String {
-    match e {
-        Expr::Num(n) => n.clone(),
-        Expr::Str(s) => lua_str(s),
-        Expr::Bool(true) => "true".into(),
-        Expr::Bool(false) => "false".into(),
-        Expr::Nil => "nil".into(),
-        Expr::Ident(n) => n.clone(),
-        Expr::Field(b, f) => format!("{}.{}", emit_expr(b), f),
-        Expr::Index(a, b) => format!("{}[{}]", emit_expr(a), emit_expr(b)),
-        Expr::Call(f, args) => {
-            // session() is the runtime's identity primitive
-            if matches!(f.as_ref(), Expr::Ident(n) if n == "session") && args.is_empty() {
-                return "rt.session()".into();
-            }
-            let args: Vec<String> = args.iter().map(emit_expr).collect();
-            format!("{}({})", emit_expr(f), args.join(", "))
-        }
-        Expr::Unary(op, a) => {
-            if *op == "not" {
-                format!("not ({})", emit_expr(a))
-            } else {
-                format!("{}({})", op, emit_expr(a))
-            }
-        }
-        Expr::Binary(op, a, b) => format!("({} {} {})", emit_expr(a), op, emit_expr(b)),
-        Expr::Table(fs) => {
-            let fs: Vec<String> = fs.iter().map(|(k, v)| format!("{} = {}", k, emit_expr(v))).collect();
-            format!("{{ {} }}", fs.join(", "))
-        }
-        Expr::Array(items) => {
-            let items: Vec<String> = items.iter().map(emit_expr).collect();
-            format!("{{ {} }}", items.join(", "))
-        }
-    }
 }
 
 fn vars_table(names: &BTreeSet<String>) -> String {
@@ -728,43 +761,200 @@ fn hop_target(side: Side) -> &'static str {
     }
 }
 
+/// Split a flow body at its top-level marks.
+fn split_segments(body: &[Stmt], name: &str) -> Result<Vec<(Side, Vec<Stmt>)>, String> {
+    let mut segs: Vec<(Side, Vec<Stmt>)> = vec![(Side::Browser, Vec::new())];
+    for s in body {
+        if let Stmt::Mark(side) = s {
+            let (cur, _) = segs.last().unwrap();
+            if *cur == *side {
+                return Err(format!("{name}: mark to the side already executing"));
+            }
+            segs.push((*side, Vec::new()));
+        } else {
+            segs.last_mut().unwrap().1.push(s.clone());
+        }
+    }
+    Ok(segs)
+}
+
 impl Gen {
+    fn emit_expr(&mut self, e: &Expr, scope: &[String]) -> Result<String, String> {
+        Ok(match e {
+            Expr::Num(n) => n.clone(),
+            Expr::Str(s) => lua_str(s),
+            Expr::Bool(true) => "true".into(),
+            Expr::Bool(false) => "false".into(),
+            Expr::Nil => "nil".into(),
+            Expr::Ident(n) => n.clone(),
+            Expr::Field(b, f) => format!("{}.{}", self.emit_expr(b, scope)?, f),
+            Expr::Index(a, b) => {
+                format!("{}[{}]", self.emit_expr(a, scope)?, self.emit_expr(b, scope)?)
+            }
+            Expr::Call(f, args) => {
+                // session() is the runtime's identity primitive
+                if matches!(f.as_ref(), Expr::Ident(n) if n == "session") && args.is_empty() {
+                    return Ok("rt.session()".into());
+                }
+                let mut parts = Vec::new();
+                for a in args {
+                    parts.push(self.emit_expr(a, scope)?);
+                }
+                format!("{}({})", self.emit_expr(f, scope)?, parts.join(", "))
+            }
+            Expr::Unary(op, a) => {
+                if *op == "not" {
+                    format!("not ({})", self.emit_expr(a, scope)?)
+                } else {
+                    format!("{}({})", op, self.emit_expr(a, scope)?)
+                }
+            }
+            Expr::Binary(op, a, b) => format!(
+                "({} {} {})",
+                self.emit_expr(a, scope)?,
+                op,
+                self.emit_expr(b, scope)?
+            ),
+            Expr::Table(fs) => {
+                let mut parts = Vec::new();
+                for (k, v) in fs {
+                    parts.push(format!("{} = {}", k, self.emit_expr(v, scope)?));
+                }
+                format!("{{ {} }}", parts.join(", "))
+            }
+            Expr::Array(items) => {
+                let mut parts = Vec::new();
+                for v in items {
+                    parts.push(self.emit_expr(v, scope)?);
+                }
+                format!("{{ {} }}", parts.join(", "))
+            }
+            Expr::Fn(params, body) => self.lambda(params, body, scope)?,
+        })
+    }
+
+    /// A lambda's segment 0 is a real Lua closure — captures are lexical,
+    /// on the VM where the lambda was built. The marked remainder ships
+    /// under `enclosing:lN:i` hop ids like any other segments.
+    fn lambda(&mut self, params: &[String], body: &[Stmt], scope: &[String]) -> Result<String, String> {
+        self.lambda_n += 1;
+        let prefix = format!("{}:l{}", self.fn_name, self.lambda_n);
+        let mut base: Vec<String> = scope.to_vec();
+        base.extend(params.iter().cloned());
+        let inner = self.flow_body(&prefix, body, &base)?;
+        Ok(format!("function({})\n{}  end", params.join(", "), inner))
+    }
+
+    /// Emit a flow body (used by named fns and lambdas): segment 0's code,
+    /// with the chain to segment 1 if marks are present. Registers later
+    /// segments under `{prefix}:{i}`.
+    fn flow_body(&mut self, prefix: &str, body: &[Stmt], base_scope: &[String]) -> Result<String, String> {
+        check_no_nested_marks(body)?;
+        let segs = split_segments(body, prefix)?;
+        let n = segs.len();
+
+        if n == 1 {
+            let mut out = String::new();
+            let mut scope = base_scope.to_vec();
+            self.stmts(&segs[0].1, &mut scope, 1, &mut out)?;
+            return Ok(out);
+        }
+
+        // ship set for each hop i (into segment i):
+        //   refs(segments i..end) ∩ scope at the end of segment i-1
+        let mut ship: Vec<BTreeSet<String>> = vec![BTreeSet::new(); n];
+        let mut scope_end: Vec<Vec<String>> = vec![Vec::new(); n];
+        scope_end[0] = base_scope.to_vec();
+        scope_end[0].extend(toplevel_lets(&segs[0].1));
+        for i in 1..n {
+            let mut refs = BTreeSet::new();
+            for (_, seg) in &segs[i..] {
+                refs_stmts(seg, &mut refs);
+            }
+            ship[i] = refs.into_iter().filter(|r| scope_end[i - 1].contains(r)).collect();
+            scope_end[i] = ship[i].iter().cloned().collect();
+            scope_end[i].extend(toplevel_lets(&segs[i].1));
+        }
+
+        // segment 0 plus the chain into segment 1
+        let mut out = String::new();
+        let mut scope = base_scope.to_vec();
+        self.stmts(&segs[0].1, &mut scope, 1, &mut out)?;
+        let _ = writeln!(
+            out,
+            "  return rt.at({}, {}, {})",
+            hop_target(segs[1].0),
+            lua_str(&format!("{prefix}:1")),
+            vars_table(&ship[1])
+        );
+
+        // registered segments 1..n-1
+        for i in 1..n {
+            let mut reg = String::new();
+            let _ = writeln!(reg, "rt.register({}, function(__vars)", lua_str(&format!("{prefix}:{i}")));
+            for v in &ship[i] {
+                let _ = writeln!(reg, "  local {v} = __vars.{v}");
+            }
+            let mut seg_scope: Vec<String> = ship[i].iter().cloned().collect();
+            self.stmts(&segs[i].1, &mut seg_scope, 1, &mut reg)?;
+            if i + 1 < n {
+                let _ = writeln!(
+                    reg,
+                    "  return rt.at({}, {}, {})",
+                    hop_target(segs[i + 1].0),
+                    lua_str(&format!("{prefix}:{}", i + 1)),
+                    vars_table(&ship[i + 1])
+                );
+            }
+            let _ = writeln!(reg, "end)");
+            self.regs.push(reg);
+        }
+
+        Ok(out)
+    }
+
     /// Emit statements at `indent`, tracking `scope` (in-scope locals) so
-    /// cast sites know what to capture.
-    fn stmts(&mut self, ss: &[Stmt], scope: &mut Vec<String>, indent: usize, out: &mut String) {
+    /// cast sites and lambdas know what is capturable.
+    fn stmts(&mut self, ss: &[Stmt], scope: &mut Vec<String>, indent: usize, out: &mut String) -> Result<(), String> {
         let pad = "  ".repeat(indent);
         for s in ss {
             match s {
                 Stmt::Let(n, e) => {
-                    let _ = writeln!(out, "{pad}local {} = {}", n, emit_expr(e));
+                    let rhs = self.emit_expr(e, scope)?;
+                    let _ = writeln!(out, "{pad}local {n} = {rhs}");
                     scope.push(n.clone());
                 }
                 Stmt::Assign(l, r) => {
-                    let _ = writeln!(out, "{pad}{} = {}", emit_expr(l), emit_expr(r));
+                    let lhs = self.emit_expr(l, scope)?;
+                    let rhs = self.emit_expr(r, scope)?;
+                    let _ = writeln!(out, "{pad}{lhs} = {rhs}");
                 }
                 Stmt::Return(Some(e)) => {
-                    let _ = writeln!(out, "{pad}return {}", emit_expr(e));
+                    let v = self.emit_expr(e, scope)?;
+                    let _ = writeln!(out, "{pad}return {v}");
                 }
                 Stmt::Return(None) => {
                     let _ = writeln!(out, "{pad}return");
                 }
                 Stmt::If(c, t, e) => {
-                    let _ = writeln!(out, "{pad}if {} then", emit_expr(c));
+                    let cond = self.emit_expr(c, scope)?;
+                    let _ = writeln!(out, "{pad}if {cond} then");
                     let mut inner = scope.clone();
-                    self.stmts(t, &mut inner, indent + 1, out);
+                    self.stmts(t, &mut inner, indent + 1, out)?;
                     if let Some(e) = e {
                         let _ = writeln!(out, "{pad}else");
                         let mut inner = scope.clone();
-                        self.stmts(e, &mut inner, indent + 1, out);
+                        self.stmts(e, &mut inner, indent + 1, out)?;
                     }
                     let _ = writeln!(out, "{pad}end");
                 }
                 Stmt::For(k, v, e, body) => {
-                    let _ = writeln!(out, "{pad}for {}, {} in ipairs({}) do", k, v, emit_expr(e));
+                    let it = self.emit_expr(e, scope)?;
+                    let _ = writeln!(out, "{pad}for {k}, {v} in ipairs({it}) do");
                     let mut inner = scope.clone();
                     inner.push(k.clone());
                     inner.push(v.clone());
-                    self.stmts(body, &mut inner, indent + 1, out);
+                    self.stmts(body, &mut inner, indent + 1, out)?;
                     let _ = writeln!(out, "{pad}end");
                 }
                 Stmt::Mark(_) => {
@@ -785,14 +975,14 @@ impl Gen {
                     for n in &captured {
                         let _ = writeln!(reg, "  local {n} = __vars.{n}");
                     }
-                    self.stmts(body, &mut body_scope, 1, &mut reg);
+                    self.stmts(body, &mut body_scope, 1, &mut reg)?;
                     let _ = writeln!(reg, "end)");
                     self.regs.push(reg);
                     // the send site
                     let tgt = match target {
                         CastTarget::Browsers => "\"browsers\"".to_string(),
                         CastTarget::Server => "\"server\"".to_string(),
-                        CastTarget::Session(e) => emit_expr(e),
+                        CastTarget::Session(e) => self.emit_expr(e, scope)?,
                     };
                     let _ = writeln!(
                         out,
@@ -803,144 +993,31 @@ impl Gen {
                     );
                 }
                 Stmt::Spawn(e) => {
-                    let _ = writeln!(out, "{pad}rt.start_flow(function() {} end)", emit_expr(e));
+                    let call = self.emit_expr(e, scope)?;
+                    let _ = writeln!(out, "{pad}rt.start_flow(function() {call} end)");
                 }
                 Stmt::Expr(e) => {
-                    let _ = writeln!(out, "{pad}{}", emit_expr(e));
+                    let v = self.emit_expr(e, scope)?;
+                    let _ = writeln!(out, "{pad}{v}");
                 }
             }
         }
+        Ok(())
     }
-}
-
-fn check_no_nested_marks(ss: &[Stmt]) -> Result<(), String> {
-    for s in ss {
-        match s {
-            Stmt::If(_, t, e) => {
-                for inner in [Some(t), e.as_ref()].into_iter().flatten() {
-                    for st in inner {
-                        if matches!(st, Stmt::Mark(_)) {
-                            return Err(
-                                "v0: placement marks are only allowed at the top level of a function body"
-                                    .into(),
-                            );
-                        }
-                    }
-                    check_no_nested_marks(inner)?;
-                }
-            }
-            Stmt::Cast(_, body) => {
-                for st in body {
-                    if matches!(st, Stmt::Mark(_)) {
-                        return Err("v0: placement marks are not allowed inside cast bodies".into());
-                    }
-                }
-                check_no_nested_marks(body)?;
-            }
-            Stmt::For(_, _, _, body) => {
-                for st in body {
-                    if matches!(st, Stmt::Mark(_)) {
-                        return Err(
-                            "v0: placement marks are only allowed at the top level of a function body"
-                                .into(),
-                        );
-                    }
-                }
-                check_no_nested_marks(body)?;
-            }
-            _ => {}
-        }
-    }
-    Ok(())
 }
 
 fn emit_fn(name: &str, params: &[String], body: &[Stmt], out: &mut String, regs: &mut Vec<String>) -> Result<(), String> {
-    check_no_nested_marks(body)?;
-
-    // split at top-level marks; flows originate on the browser
-    let mut segs: Vec<(Side, Vec<Stmt>)> = vec![(Side::Browser, Vec::new())];
-    for s in body {
-        if let Stmt::Mark(side) = s {
-            let (cur, _) = segs.last().unwrap();
-            if *cur == *side {
-                return Err(format!("fn {name}: mark to the side already executing"));
-            }
-            segs.push((*side, Vec::new()));
-        } else {
-            segs.last_mut().unwrap().1.push(s.clone());
-        }
-    }
-
-    let mut gen = Gen { regs: Vec::new(), cast_n: 0, fn_name: name.to_string() };
-
-    if segs.len() == 1 {
-        // unmarked: a plain, location-agnostic function
-        let mut code = String::new();
-        let _ = writeln!(code, "function {}({})", name, params.join(", "));
-        let mut scope: Vec<String> = params.to_vec();
-        gen.stmts(&segs[0].1, &mut scope, 1, &mut code);
-        let _ = writeln!(code, "end");
-        out.push_str(&code);
-        out.push('\n');
-        regs.append(&mut gen.regs);
-        return Ok(());
-    }
-
-    // ship set for each hop i (into segment i):
-    //   refs(segments i..end) ∩ scope at the end of segment i-1
-    let n = segs.len();
-    let mut ship: Vec<BTreeSet<String>> = vec![BTreeSet::new(); n];
-    let mut scope_end: Vec<Vec<String>> = vec![Vec::new(); n];
-    scope_end[0] = params.to_vec();
-    scope_end[0].extend(toplevel_lets(&segs[0].1));
-    for i in 1..n {
-        let mut refs = BTreeSet::new();
-        for (_, seg) in &segs[i..] {
-            refs_stmts(seg, &mut refs);
-        }
-        ship[i] = refs.into_iter().filter(|r| scope_end[i - 1].contains(r)).collect();
-        scope_end[i] = ship[i].iter().cloned().collect();
-        scope_end[i].extend(toplevel_lets(&segs[i].1));
-    }
-
-    // origin function: segment 0, then chain to segment 1
-    let mut code = String::new();
-    let _ = writeln!(code, "function {}({})", name, params.join(", "));
-    let mut scope: Vec<String> = params.to_vec();
-    gen.stmts(&segs[0].1, &mut scope, 1, &mut code);
-    let _ = writeln!(
-        code,
-        "  return rt.at({}, {}, {})",
-        hop_target(segs[1].0),
-        lua_str(&format!("{name}:1")),
-        vars_table(&ship[1])
-    );
-    let _ = writeln!(code, "end");
-    out.push_str(&code);
+    let mut gen = Gen {
+        regs: Vec::new(),
+        cast_n: 0,
+        lambda_n: 0,
+        fn_name: name.to_string(),
+    };
+    let inner = gen.flow_body(name, body, params)?;
+    let _ = writeln!(out, "function {}({})", name, params.join(", "));
+    out.push_str(&inner);
+    let _ = writeln!(out, "end");
     out.push('\n');
-
-    // registered segments 1..n-1
-    for i in 1..n {
-        let mut reg = String::new();
-        let _ = writeln!(reg, "rt.register({}, function(__vars)", lua_str(&format!("{name}:{i}")));
-        for v in &ship[i] {
-            let _ = writeln!(reg, "  local {v} = __vars.{v}");
-        }
-        let mut scope: Vec<String> = ship[i].iter().cloned().collect();
-        gen.stmts(&segs[i].1, &mut scope, 1, &mut reg);
-        if i + 1 < n {
-            let _ = writeln!(
-                reg,
-                "  return rt.at({}, {}, {})",
-                hop_target(segs[i + 1].0),
-                lua_str(&format!("{name}:{}", i + 1)),
-                vars_table(&ship[i + 1])
-            );
-        }
-        let _ = writeln!(reg, "end)");
-        gen.regs.push(reg);
-    }
-
     regs.append(&mut gen.regs);
     Ok(())
 }
@@ -959,12 +1036,17 @@ pub fn compile(src: &str) -> Result<String, String> {
     for item in &items {
         match item {
             Item::ServerLet(name, e) => {
-                let _ = writeln!(
-                    out,
-                    "if SIDE == \"server\" then\n  {} = {}\nend\n",
-                    name,
-                    emit_expr(e)
-                );
+                let mut gen = Gen {
+                    regs: Vec::new(),
+                    cast_n: 0,
+                    lambda_n: 0,
+                    fn_name: name.to_string(),
+                };
+                let rhs = gen.emit_expr(e, &[])?;
+                if !gen.regs.is_empty() {
+                    return Err(format!("server let {name}: marked lambdas not allowed here"));
+                }
+                let _ = writeln!(out, "if SIDE == \"server\" then\n  {name} = {rhs}\nend\n");
             }
             Item::Fn(name, params, body) => emit_fn(name, params, body, &mut out, &mut regs)?,
         }

@@ -208,6 +208,56 @@ hops, and the phase-2 tail of `reply` packets unwinding segment by segment
 is the naive return chain — the tail-hop optimization deferred above,
 visible in a transcript.
 
+## UI as data: hui, and closures in attributes
+
+The first todo app built its HTML by string concatenation, with
+`onclick="hopFire('toggle_todo', 1)"` embedded in the strings — stringly
+typed UI, the exact thing this project exists to remove. The fix has two
+halves, and the second is the interesting one.
+
+**hui** (`hoprt/lua/hui.lua`) is a hiccup renderer, loaded into every VM
+like the runtime itself. A node is data — `[:li, { class = "done" },
+text]` — with keyword literals (`:li` is just a string), attribute maps,
+and fragments (a list built with `table.insert` splices in place). Nothing
+novel; it exists so views are values that plain functions like
+`todo_view(items)` can return, on whichever VM happens to be rendering.
+
+**Function-valued attributes are closures, and closures may hop.** This
+falls out of the compilation model rather than being a feature bolted on:
+segments were already closures, so a lambda in an attribute compiles the
+same way any marked function body does — its segment 0 is emitted *inline*
+as a real Lua closure, and the marked remainder registers under
+`enclosing:lN:i` hop ids. The whole todo item, view and behavior:
+
+```text
+[:li, {
+  class = item.done && "done",
+  onclick = fn(e) {
+    server!();                       // ships {i} — the closure's capture
+    todos[i].done = !todos[i].done;
+    let snapshot = todos;
+    cast browsers { hui.render("#todos", todo_view(snapshot)); }
+  }
+}, item.text]
+```
+
+The division of labor is exact. The loop variable `i` is captured by Lua's
+own lexical scoping, in the browser VM where the lambda was built — the
+closure itself never crosses the wire (hui registers it in a local handler
+table and rendered HTML calls back by id). Only when the handler *hops*
+does anything ship, and then it's the usual liveness set: `{ i = i }`,
+computed statically. The generated attribute value is two lines:
+
+```text
+onclick = function(e)
+  return rt.at("server", "todo_view:l1:1", { i = i })
+end
+```
+
+Handler ids are minted per render and released when that root re-renders;
+each activation runs as a flow, so handlers get the full hop machinery —
+suspension, replies, error propagation to the click site.
+
 ## Examples
 
 In [`../examples/netlua/`](../examples/netlua/), written in the brace layer
@@ -219,14 +269,22 @@ In [`../examples/netlua/`](../examples/netlua/), written in the brace layer
   linear marks for the authoritative path, `cast` for fan-out, direct
   session sends.
 
+And running for real: `hoprt/hop/todo.hop` is the multiplayer todo app —
+hiccup views, marked lambdas as click handlers, served to actual browsers
+by `hopd` (`cargo run -p hoprt --bin hopd -- hoprt/hop/todo.hop`).
+
 ## Later, not now
 
 - **Storage**: a server segment that appends to durable's event log is the
   ramalite hookup; reactive queries are a server watcher that
   `cast browsers` invalidations. Libraries over these semantics, not
-  language features.
+  language features. Next up, with a design of its own: typed paths — the
+  Rust side's path algebra, checked by hopc against a declared schema.
 - **Syntax**: deferred on purpose. Requirements recorded: braces, no
   whitespace sensitivity, no mandatory type annotations, MoonScript-level
-  sugar, first-class data literals good enough for hiccup.
+  sugar. (Hiccup data literals: done, see above.)
 - **More locations**: web workers and multiple app processes give the
   target slot something to select over again; marks don't change.
+- **hui diffing**: today every render replaces innerHTML under the
+  selector. Fine at this scale; keyed diffing is a renderer upgrade, not a
+  semantics change.
