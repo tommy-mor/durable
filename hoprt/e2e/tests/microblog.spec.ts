@@ -34,9 +34,9 @@ test('microblog: follow then fan-out a post onto the follower timeline', async (
     await b.locator('#draft').fill('only bob');
     await b.locator('#post').click();
     await expect(b.locator('#feed li')).toHaveCount(2);
-    await expect(b.locator('#feed li')).toContainText('only bob');
+    await expect(b.locator('#feed')).toContainText('only bob');
     await expect(a.locator('#feed li')).toHaveCount(1);
-    await expect(a.locator('#feed li')).not.toContainText('only bob');
+    await expect(a.locator('#feed')).not.toContainText('only bob');
 
     await ctxA.close();
     await ctxB.close();
