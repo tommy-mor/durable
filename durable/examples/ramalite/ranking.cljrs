@@ -1,0 +1,92 @@
+;; ranking.cljrs — pairwise preference voting into a weighted edge graph,
+;; per scope, with decay. The shape durable's Sum + merge operator was built
+;; for: every vote is two blind O(1) merges, folded lazily at compaction.
+;;
+;; Run: cljrs run ranking.cljrs
+
+(ns app.ranking
+  (:require [ramalite.core :as r]))
+
+;; ---------------------------------------------------------------------------
+;; Schema. Each scope is an isolated subtree; deleting one is a single
+;; RocksDB range delete.
+
+(def recent-cap 128)
+
+(def schema
+  {:scopes
+   (r/map-of :string
+     (r/struct
+      {:items      (r/map-of :i64 (r/leaf :string))   ; id -> label
+       :edges      (r/map-of [:i64 :i64] (r/sum :f64)); (winner, loser) -> weight
+       :recent     (r/deque-of (r/leaf :vote))        ; bounded audit window
+       :vote-count (r/sum :i64)}))})
+
+;; ---------------------------------------------------------------------------
+;; Reducer.
+
+(defn reduce-event [tx {:keys [ts-ms]} event]
+  (let [scope [:scopes (:scope event)]]
+    (case (:type event)
+      :add-item
+      [(r/put (into scope [:items (:id event)]) (:label event))]
+
+      :vote
+      (let [{:keys [winner loser weight] :or {weight 1.0}} event
+            recent (conj scope :recent)]
+        (cond-> [(r/add (into scope [:edges [winner loser]]) weight)
+                 (r/add (conj scope :vote-count) 1)
+                 (r/push-back recent {:winner winner :loser loser :at ts-ms})]
+          (>= (r/peek tx (conj recent r/COUNT)) recent-cap)
+          (conj (r/pop-front recent))))
+
+      ;; Decay every edge in a scope. This is an *event*, not maintenance —
+      ;; it is on the tape, so replay reproduces it exactly. Reads committed
+      ;; weights, emits one put per edge (transform_values, spelled in data).
+      :decay
+      (let [factor (:factor event)]
+        (mapv (fn [[pair w]]
+                (r/put (into scope [:edges pair]) (* w factor)))
+              (r/peek tx (into scope [:edges r/ENTRIES])))))))
+
+;; ---------------------------------------------------------------------------
+
+(def module
+  {:schema schema
+   :reduce reduce-event
+   :log    "ranking.jsonl"
+   :proj   "ranking.db"})
+
+(defn -main []
+  (let [rt (r/open! module)]
+    (r/append-batch! rt
+      [{:type :add-item :scope "tools" :id 1 :label "grep"}
+       {:type :add-item :scope "tools" :id 2 :label "ripgrep"}
+       {:type :add-item :scope "tools" :id 3 :label "ag"}
+       {:type :vote :scope "tools" :winner 2 :loser 1}
+       {:type :vote :scope "tools" :winner 2 :loser 3}
+       {:type :vote :scope "tools" :winner 1 :loser 3}
+       {:type :vote :scope "tools" :winner 2 :loser 1 :weight 2.0}
+       {:type :decay :scope "tools" :factor 0.9}])
+
+    ;; One edge — a point get on a tuple key.
+    (println "2 beats 1:" (r/one rt [:scopes "tools" :edges [2 1]]))  ; 2.7
+
+    ;; Whole matchup graph for a scope — bounded to the scope's prefix.
+    (println "edges:" (r/entries rt [:scopes "tools" :edges r/ENTRIES]))
+
+    ;; Naive centrality in the client: total win weight per item.
+    (let [wins (reduce (fn [acc [[w _] wt]] (update acc w (fnil + 0.0) wt))
+                       {}
+                       (r/entries rt [:scopes "tools" :edges r/ENTRIES]))]
+      (println "win weight:" (sort-by (comp - val) wins)))
+
+    ;; Audit trail: last votes, newest first.
+    (println "recent:" (r/select rt [:scopes "tools" :recent r/ALL]))
+
+    (r/verify! rt)))
+
+;; Want a different ranking function — Elo, Bradley-Terry, PageRank over the
+;; edge graph? The votes are all on the tape. Change the reducer to maintain
+;; the new state shape, (r/rebuild! rt), and every vote ever cast is
+;; re-scored under the new rules.

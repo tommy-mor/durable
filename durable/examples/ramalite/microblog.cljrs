@@ -1,0 +1,104 @@
+;; microblog.cljrs — Rama's flagship demo shape (their Twitter-scale
+;; Mastodon), at sqlite scale: one process, one .jsonl tape, one RocksDB
+;; projection. Follows, posts, and fan-out-on-write home timelines.
+;;
+;; Run: cljrs run microblog.cljrs
+
+(ns app.microblog
+  (:require [ramalite.core :as r]))
+
+;; ---------------------------------------------------------------------------
+;; Schema. Timelines are materialized per reader (fan-out on write), which is
+;; exactly the PState pattern: compute at write time what reads want to be
+;; a point get / bounded scan.
+
+(def schema
+  {:users     (r/map-of :string (r/struct {:name   (r/leaf :string)
+                                           :joined (r/leaf :i64)}))
+   ;; followee -> follower -> true   (durable has no set; a bool-leaf map is one)
+   :followers (r/map-of :string (r/map-of :string (r/leaf :bool)))
+   ;; author -> append-only list of their own posts
+   :posts     (r/map-of :string (r/list-of (r/leaf :post)))
+   ;; reader -> home timeline, O(1) at both ends
+   :timelines (r/map-of :string (r/deque-of (r/leaf :entry)))
+   :post-count (r/sum :i64)})
+
+(def timeline-cap 400)
+
+;; ---------------------------------------------------------------------------
+;; Reducer. Note what the reducer is allowed to do:
+;;   - read committed state via peek (Tx::db — never its own in-flight writes)
+;;   - use meta for ids and time (seq/ts-ms are stamped at ingest; replay
+;;     reuses the stamped values, so fan-out is deterministic)
+;;   - return writes
+
+(defn reduce-event [tx {:keys [seq ts-ms]} event]
+  (case (:type event)
+    :signup
+    (let [u (:user event)]
+      [(r/put [:users u :name]   (:name event))
+       (r/put [:users u :joined] ts-ms)])
+
+    :follow
+    [(r/put [:followers (:followee event) (:follower event)] true)]
+
+    :unfollow
+    [(r/del [:followers (:followee event) (:follower event)])]
+
+    :post
+    (let [author (:author event)
+          entry  {:id seq :author author :text (:text event) :at ts-ms}
+          ;; committed followers as of the previous event — deterministic
+          ;; under replay because the tape order is the only order.
+          readers (conj (r/peek tx [:followers author r/KEYS]) author)]
+      (into
+       [(r/push [:posts author] entry)
+        (r/add  [:post-count] 1)]
+       (mapcat
+        (fn [reader]
+          (let [tl [:timelines reader]]
+            (cond-> [(r/push-back tl entry)]
+              ;; keep home timelines bounded; deque pops are O(1) and
+              ;; batch-deferred, so this stays one atomic commit.
+              (>= (r/peek tx (conj tl r/COUNT)) timeline-cap)
+              (conj (r/pop-front tl)))))
+        readers)))))
+
+;; ---------------------------------------------------------------------------
+
+(def module
+  {:schema schema
+   :reduce reduce-event
+   :log    "microblog.jsonl"
+   :proj   "microblog.db"})
+
+(defn -main []
+  (let [rt (r/open! module)]
+    (r/append-batch! rt
+      [{:type :signup :user "alice" :name "Alice"}
+       {:type :signup :user "bob"   :name "Bob"}
+       {:type :signup :user "carol" :name "Carol"}
+       {:type :follow :followee "alice" :follower "bob"}
+       {:type :follow :followee "alice" :follower "carol"}
+       {:type :post   :author "alice" :text "hello, tape"}
+       {:type :post   :author "bob"   :text "hi alice"}])
+
+    ;; Bob's home timeline: alice's post (he follows her) + his own.
+    ;; A bounded deque scan — explain says BOUNDED.
+    (println "bob's timeline:"
+             (r/select rt [:timelines "bob" r/ALL :text]))
+
+    ;; Everything alice posted after some point, filtered server-side.
+    (println "alice since seq 5:"
+             (r/select rt [:posts "alice" (r/where (r/ge :id 5)) :text]))
+
+    ;; Who follows alice? Keys of a nested map — no values decoded.
+    (println "alice's followers:" (r/select rt [:followers "alice" r/KEYS]))
+
+    (r/verify! rt)))
+
+;; The schema-evolution story, concretely: want likes? Add
+;;   :likes (r/map-of :i64 (r/sum :i64))
+;; to the schema, a :like branch to the reducer, and (r/rebuild! rt).
+;; Old :post events replay unchanged; there is no migration, because the
+;; projection was never the truth.

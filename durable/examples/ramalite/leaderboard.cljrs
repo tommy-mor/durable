@@ -1,0 +1,66 @@
+;; leaderboard.cljrs — the durable README example, in cljrs.
+;;
+;; Event log:   leaderboard.jsonl (source of truth, one JSON object per line)
+;; Projection:  leaderboard.db    (RocksDB, rebuildable, DisableWal)
+;;
+;; Run: cljrs run leaderboard.cljrs
+
+(ns app.leaderboard
+  (:require [ramalite.core :as r]))
+
+;; ---------------------------------------------------------------------------
+;; Schema — EDN instead of #[derive(Durable)]. Same shapes, same key layout.
+
+(def schema
+  {:scores (r/map-of :string (r/sum :i64))
+   :title  (r/leaf :string)})
+
+;; ---------------------------------------------------------------------------
+;; Reducer — a pure function from [tx meta event] to a vector of reified
+;; writes. Nothing here touches the database; the Rust host lowers each write
+;; to RocksDB ops and commits them atomically with the applied offset.
+
+(defn reduce-event [tx meta event]
+  (case (:type event)
+    :points
+    ;; Sum add is a blind merge — O(1), no read, folded at compaction.
+    [(r/add [:scores (:player event)] (:delta event))]
+
+    :retitle
+    [(r/put [:title] (:name event))]))
+
+;; ---------------------------------------------------------------------------
+;; Wire it up.
+
+(def module
+  {:schema schema
+   :reduce reduce-event
+   :log    "leaderboard.jsonl"
+   :proj   "leaderboard.db"})
+
+(defn -main []
+  (let [rt (r/open! module)]                       ; replays any unapplied tail
+    (r/append-batch! rt                            ; one fsync for the group
+      [{:type :points :player "alice" :delta 10}
+       {:type :points :player "alice" :delta 5}
+       {:type :points :player "bob"   :delta 7}
+       {:type :retitle :name "leaderboard"}])
+
+    ;; Point get — explain says POINT.
+    (println "alice:" (r/one rt [:scores "alice"]))          ; => 15
+
+    ;; Prefix scan over the map — explain says SCAN, and admits it.
+    (println "all scores:" (r/entries rt [:scores r/ENTRIES]))
+
+    ;; Multi-key read shaped like the answer you want.
+    (println (r/project rt {:title [:title]
+                            :top   [:scores r/VALS]}))
+
+    ;; The property that makes live-coding this file safe:
+    (r/verify! rt)                                 ; incremental == replay
+    (println "verified: incremental == replay from zero")))
+
+;; Try it live: change :delta handling above (say, double all points), then
+;;   (r/rebuild! rt)
+;; The projection is now as if the new rule had always existed. The tape
+;; never changed.

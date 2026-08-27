@@ -1,0 +1,126 @@
+;; todo-ui.cljrs — the full-stack pattern (a todo-tournament contestant,
+;; ramalite-style): schema, reducer, UI, and server in one file.
+;;
+;; The marks, borrowed from buzz:
+;;   (server expr)      value computed on the server, streamed to the browser,
+;;                      re-run when the projection keys it read change
+;;   (server! expr)     an RPC — here, always an event append
+;;   (client expr)      a browser value crossing into a server! form
+;;   (local-state init) per-browser state, never sent to the server
+;;
+;; What ramalite changes underneath buzz: server state is not an atom.
+;; Every server! lands on the .jsonl tape; every (server ...) is a query
+;; with an explain-able key range; invalidation is write-set/read-range
+;; prefix intersection, not whole-atom watching.
+;;
+;; Run: cljrs run todo-ui.cljrs   →   http://localhost:1350
+
+(ns app.todo
+  (:require [ramalite.core :as r]
+            [ramalite.ui :refer [defui server server! client local-state
+                                 handler run-server]]))
+
+;; ---------------------------------------------------------------------------
+;; State layer. ids and times come from ingest meta, never from the browser.
+
+(def schema
+  {:todos (r/map-of :i64 (r/struct {:text (r/leaf :string)
+                                    :done (r/leaf :bool)
+                                    :at   (r/leaf :i64)}))
+   :stats (r/struct {:created   (r/sum :i64)
+                     :completed (r/sum :i64)})})
+
+(defn reduce-event [tx {:keys [seq ts-ms]} event]
+  (case (:type event)
+    :add
+    [(r/put [:todos seq :text] (:text event))
+     (r/put [:todos seq :done] false)
+     (r/put [:todos seq :at]   ts-ms)
+     (r/add [:stats :created] 1)]
+
+    :toggle
+    (let [id   (:id event)
+          done (r/peek tx [:todos id :done])]
+      [(r/put [:todos id :done] (not done))
+       (r/add [:stats :completed] (if done -1 1))])
+
+    :remove
+    (let [id (:id event)]
+      (cond-> [(r/del-subtree [:todos id])]      ; one range delete
+        (r/peek tx [:todos id :done])
+        (conj (r/add [:stats :completed] -1))))))
+
+(def rt
+  (r/open! {:schema schema
+            :reduce reduce-event
+            :log    "todos.jsonl"
+            :proj   "todos.db"}))
+
+;; ---------------------------------------------------------------------------
+;; UI layer. The body is client code; the marks cross the wire.
+;;
+;; Reactivity is mechanical: the :todos query below subscribes to the byte
+;; prefix of [:todos]; the :stats query to [:stats]. A :toggle event commits
+;; writes under both prefixes, so both re-run. A hypothetical event touching
+;; only [:sessions ...] would re-render nothing here — no atom to over-watch.
+
+(defui todo-app []
+  (let [todos (server (sort-by (comp :at val)
+                               (r/entries rt [:todos r/ENTRIES])))
+        stats (server (r/subtree rt [:stats]))
+        draft (local-state "")]
+    [:div
+     [:h1 "todos"]
+     [:p (:completed stats) " done of " (:created stats) " ever created"]
+
+     [:input {:value @draft
+              :placeholder "what needs doing?"
+              :on-input (fn [e] (reset! draft (.. e -target -value)))}]
+     [:button {:on-click (fn [_]
+                           ;; the browser sends an event, not a mutation —
+                           ;; the reducer decides what :add means, and the
+                           ;; tape remembers it happened.
+                           (server! (r/append! rt {:type :add
+                                                   :text (client @draft)}))
+                           (reset! draft ""))}
+      "add"]
+
+     [:ul
+      (for [[id {:keys [text done]}] todos]
+        [:li {:key id}
+         [:input {:type "checkbox" :checked done
+                  :on-click (fn [_]
+                              (server! (r/append! rt {:type :toggle
+                                                      :id (client id)})))}]
+         [:span (if done {:style "text-decoration: line-through"} {}) text]
+         [:button {:on-click (fn [_]
+                               (server! (r/append! rt {:type :remove
+                                                       :id (client id)})))}
+          "×"]])]]))
+
+;; ---------------------------------------------------------------------------
+;; Server. :watch takes the runtime, not atoms — commits carry their write
+;; keys, so the handler knows exactly which mounted queries to re-run and
+;; which connected browsers to patch.
+
+(def ui
+  (handler {:title  "todos"
+            :watch  [rt]
+            :mounts [{:el "app" :ui #'todo-app}]}))
+
+(defn -main [& _]
+  (run-server (fn [req] (or (ui req) {:status 404 :body "not found"}))
+              {:port 1350})
+  (println "http://localhost:1350")
+  @(promise))
+
+;; Things this file gets that its atom-backed cousins don't:
+;;
+;;   - Restart the process: buzz reconnects the browsers, the tape restores
+;;     the todos. Nothing was lost because nothing lived in memory.
+;;   - grep todos.jsonl for every toggle ever, with timestamps.
+;;   - Redefine reduce-event live (e.g. make :remove archive instead of
+;;     delete), (r/rebuild! rt) — every connected browser re-renders into
+;;     the world where removes had always been archives.
+;;   - :stats survives any UI rewrite; it is a fold over history, not a
+;;     counter someone remembered to increment.
