@@ -83,6 +83,32 @@ fn liveness_ships_only_what_the_remainder_uses() {
 }
 
 #[test]
+fn todo_app_runs_on_simulated_cluster() {
+    let src = include_str!("../hop/todo.hop");
+    let lua = compiler::compile(src).expect("hopc compile");
+    // the simulated cluster has no DOM; stub it with a print
+    let dom_stub =
+        "dom = { set = function(sel, html) print(\"[dom] \" .. sel .. \" := \" .. html) end }\n";
+    let code = format!("{dom_stub}{lua}");
+
+    let host = Host::new(&["A", "B"], &code, false).expect("host");
+    host.fire("A", "sim_demo").unwrap();
+    host.pump().unwrap();
+    host.assert_quiescent().unwrap();
+
+    let all = host.log().join("\n");
+    // final state rendered on BOTH tabs: item 1 toggled done, item 2 not
+    let final_html = "<li class=\"done\" onclick=\"hopFire('toggle_todo', 1)\">buy milk</li>\
+                      <li onclick=\"hopFire('toggle_todo', 2)\">write the compiler</li>";
+    for tab in ["A", "B"] {
+        assert!(
+            all.contains(&format!("[browser {tab}] [dom] #todos := {final_html}")),
+            "tab {tab} missing final render:\n{all}"
+        );
+    }
+}
+
+#[test]
 fn marks_rejected_inside_branches() {
     let src = "fn f(x) { if x { server!(); } }";
     let err = compiler::compile(src).unwrap_err();

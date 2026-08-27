@@ -1,0 +1,29 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>hop todo</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 480px; margin: 40px auto; padding: 0 16px; }
+    h1 { font-weight: 600; }
+    form { display: flex; gap: 8px; }
+    input { flex: 1; padding: 8px; font-size: 1rem; }
+    button { padding: 8px 16px; font-size: 1rem; cursor: pointer; }
+    ul { padding: 0; }
+    li { list-style: none; cursor: pointer; padding: 8px; border-bottom: 1px solid #eee; }
+    li:hover { background: #f8f8f8; }
+    li.done { text-decoration: line-through; color: #999; }
+    #status { color: #999; font-size: 0.85rem; margin-top: 24px; }
+  </style>
+</head>
+<body>
+  <h1>todos</h1>
+  <form id="f">
+    <input id="text" placeholder="what needs doing?" autocomplete="off">
+    <button>add</button>
+  </form>
+  <ul id="todos"></ul>
+  <div id="status">loading lua…</div>
+  <script type="module" src="/glue.js"></script>
+</body>
+</html>

@@ -160,3 +160,23 @@ end
 function __receive(pkt)
   rt.receive(pkt)
 end
+
+-- Entry-point helpers for hosts and browser glue -----------------------------
+
+-- The browser glue fires DOM events through this: each event is one flow.
+function __fire(name, arg)
+  rt.start_flow(function()
+    _G[name](arg)
+  end)
+end
+
+-- hopd calls this on the server VM when a tab connects. The app may define
+-- on_connect(sid) to bring the newcomer up to date. Server-origin flow:
+-- browser!() is not available inside it, casts are.
+function __session_connect(sid)
+  if _G.on_connect ~= nil then
+    rt.start_flow(function()
+      on_connect(sid)
+    end)
+  end
+end

@@ -113,8 +113,14 @@ fn lex(src: &str) -> Result<Vec<Tok>, String> {
                 while i < cs.len() && cs[i] != '"' {
                     if cs[i] == '\\' && i + 1 < cs.len() {
                         i += 1;
+                        s.push(match cs[i] {
+                            'n' => '\n',
+                            't' => '\t',
+                            c => c,
+                        });
+                    } else {
+                        s.push(cs[i]);
                     }
-                    s.push(cs[i]);
                     i += 1;
                 }
                 if i >= cs.len() {
@@ -186,6 +192,8 @@ enum Stmt {
     Assign(Expr, Expr),
     Return(Option<Expr>),
     If(Expr, Vec<Stmt>, Option<Vec<Stmt>>),
+    /// `for k, v in expr { ... }` — iterates the array part in order (ipairs)
+    For(String, String, Expr, Vec<Stmt>),
     Mark(Side),
     Cast(CastTarget, Vec<Stmt>),
     Spawn(Expr),
@@ -325,6 +333,16 @@ impl Parser {
         }
         if self.at_kw("if") {
             return self.if_stmt();
+        }
+        if self.at_kw("for") {
+            self.eat_kw("for")?;
+            let k = self.ident()?;
+            self.expect(Tok::Comma)?;
+            let v = self.ident()?;
+            self.eat_kw("in")?;
+            let e = self.expr()?;
+            let body = self.block()?;
+            return Ok(Stmt::For(k, v, e, body));
         }
         if self.at_kw("cast") {
             self.eat_kw("cast")?;
@@ -618,6 +636,10 @@ fn refs_stmts(ss: &[Stmt], out: &mut BTreeSet<String>) {
                     refs_stmts(e, out);
                 }
             }
+            Stmt::For(_, _, e, body) => {
+                refs_expr(e, out);
+                refs_stmts(body, out);
+            }
             Stmt::Mark(_) => {}
             Stmt::Cast(t, body) => {
                 if let CastTarget::Session(e) = t {
@@ -737,6 +759,14 @@ impl Gen {
                     }
                     let _ = writeln!(out, "{pad}end");
                 }
+                Stmt::For(k, v, e, body) => {
+                    let _ = writeln!(out, "{pad}for {}, {} in ipairs({}) do", k, v, emit_expr(e));
+                    let mut inner = scope.clone();
+                    inner.push(k.clone());
+                    inner.push(v.clone());
+                    self.stmts(body, &mut inner, indent + 1, out);
+                    let _ = writeln!(out, "{pad}end");
+                }
                 Stmt::Mark(_) => {
                     unreachable!("marks are split before emission; nested marks are rejected")
                 }
@@ -803,6 +833,17 @@ fn check_no_nested_marks(ss: &[Stmt]) -> Result<(), String> {
                 for st in body {
                     if matches!(st, Stmt::Mark(_)) {
                         return Err("v0: placement marks are not allowed inside cast bodies".into());
+                    }
+                }
+                check_no_nested_marks(body)?;
+            }
+            Stmt::For(_, _, _, body) => {
+                for st in body {
+                    if matches!(st, Stmt::Mark(_)) {
+                        return Err(
+                            "v0: placement marks are only allowed at the top level of a function body"
+                                .into(),
+                        );
                     }
                 }
                 check_no_nested_marks(body)?;

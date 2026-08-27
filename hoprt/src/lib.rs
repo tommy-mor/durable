@@ -7,3 +7,4 @@
 
 pub mod compiler;
 pub mod harness;
+pub mod serve;

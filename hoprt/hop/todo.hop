@@ -1,0 +1,63 @@
+// todo.hop — a multiplayer todo app in hopc v0.
+//
+// One file: server state, choreographed functions, rendering. Serve it for
+// real browsers with:
+//
+//   cargo run -p hoprt --bin hopd -- hoprt/hop/todo.hop
+//   open http://localhost:9000 in two tabs — they stay in sync.
+//
+// Every mutation is: browser event → hop to server (authoritative state) →
+// broadcast a snapshot → every tab re-renders. The tabs hold no state at
+// all; the DOM is a projection of the server.
+
+server let todos = [];
+
+// Location-agnostic renderer: runs on whichever browser receives the cast.
+// dom.* is provided by the environment (glue.js in a real browser, a stub
+// in the simulated cluster).
+fn render_list(items) {
+  let html = "";
+  for i, item in items {
+    let cls = "";
+    if item.done {
+      cls = " class=\"done\"";
+    }
+    html = html .. "<li" .. cls .. " onclick=\"hopFire('toggle_todo', " .. i .. ")\">"
+                .. item.text .. "</li>";
+  }
+  dom.set("#todos", html);
+}
+
+// Called by hopd (as a server-origin flow) when a tab connects: bring the
+// newcomer up to date without disturbing anyone else.
+fn on_connect(sid) {
+  let snapshot = todos;
+  cast session(sid) {
+    render_list(snapshot);
+  }
+}
+
+fn add_todo(text) {
+  server!();                                  // ships {text}
+  table.insert(todos, { text = text, done = false });
+  let snapshot = todos;
+  cast browsers {                             // captures {snapshot}
+    render_list(snapshot);
+  }
+}
+
+fn toggle_todo(i) {
+  server!();                                  // ships {i}
+  todos[i].done = !todos[i].done;
+  let snapshot = todos;
+  cast browsers {
+    render_list(snapshot);
+  }
+}
+
+// Entry for the simulated-cluster test (each spawn = one DOM event).
+fn sim_demo() {
+  spawn add_todo("buy milk");
+  spawn add_todo("write the compiler");
+  spawn toggle_todo(1);
+}
