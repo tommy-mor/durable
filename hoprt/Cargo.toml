@@ -1,0 +1,10 @@
+[package]
+name = "hoprt"
+version = "0.1.0"
+edition = "2021"
+description = "Spike: hop runtime for network-aware Lua — segment closures, coroutine flows, and a simulated browser/server wire, before the compiler exists"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+mlua = { version = "0.10", features = ["luau", "serialize"] }
+serde_json = "1.0"
