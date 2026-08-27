@@ -45,15 +45,17 @@ fn session_name(n: usize) -> String {
     }
 }
 
-fn http_thread(port: u16, app_code: String) {
+fn http_thread(port: u16, ws_port: u16, app_code: String) {
     let server = tiny_http::Server::http(("0.0.0.0", port)).expect("bind http");
+    let config = format!(r#"{{"wsPort":{ws_port}}}"#);
     for req in server.incoming_requests() {
         let (content, ctype) = match req.url() {
-            "/" | "/index.html" => (INDEX_HTML, "text/html; charset=utf-8"),
-            "/glue.js" => (GLUE_JS, "application/javascript"),
-            "/hoprt.lua" => (HOPRT_LUA, "text/plain; charset=utf-8"),
-            "/hui.lua" => (HUI_LUA, "text/plain; charset=utf-8"),
-            "/app.lua" => (app_code.as_str(), "text/plain; charset=utf-8"),
+            "/" | "/index.html" => (INDEX_HTML.to_string(), "text/html; charset=utf-8"),
+            "/glue.js" => (GLUE_JS.to_string(), "application/javascript"),
+            "/config.json" => (config.clone(), "application/json"),
+            "/hoprt.lua" => (HOPRT_LUA.to_string(), "text/plain; charset=utf-8"),
+            "/hui.lua" => (HUI_LUA.to_string(), "text/plain; charset=utf-8"),
+            "/app.lua" => (app_code.clone(), "text/plain; charset=utf-8"),
             _ => {
                 let _ = req.respond(tiny_http::Response::empty(404));
                 continue;
@@ -152,7 +154,7 @@ pub fn serve(
 ) -> mlua::Result<()> {
     {
         let app = app_code.clone();
-        thread::spawn(move || http_thread(http_port, app));
+        thread::spawn(move || http_thread(http_port, ws_port, app));
     }
     let (tx, rx) = mpsc::channel::<Ev>();
     {

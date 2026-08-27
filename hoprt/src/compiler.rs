@@ -13,7 +13,7 @@
 //!        | "spawn" call ";"                        start a flow (an "event")
 //!        | "return" expr? ";"
 //!        | "if" expr block ("else" (block|if))?
-//!        | "for" k "," v "in" expr block           array iteration (ipairs)
+//!        | "for" k "," v "in" ["pairs"] expr block ipairs, or pairs if marked
 //!        | lvalue "=" expr ";"                     assignment
 //!        | expr ";"
 //! expr  := ... | ":name"                           keyword → string literal
@@ -216,8 +216,8 @@ enum Stmt {
     Assign(Expr, Expr),
     Return(Option<Expr>),
     If(Expr, Vec<Stmt>, Option<Vec<Stmt>>),
-    /// `for k, v in expr { ... }` — iterates the array part in order (ipairs)
-    For(String, String, Expr, Vec<Stmt>),
+    /// `for k, v in expr { ... }` — ipairs. `for k, v in pairs expr` — pairs.
+    For(String, String, Expr, Vec<Stmt>, bool),
     Mark(Side),
     Cast(CastTarget, Vec<Stmt>),
     Spawn(Expr),
@@ -369,9 +369,15 @@ impl Parser {
             self.expect(Tok::Comma)?;
             let v = self.ident()?;
             self.eat_kw("in")?;
+            let pairs = if self.at_kw("pairs") {
+                self.pos += 1;
+                true
+            } else {
+                false
+            };
             let e = self.expr()?;
             let body = self.block()?;
-            return Ok(Stmt::For(k, v, e, body));
+            return Ok(Stmt::For(k, v, e, body, pairs));
         }
         if self.at_kw("cast") {
             self.eat_kw("cast")?;
@@ -675,7 +681,7 @@ fn refs_stmts(ss: &[Stmt], out: &mut BTreeSet<String>) {
                     refs_stmts(e, out);
                 }
             }
-            Stmt::For(_, _, e, body) => {
+            Stmt::For(_, _, e, body, _) => {
                 refs_expr(e, out);
                 refs_stmts(body, out);
             }
@@ -721,7 +727,7 @@ fn check_no_nested_marks(ss: &[Stmt]) -> Result<(), String> {
                     reject(e, "branches; marks must be at the top level of a function body")?;
                 }
             }
-            Stmt::For(_, _, _, body) => {
+            Stmt::For(_, _, _, body, _) => {
                 reject(body, "loop bodies; marks must be at the top level of a function body")?
             }
             Stmt::Cast(_, body) => reject(body, "cast bodies")?,
@@ -948,9 +954,10 @@ impl Gen {
                     }
                     let _ = writeln!(out, "{pad}end");
                 }
-                Stmt::For(k, v, e, body) => {
+                Stmt::For(k, v, e, body, pairs) => {
                     let it = self.emit_expr(e, scope)?;
-                    let _ = writeln!(out, "{pad}for {k}, {v} in ipairs({it}) do");
+                    let iter = if *pairs { "pairs" } else { "ipairs" };
+                    let _ = writeln!(out, "{pad}for {k}, {v} in {iter}({it}) do");
                     let mut inner = scope.clone();
                     inner.push(k.clone());
                     inner.push(v.clone());

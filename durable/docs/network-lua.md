@@ -331,6 +331,25 @@ What this is, mechanically:
 app, but a crash or a hopd restart no longer empties the board, and
 `store.verify()` still holds incremental == replay from zero.
 
+The same store is what the larger apps sit on — they exist to see
+whether hop + the tape scale past a todo list:
+
+- [`hoprt/hop/ranking.hop`](../../hoprt/hop/ranking.hop) — pairwise
+  votes into a `Sum` edge graph, plus decay as an event (replay
+  reproduces the 0.9 scale).
+- [`hoprt/hop/microblog.hop`](../../hoprt/hop/microblog.hop) —
+  follows and fan-out-on-write home timelines. The reducer peeks
+  the author's follower list and `tx.push`es the new post id onto
+  every inbox.
+- [`hoprt/hop/chat.hop`](../../hoprt/hop/chat.hop) — rooms as a
+  nested `Map → List`. Switching rooms is a query; a send is one
+  `ListPush` under that prefix.
+
+Each one is served by `hopd` the same way (`cargo run -p hoprt
+--bin hopd -- hoprt/hop/<app>.hop`). Simulated-cluster coverage
+lives in `hoprt/tests/apps.rs`; two-tab browser coverage is
+`hoprt/e2e` (Playwright against a real `hopd`).
+
 Reactive queries (write-key ∩ subscribed range → `cast browsers`) are
 still a library on top of this, not a language feature. hopc checking
 paths against the declared schema is the next compiler pass — the
