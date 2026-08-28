@@ -70,7 +70,7 @@ pub use query::{
     entries, explain, one, project, select, subtree, CostClass, Expr, Nav, Plan, Predicate, Query,
     Terminal,
 };
-pub use runtime::{JsonlLog, Runtime, Tx};
+pub use runtime::{JsonlLog, Meta, Record, Runtime, Tx};
 pub use schema::{Deque, Leaf, List, Map, Schema, Sum, Summable};
 pub use shape::{Describe, Shape};
 

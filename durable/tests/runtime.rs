@@ -62,7 +62,7 @@ fn open_rt(dir: &TempDir) -> Runtime<Event> {
 #[test]
 fn append_indexes_everything() {
     let dir = TempDir::new().unwrap();
-    let mut rt = open_rt(&dir);
+    let rt = open_rt(&dir);
 
     rt.append(Event::Evidence(Evidence {
         id: "e1".into(),
@@ -124,7 +124,7 @@ fn append_indexes_everything() {
 #[test]
 fn incremental_equals_replay_from_zero() {
     let dir = TempDir::new().unwrap();
-    let mut rt = open_rt(&dir);
+    let rt = open_rt(&dir);
     for i in 0..20 {
         rt.append(Event::Evidence(Evidence {
             id: format!("e{i}"),
@@ -156,7 +156,7 @@ fn incremental_equals_replay_from_zero() {
 fn catch_up_from_existing_log() {
     let dir = TempDir::new().unwrap();
     {
-        let mut rt = open_rt(&dir);
+        let rt = open_rt(&dir);
         rt.append(Event::Evidence(Evidence {
             id: "e1".into(),
             kind: "llm.judgment".into(),
@@ -165,7 +165,7 @@ fn catch_up_from_existing_log() {
         .unwrap();
     }
     // Reopen: projection exists and should catch up (no-op) then accept more.
-    let mut rt = open_rt(&dir);
+    let rt = open_rt(&dir);
     assert_eq!(rt.applied().unwrap(), 1);
     rt.append(Event::Evidence(Evidence {
         id: "e2".into(),
@@ -180,7 +180,7 @@ fn catch_up_from_existing_log() {
 #[test]
 fn append_keeps_log_len_without_reread() {
     let dir = TempDir::new().unwrap();
-    let mut rt = open_rt(&dir);
+    let rt = open_rt(&dir);
     for i in 0..50 {
         rt.append(Event::Evidence(Evidence {
             id: format!("e{i}"),
@@ -189,8 +189,167 @@ fn append_keeps_log_len_without_reread() {
         }))
         .unwrap();
     }
-    assert_eq!(rt.log().len().unwrap(), 50);
+    assert_eq!(rt.log_len().unwrap(), 50);
     assert_eq!(rt.applied().unwrap(), 50);
     rt.verify().unwrap();
 }
 
+#[test]
+fn ingest_stamps_seq_and_monotonic_ts() {
+    let dir = TempDir::new().unwrap();
+    let rt = open_rt(&dir);
+    let a = rt
+        .append(Event::Evidence(Evidence {
+            id: "e1".into(),
+            kind: "llm.judgment".into(),
+            epoch: 1,
+        }))
+        .unwrap();
+    let b = rt
+        .append(Event::Evidence(Evidence {
+            id: "e2".into(),
+            kind: "git.commit".into(),
+            epoch: 2,
+        }))
+        .unwrap();
+    assert_eq!(a.seq, 0);
+    assert_eq!(b.seq, 1);
+    assert!(b.ts_ms >= a.ts_ms);
+    assert!(a.ts_ms > 0);
+
+    let tape = std::fs::read_to_string(dir.path().join("log.jsonl")).unwrap();
+    let line: serde_json::Value = serde_json::from_str(tape.lines().next().unwrap()).unwrap();
+    assert_eq!(line["seq"], 0);
+    assert!(line["ts_ms"].as_u64().unwrap() > 0);
+    assert_eq!(line["event"]["type"], "evidence");
+    assert!(
+        line.get("type").is_none(),
+        "event body is nested, not flattened"
+    );
+}
+
+#[test]
+fn append_batch_is_one_contiguous_seq_run() {
+    let dir = TempDir::new().unwrap();
+    let rt = open_rt(&dir);
+    let recs = rt
+        .append_batch(vec![
+            Event::Evidence(Evidence {
+                id: "e0".into(),
+                kind: "llm.judgment".into(),
+                epoch: 0,
+            }),
+            Event::Evidence(Evidence {
+                id: "e1".into(),
+                kind: "git.commit".into(),
+                epoch: 1,
+            }),
+            Event::Evidence(Evidence {
+                id: "e2".into(),
+                kind: "llm.judgment".into(),
+                epoch: 2,
+            }),
+        ])
+        .unwrap();
+    assert_eq!(recs.len(), 3);
+    assert_eq!(recs[0].seq, 0);
+    assert_eq!(recs[1].seq, 1);
+    assert_eq!(recs[2].seq, 2);
+    assert!(recs[0].ts_ms <= recs[1].ts_ms && recs[1].ts_ms <= recs[2].ts_ms);
+    assert_eq!(rt.log_len().unwrap(), 3);
+    assert_eq!(rt.applied().unwrap(), 3);
+
+    let kinds = rt
+        .select(&Query::new(vec![
+            Nav::Field("events".into()),
+            Nav::All,
+            Nav::Field("kind".into()),
+        ]))
+        .unwrap();
+    assert_eq!(kinds.len(), 3);
+    rt.verify().unwrap();
+}
+
+#[test]
+fn reducer_sees_ingest_meta() {
+    use durable::Tx;
+    use std::sync::{Mutex, OnceLock};
+
+    static LAST: OnceLock<Mutex<Option<(u64, u64)>>> = OnceLock::new();
+    fn last() -> &'static Mutex<Option<(u64, u64)>> {
+        LAST.get_or_init(|| Mutex::new(None))
+    }
+
+    fn reduce_meta(tx: &mut Tx, event: &Event) -> durable::Result<()> {
+        *last().lock().unwrap() = Some((tx.meta().seq, tx.meta().ts_ms));
+        reduce(tx, event)
+    }
+
+    let dir = TempDir::new().unwrap();
+    let rt = Runtime::open_described::<Store>(
+        dir.path().join("proj"),
+        dir.path().join("log.jsonl"),
+        None,
+        reduce_meta,
+    )
+    .unwrap();
+    let rec = rt
+        .append(Event::Evidence(Evidence {
+            id: "e1".into(),
+            kind: "llm.judgment".into(),
+            epoch: 1,
+        }))
+        .unwrap();
+    let seen = last().lock().unwrap().unwrap();
+    assert_eq!(seen.0, rec.seq);
+    assert_eq!(seen.1, rec.ts_ms);
+}
+
+#[test]
+fn queries_run_without_exclusive_lock() {
+    use std::sync::Arc;
+    use std::thread;
+
+    let dir = TempDir::new().unwrap();
+    let rt = Arc::new(open_rt(&dir));
+    rt.append(Event::Evidence(Evidence {
+        id: "seed".into(),
+        kind: "llm.judgment".into(),
+        epoch: 0,
+    }))
+    .unwrap();
+
+    let q = Query::new(vec![
+        Nav::Field("evidence_by_id".into()),
+        Nav::Key(Value::Text("seed".into())),
+    ]);
+    let readers: Vec<_> = (0..4)
+        .map(|_| {
+            let rt = rt.clone();
+            let q = q.clone();
+            thread::spawn(move || {
+                for _ in 0..80 {
+                    assert!(rt.one(&q).unwrap().is_some());
+                }
+            })
+        })
+        .collect();
+    for i in 0..40 {
+        rt.append(Event::Evidence(Evidence {
+            id: format!("e{i}"),
+            kind: "git.commit".into(),
+            epoch: i,
+        }))
+        .unwrap();
+    }
+    for h in readers {
+        h.join().unwrap();
+    }
+    assert_eq!(rt.applied().unwrap(), 41);
+}
+
+#[test]
+fn runtime_is_sync() {
+    fn assert_sync<T: Sync>() {}
+    assert_sync::<Runtime<Event>>();
+}

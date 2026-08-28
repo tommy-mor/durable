@@ -20,6 +20,7 @@ on the client side of the boundary.
 ```rust
 fn reduce(tx: &mut Tx, event: &Event) -> Result<()> {
     let root = Store::root();
+    // tx.meta().seq / tx.meta().ts_ms are stamped at ingest, not by the caller.
     match event {
         Event::Evidence(e) => {
             tx.write(root.events().push_op(e));

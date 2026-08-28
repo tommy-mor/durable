@@ -42,7 +42,7 @@ fn reduce(tx: &mut Tx, event: &Event) -> durable::Result<()> {
 
 fn main() -> durable::Result<()> {
     let dir = tempfile::tempdir().unwrap();
-    let mut rt = Runtime::open_described::<Store>(
+    let rt = Runtime::open_described::<Store>(
         dir.path().join("proj"),
         dir.path().join("log.jsonl"),
         None,

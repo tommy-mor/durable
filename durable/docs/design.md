@@ -95,11 +95,19 @@ in-place migration when a schema changes.
 ## Runtime
 
 [`Runtime<E>`](../src/runtime.rs) is that pairing. The JSONL log is the source
-of truth (appended and fsynced first). The reducer receives a [`Tx`] and writes
-typed paths. The applied offset is committed in the same RocksDB batch as the
+of truth. Callers supply an event body; the runtime stamps a [`Record`] with a
+sequence number and a monotonic millisecond timestamp, then fsyncs that line
+(or a whole [`append_batch`] group) before reducing. The reducer receives a
+[`Tx`] whose [`Tx::meta`] is that stamp — ids and times are not minted by the
+client. The applied offset is committed in the same RocksDB batch as the
 event's projection writes, so a crash before commit replays the event against
 the previous projection. `DisableWal` is the right durability for the
 projection: it is rebuildable.
+
+Writes take an internal mutex. Query methods only read RocksDB, which already
+supports concurrent snapshots, so an in-flight fsync does not block `one` /
+`select`. `append_batch` is the group-commit primitive: N events, one
+`sync_data`.
 
 `rebuild()` range-deletes the projection and reduces from event 0.
 `verify()` checks the live projection against a fresh replay. The property
