@@ -1,0 +1,189 @@
+// microblog.hop — follows, posts, fan-out-on-write home timelines.
+//
+// A post is one event. The reducer peeks the author's follower list
+// (committed state) and pushes the new post id onto every reader's
+// timeline, including the author's. Two tabs: follow someone, see their
+// next post land on your home feed.
+//
+//   cargo run -p hoprt --bin hopd -- hoprt/hop/microblog.hop
+
+server let schema = store.record([
+  ["users", store.map(store.record([
+    ["name", store.leaf]
+  ]))],
+  ["followers", store.map(store.list(store.leaf))],
+  ["posts", store.map(store.record([
+    ["author", store.leaf],
+    ["text", store.leaf]
+  ]))],
+  ["timelines", store.map(store.list(store.leaf))],
+  ["post_count", store.sum]
+]);
+
+fn reduce(tx, event) {
+  if event.type == "join" {
+    tx.put(["users", event.sid, "name"], event.name);
+  } else {
+    if event.type == "follow" {
+      tx.push(["followers", event.who], event.sid);
+    } else {
+      if event.type == "post" {
+        let id = tx.seq;
+        tx.put(["posts", id], { author = event.sid, text = event.text });
+        tx.add(["post_count"], 1);
+        tx.push(["timelines", event.sid], id);
+        let fans = tx.peek(["followers", event.sid]);
+        if fans {
+          for i, fan in fans {
+            tx.push(["timelines", fan], id);
+          }
+        }
+      }
+    }
+  }
+}
+
+fn gather_timeline(sid) {
+  let ids = store.one(["timelines", sid]);
+  let rows = [];
+  if ids {
+    for i, id in ids {
+      let p = store.one(["posts", id]);
+      if p {
+        p.id = id;
+        table.insert(rows, p);
+      }
+    }
+  }
+  return rows;
+}
+
+fn name_of(sid, users) {
+  for i, u in users {
+    if u.id == sid {
+      return u.name;
+    }
+  }
+  return sid;
+}
+
+fn blog_view(me, users, feed) {
+  let people = [];
+  for i, u in users {
+    if u.id != me {
+      let id = u.id;
+      table.insert(people, [:li, { class = "user" },
+        u.name .. " (" .. id .. ") ",
+        [:button, {
+          class = "follow",
+          id = "follow-" .. id,
+          onclick = fn(e) {
+            server!();
+            store.append({ type = "follow", sid = session(), who = id });
+            let us = store.items(["users"]);
+            let tl = gather_timeline(session());
+            cast session(session()) {
+              hui.render("#app", blog_view(me, us, tl));
+            }
+          }
+        }, "follow"]
+      ]);
+    }
+  }
+  let posts = [];
+  for i, p in feed {
+    table.insert(posts, [:li, { class = "post" },
+      [:span, { class = "meta" }, name_of(p.author, users) .. ": "],
+      p.text
+    ]);
+  }
+  return [:div, {},
+    [:h1, {}, "microblog"],
+    [:p, { class = "meta", id = "whoami" }, "you are " .. me],
+    [:div, { class = "row" },
+      [:input, { id = "name", placeholder = "display name" }],
+      [:button, { id = "join", onclick = fn(e) { join(); } }, "join"]
+    ],
+    [:div, { class = "row" },
+      [:input, { id = "draft", placeholder = "what's happening?" }],
+      [:button, { id = "post", onclick = fn(e) { publish(); } }, "post"]
+    ],
+    [:div, { class = "cols" },
+      [:div, {},
+        [:h2, {}, "people"],
+        [:ul, { id = "users" }, people]
+      ],
+      [:div, {},
+        [:h2, {}, "home"],
+        [:ul, { id = "feed" }, posts]
+      ]
+    ]
+  ];
+}
+
+fn join() {
+  let name = dom.get("#name");
+  if name == "" {
+    return;
+  }
+  server!();
+  store.append({ type = "join", sid = session(), name = name });
+  cast browsers {
+    refresh_feed();
+  }
+}
+
+fn publish() {
+  let text = dom.get("#draft");
+  if text == "" {
+    return;
+  }
+  server!();
+  store.append({ type = "post", sid = session(), text = text });
+  let users = store.items(["users"]);
+  // each connected tab has its own timeline; broadcast a refresh token
+  // and let on_refresh rebuild per session.
+  cast browsers {
+    refresh_feed();
+  }
+}
+
+fn refresh_feed() {
+  // Capture this tab's session on the browser before hopping. A
+  // `cast browsers { refresh_feed() }` keeps the poster's origin on
+  // the packet — session() on the server would then paint every tab
+  // with the author's timeline.
+  let me = session();
+  server!();
+  let users = store.items(["users"]);
+  let feed = gather_timeline(me);
+  browser!();
+  hui.render("#app", blog_view(me, users, feed));
+}
+
+fn on_connect(sid) {
+  let users = store.items(["users"]);
+  let feed = gather_timeline(sid);
+  cast session(sid) {
+    hui.render("#app", blog_view(sid, users, feed));
+  }
+}
+
+fn sim_join(name) {
+  server!();
+  store.append({ type = "join", sid = session(), name = name });
+}
+
+fn sim_follow(who) {
+  server!();
+  store.append({ type = "follow", sid = session(), who = who });
+}
+
+fn sim_post(text) {
+  server!();
+  store.append({ type = "post", sid = session(), text = text });
+}
+
+fn sim_demo() {
+  spawn sim_join("Ada");
+}

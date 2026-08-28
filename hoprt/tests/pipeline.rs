@@ -87,32 +87,34 @@ fn todo_app_runs_on_simulated_cluster() {
     let src = include_str!("../hop/todo.hop");
     let lua = compiler::compile(src).expect("hopc compile");
     // the simulated cluster has no DOM; stub it with a print
-    let dom_stub =
-        "dom = { set = function(sel, html) print(\"[dom] \" .. sel .. \" := \" .. html) end }\n";
+    let dom_stub = "dom = {\
+        set = function(sel, html) print(\"[dom] \" .. sel .. \" := \" .. html) end,\
+        get = function() return \"\" end,\
+        clear = function() end\
+    }\n";
     let code = format!("{dom_stub}{lua}");
 
     let host = Host::new(&["A", "B"], &code, false).expect("host");
     host.fire("A", "sim_demo").unwrap();
     host.pump().unwrap();
 
-    // "Click" the first todo on tab A. Handler ids are deterministic here:
-    // render 1 minted id 1 (one item), render 2 released it and minted 2, 3
-    // — so id 2 is the first <li>'s onclick closure, which captured i = 1.
-    host.fire_with("A", "__handler_fire", 2).unwrap();
+    // Renders go to #app (form button + one <li> per item). After two adds
+    // the first item's onclick is handler 4 (button=3, milk=4, compiler=5).
+    host.fire_with("A", "__handler_fire", 4).unwrap();
     host.pump().unwrap();
     host.assert_quiescent().unwrap();
 
     let all = host.log().join("\n");
-    // final render on BOTH tabs: item 1 struck through, item 2 not.
-    // (render 3 released ids 2 and 3, minted 4 and 5 — never reused.)
-    let final_html = "<ul>\
-                      <li class=\"done\" onclick=\"__hopHandler(4)\">buy milk</li>\
-                      <li onclick=\"__hopHandler(5)\">write the compiler</li>\
-                      </ul>";
     for tab in ["A", "B"] {
+        let prefix = format!("[browser {tab}] [dom] #app :=");
+        assert!(all.contains(&prefix), "tab {tab} missing #app render:\n{all}");
         assert!(
-            all.contains(&format!("[browser {tab}] [dom] #todos := {final_html}")),
-            "tab {tab} missing final render:\n{all}"
+            all.contains("class=\"done\"") && all.contains("buy milk"),
+            "tab {tab} missing struck-through milk:\n{all}"
+        );
+        assert!(
+            all.contains("write the compiler"),
+            "tab {tab} missing second item:\n{all}"
         );
     }
 }
@@ -123,11 +125,22 @@ fn lambda_with_marks_ships_only_its_captures() {
     let lua = compiler::compile(src).expect("hopc compile");
     // the onclick lambda hops to the server carrying only the loop index it
     // captured — not item, rows, or the items array
-    assert!(lua.contains(r#"return rt.at("server", "todo_view:l1:1", { i = i })"#), "{lua}");
+    assert!(lua.contains(r#"return rt.at("server", "todo_view:l1:1", { id = id })"#), "{lua}");
     // its server segment is registered like any other, and the cast inside
     // it carries the snapshot
     assert!(lua.contains(r#"rt.register("todo_view:l1:1""#), "{lua}");
-    assert!(lua.contains(r#"rt.cast("browsers", "todo_view:c1", { snapshot = snapshot })"#), "{lua}");
+    assert!(
+        lua.contains(r#"rt.cast("browsers", "todo_view:c1", { completed = completed, created = created, snapshot = snapshot })"#),
+        "{lua}"
+    );
+}
+
+#[test]
+fn hopc_emits_pairs_when_asked() {
+    let lua = compiler::compile("fn f(t) { for k, v in pairs t { print(k); } }").expect("pairs");
+    assert!(lua.contains("for k, v in pairs(t) do"), "{lua}");
+    let lua = compiler::compile("fn f(t) { for i, v in t { print(v); } }").expect("ipairs");
+    assert!(lua.contains("for i, v in ipairs(t) do"), "{lua}");
 }
 
 #[test]

@@ -1,0 +1,109 @@
+// ranking.hop — pairwise votes into a Sum edge graph, per scope.
+//
+// Each vote is two durable writes: a blind merge on the winner→loser edge
+// and a vote counter. Decay is an event on the tape, so replay reproduces
+// it. Two tabs stay in sync; restart hopd and the graph is still there.
+//
+//   cargo run -p hoprt --bin hopd -- hoprt/hop/ranking.hop
+
+server let schema = store.record([
+  ["scopes", store.map(store.record([
+    ["votes", store.sum],
+    ["edges", store.map(store.sum)]
+  ]))]
+]);
+
+fn reduce(tx, event) {
+  if event.type == "vote" {
+    let key = event.winner .. ">" .. event.loser;
+    tx.add(["scopes", event.scope, "edges", key], 1);
+    tx.add(["scopes", event.scope, "votes"], 1);
+  } else {
+    if event.type == "decay" {
+      let edges = tx.peek(["scopes", event.scope, "edges"]);
+      if edges {
+        for k, w in pairs edges {
+          tx.put(["scopes", event.scope, "edges", k], w * 0.9);
+        }
+      }
+    }
+  }
+}
+
+fn pair_button(scope, a, b) {
+  return [:button, {
+    class = "pair",
+    id = "vote-" .. a .. "-" .. b,
+    onclick = fn(e) {
+      server!();
+      store.append({ type = "vote", scope = scope, winner = a, loser = b });
+      let votes = store.one(["scopes", scope, "votes"]);
+      let edges = store.entries(["scopes", scope, "edges"]);
+      cast browsers {
+        hui.render("#app", ranking_view(scope, votes, edges));
+      }
+    }
+  }, a .. " beats " .. b];
+}
+
+fn ranking_view(scope, votes, edges) {
+  if !votes {
+    votes = 0;
+  }
+  let rows = [];
+  if edges {
+    for i, pair in edges {
+      table.insert(rows, [:li, { class = "edge" }, pair[1] .. "  " .. pair[2]]);
+    }
+  }
+  return [:div, {},
+    [:h1, {}, "ranking"],
+    [:p, { class = "meta", id = "vote-count" }, "" .. votes .. " votes in " .. scope],
+    [:h2, {}, "cast a vote"],
+    [:div, { class = "row" },
+      pair_button(scope, "ripgrep", "grep"),
+      pair_button(scope, "ripgrep", "ag"),
+      pair_button(scope, "grep", "ag")
+    ],
+    [:div, { class = "row" },
+      [:button, { id = "decay", onclick = fn(e) {
+        server!();
+        store.append({ type = "decay", scope = scope });
+        let v = store.one(["scopes", scope, "votes"]);
+        let es = store.entries(["scopes", scope, "edges"]);
+        cast browsers {
+          hui.render("#app", ranking_view(scope, v, es));
+        }
+      } }, "decay 10%"]
+    ],
+    [:h2, {}, "edges"],
+    [:ul, { id = "edges" }, rows]
+  ];
+}
+
+fn vote(scope, winner, loser) {
+  server!();
+  store.append({ type = "vote", scope = scope, winner = winner, loser = loser });
+  let votes = store.one(["scopes", scope, "votes"]);
+  let edges = store.entries(["scopes", scope, "edges"]);
+  cast browsers {
+    hui.render("#app", ranking_view(scope, votes, edges));
+  }
+}
+
+fn on_connect(sid) {
+  let votes = store.one(["scopes", "tools", "votes"]);
+  let edges = store.entries(["scopes", "tools", "edges"]);
+  if !votes {
+    votes = 0;
+  }
+  cast session(sid) {
+    hui.render("#app", ranking_view("tools", votes, edges));
+  }
+}
+
+fn sim_demo() {
+  spawn vote("tools", "ripgrep", "grep");
+  spawn vote("tools", "ripgrep", "ag");
+  spawn vote("tools", "grep", "ag");
+}

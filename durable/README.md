@@ -232,3 +232,16 @@ filter / project / explain), and the runtime property
 ```bash
 cargo run -p durable --example runtime
 ```
+
+## Hop apps
+
+[`hoprt/`](../hoprt/) is the Lua/browser runtime: placement marks hop a
+function body between a browser tab and the server. When a `.hop` file
+declares `schema` and `fn reduce`, the server VM opens this crate's
+`Runtime` — JSONL log, typed-path projection, `store.append` from server
+segments only. The multiplayer todo app is the full loop:
+
+```bash
+cargo run -p hoprt --bin hopd -- hoprt/hop/todo.hop
+# open http://localhost:9000 — restart hopd; the board is still there
+```

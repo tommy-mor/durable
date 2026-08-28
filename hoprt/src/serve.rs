@@ -15,10 +15,13 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::net::{TcpListener, TcpStream};
+use std::path::Path;
 use std::rc::Rc;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
+
+use crate::store;
 
 use mlua::{Function, Lua, LuaSerdeExt, Value as LuaValue};
 use tungstenite::Message;
@@ -42,15 +45,17 @@ fn session_name(n: usize) -> String {
     }
 }
 
-fn http_thread(port: u16, app_code: String) {
+fn http_thread(port: u16, ws_port: u16, app_code: String) {
     let server = tiny_http::Server::http(("0.0.0.0", port)).expect("bind http");
+    let config = format!(r#"{{"wsPort":{ws_port}}}"#);
     for req in server.incoming_requests() {
         let (content, ctype) = match req.url() {
-            "/" | "/index.html" => (INDEX_HTML, "text/html; charset=utf-8"),
-            "/glue.js" => (GLUE_JS, "application/javascript"),
-            "/hoprt.lua" => (HOPRT_LUA, "text/plain; charset=utf-8"),
-            "/hui.lua" => (HUI_LUA, "text/plain; charset=utf-8"),
-            "/app.lua" => (app_code.as_str(), "text/plain; charset=utf-8"),
+            "/" | "/index.html" => (INDEX_HTML.to_string(), "text/html; charset=utf-8"),
+            "/glue.js" => (GLUE_JS.to_string(), "application/javascript"),
+            "/config.json" => (config.clone(), "application/json"),
+            "/hoprt.lua" => (HOPRT_LUA.to_string(), "text/plain; charset=utf-8"),
+            "/hui.lua" => (HUI_LUA.to_string(), "text/plain; charset=utf-8"),
+            "/app.lua" => (app_code.clone(), "text/plain; charset=utf-8"),
             _ => {
                 let _ = req.respond(tiny_http::Response::empty(404));
                 continue;
@@ -139,11 +144,17 @@ fn route(sessions: &HashMap<String, mpsc::Sender<String>>, pkt: &serde_json::Val
 }
 
 /// Run the hop server forever: compile-side callers pass the already
-/// compiled Lua chunk for the app.
-pub fn serve(app_code: String, http_port: u16, ws_port: u16) -> mlua::Result<()> {
+/// compiled Lua chunk for the app. `data_dir` holds the JSONL log and
+/// RocksDB projection when the app declares `schema` + `reduce`.
+pub fn serve(
+    app_code: String,
+    http_port: u16,
+    ws_port: u16,
+    data_dir: impl AsRef<Path>,
+) -> mlua::Result<()> {
     {
         let app = app_code.clone();
-        thread::spawn(move || http_thread(http_port, app));
+        thread::spawn(move || http_thread(http_port, ws_port, app));
     }
     let (tx, rx) = mpsc::channel::<Ev>();
     {
@@ -169,7 +180,15 @@ pub fn serve(app_code: String, http_port: u16, ws_port: u16) -> mlua::Result<()>
     lua.globals().set("__print", print_fn)?;
     lua.load(HOPRT_LUA).set_name("hoprt.lua").exec()?;
     lua.load(HUI_LUA).set_name("hui.lua").exec()?;
+    store::install_constructors(&lua)?;
     lua.load(&app_code).set_name("app.lua").exec()?;
+    let bound = store::bind(&lua, data_dir.as_ref())?;
+    if bound {
+        println!(
+            "[hopd] durable store at {}  (log.jsonl + proj/)",
+            data_dir.as_ref().display()
+        );
+    }
 
     let mut sessions: HashMap<String, mpsc::Sender<String>> = HashMap::new();
     println!("[hopd] serving http://localhost:{http_port}  (ws on :{ws_port})");

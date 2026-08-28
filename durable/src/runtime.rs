@@ -15,11 +15,13 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Seek, SeekFrom, Write as IoWrite};
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
-use crate::query::{self, Plan, Query};
+use crate::dynpath;
+use crate::query::{self, Nav, Plan, Query};
 use crate::shape::field_segment;
 use crate::{codec, Batch, Db, Describe, Durability, Error, Leaf, Path as DPath, Result, Shape, Write};
 use ciborium::Value;
@@ -33,11 +35,58 @@ const META_NS: &str = "__durable";
 /// crash before commit simply replays the event against the previous state.
 pub struct Tx {
     batch: Batch,
+    /// 0-based index of the event this transaction is reducing. Stable
+    /// across replay: it is the line number in the JSONL tape.
+    seq: u64,
 }
 
 impl Tx {
-    fn new(db: &Db) -> Self {
-        Self { batch: db.batch() }
+    fn new(db: &Db, seq: u64) -> Self {
+        Self {
+            batch: db.batch(),
+            seq,
+        }
+    }
+
+    /// Log index of the event being reduced. Use this for server-assigned
+    /// ids — never take ids from the browser.
+    pub fn seq(&self) -> u64 {
+        self.seq
+    }
+
+    /// Dynamic put: a path-as-data write against `schema`.
+    pub fn put(&mut self, schema: &Shape, navs: &[Nav], value: &Value) -> Result<()> {
+        self.extend(dynpath::put(schema, None, navs, value)?);
+        Ok(())
+    }
+
+    /// Dynamic delete / subtree delete.
+    pub fn delete(&mut self, schema: &Shape, navs: &[Nav]) -> Result<()> {
+        self.write(dynpath::delete(schema, None, navs)?);
+        Ok(())
+    }
+
+    /// Dynamic Sum add (blind merge).
+    pub fn add(&mut self, schema: &Shape, navs: &[Nav], delta: &Value) -> Result<()> {
+        self.write(dynpath::add(schema, None, navs, delta)?);
+        Ok(())
+    }
+
+    /// Dynamic list/deque append.
+    pub fn push(&mut self, schema: &Shape, navs: &[Nav], value: &Value) -> Result<()> {
+        self.write(dynpath::push(schema, None, navs, value)?);
+        Ok(())
+    }
+
+    /// Dynamic collection clear.
+    pub fn clear(&mut self, schema: &Shape, navs: &[Nav]) -> Result<()> {
+        self.write(dynpath::clear(schema, None, navs)?);
+        Ok(())
+    }
+
+    /// Read committed state (not in-flight writes of this event) at `navs`.
+    pub fn peek(&self, schema: &Shape, navs: &[Nav]) -> Result<Value> {
+        dynpath::peek(self.db(), schema, None, navs)
     }
 
     /// Record a reified write. This is how a reducer mutates state.
@@ -158,19 +207,19 @@ pub struct Runtime<E> {
     db: Db,
     schema: Shape,
     namespace: Option<String>,
-    reducer: fn(&mut Tx, &E) -> Result<()>,
+    reducer: Arc<dyn Fn(&mut Tx, &E) -> Result<()>>,
     /// Events this process has applied. Loaded from the projection on open.
     applied: u64,
 }
 
-impl<E: Serialize + DeserializeOwned> Runtime<E> {
+impl<E: Serialize + DeserializeOwned + 'static> Runtime<E> {
     /// Open (or create) a runtime and catch the projection up to the log.
     pub fn open(
         db_path: impl AsRef<Path>,
         log_path: impl AsRef<Path>,
         schema: Shape,
         namespace: Option<String>,
-        reducer: fn(&mut Tx, &E) -> Result<()>,
+        reducer: impl Fn(&mut Tx, &E) -> Result<()> + 'static,
     ) -> Result<Self> {
         let db_path = db_path.as_ref().to_path_buf();
         if let Some(parent) = db_path.parent() {
@@ -183,7 +232,7 @@ impl<E: Serialize + DeserializeOwned> Runtime<E> {
             db,
             schema,
             namespace,
-            reducer,
+            reducer: Arc::new(reducer),
             applied,
         };
         rt.catch_up()?;
@@ -195,7 +244,7 @@ impl<E: Serialize + DeserializeOwned> Runtime<E> {
         db_path: impl AsRef<Path>,
         log_path: impl AsRef<Path>,
         namespace: Option<String>,
-        reducer: fn(&mut Tx, &E) -> Result<()>,
+        reducer: impl Fn(&mut Tx, &E) -> Result<()> + 'static,
     ) -> Result<Self> {
         Self::open(db_path, log_path, S::shape(), namespace, reducer)
     }
@@ -244,7 +293,7 @@ impl<E: Serialize + DeserializeOwned> Runtime<E> {
     }
 
     fn apply_event(&mut self, idx: u64, event: &E) -> Result<()> {
-        let mut tx = Tx::new(&self.db);
+        let mut tx = Tx::new(&self.db, idx);
         (self.reducer)(&mut tx, event)?;
         tx.write(applied_leaf().set(&(idx + 1)));
         // The log is the durable source of truth; the projection is rebuildable.
@@ -255,7 +304,7 @@ impl<E: Serialize + DeserializeOwned> Runtime<E> {
 
     /// Drop the projection and rebuild it from event 0.
     pub fn rebuild(&mut self) -> Result<()> {
-        let mut tx = Tx::new(&self.db);
+        let mut tx = Tx::new(&self.db, 0);
         tx.write(Write::new(crate::Op::DeletePrefix {
             prefix: Vec::new(),
         }));
@@ -269,12 +318,13 @@ impl<E: Serialize + DeserializeOwned> Runtime<E> {
     pub fn verify(&self) -> Result<()> {
         let tmp = tempfile_dir()?;
         let db_path = tmp.join("proj");
+        let reducer = self.reducer.clone();
         let mut other = Runtime::open(
             &db_path,
             self.log.path(),
             self.schema.clone(),
             self.namespace.clone(),
-            self.reducer,
+            move |tx, ev| reducer(tx, ev),
         )?;
         other.rebuild()?;
         let left = dump(&self.db)?;
