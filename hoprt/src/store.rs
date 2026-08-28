@@ -86,33 +86,44 @@ impl StoreBinding {
     /// Dispatch a store native (the server platform's store_native).
     pub fn native(&mut self, id: NativeId, args: Vec<Value>) -> Result<Value, String> {
         match id {
+            NativeId::StoreCall => {
+                // one function: a path that only navigates is a query
+                let (steps, term) = split_terminal(args.first())?;
+                if term.is_some() {
+                    return Err(
+                        "a path with a terminal navigator is a mutation — those happen in fn reduce"
+                            .into(),
+                    );
+                }
+                let q = self.path_query(&steps)?;
+                if q.is_collecting() {
+                    let vs = self.rt.select(&q).map_err(|e| e.to_string())?;
+                    let mut out = Vec::with_capacity(vs.len());
+                    for v in &vs {
+                        out.push(from_cbor(v)?);
+                    }
+                    Ok(Value::array(out))
+                } else {
+                    match self.rt.one(&q).map_err(|e| e.to_string())? {
+                        Some(v) => from_cbor(&v),
+                        None => from_cbor(&self.rt.subtree(&q).map_err(|e| e.to_string())?),
+                    }
+                }
+            }
             NativeId::StoreAppend => {
                 let ev = args.first().ok_or("store.append(event)")?;
                 let ev = to_json(ev)?;
                 let rec = self.rt.append(ev).map_err(|e| e.to_string())?;
                 Ok(Value::Int(rec.seq as i64))
             }
-            NativeId::StoreOne => {
-                let q = self.path_query(args.first())?;
-                let v = self.rt.one(&q).map_err(|e| e.to_string())?;
-                match v {
-                    Some(v) => from_cbor(&v),
-                    None => Ok(Value::Nil),
-                }
-            }
-            NativeId::StoreEntries => {
-                let q = self.path_query(args.first())?;
-                let pairs = self.rt.entries(&q).map_err(|e| e.to_string())?;
-                let mut out = Vec::with_capacity(pairs.len());
-                for (k, v) in &pairs {
-                    out.push(Value::array(vec![from_cbor(k)?, from_cbor(v)?]));
-                }
-                Ok(Value::array(out))
-            }
             NativeId::StoreItems => {
                 // map entries → array of records with the key merged as `id`,
                 // ready for `for i, item in items` rendering
-                let q = self.path_query(args.first())?;
+                let (steps, term) = split_terminal(args.first())?;
+                if term.is_some() {
+                    return Err("store.items takes a plain path".into());
+                }
+                let q = self.path_query(&steps)?;
                 let pairs = self.rt.entries(&q).map_err(|e| e.to_string())?;
                 let mut out = Vec::with_capacity(pairs.len());
                 for (k, v) in &pairs {
@@ -132,19 +143,61 @@ impl StoreBinding {
         }
     }
 
-    fn path_query(&self, path: Option<&Value>) -> Result<Query, String> {
-        let steps = path_steps(path)?;
-        let navs = dynpath::navs_for(&self.schema, &steps).map_err(|e| e.to_string())?;
+    fn path_query(&self, steps: &[ciborium::Value]) -> Result<Query, String> {
+        let navs = dynpath::navs_for(&self.schema, steps).map_err(|e| e.to_string())?;
         Ok(Query::new(navs))
     }
 }
 
-fn path_steps(path: Option<&Value>) -> Result<Vec<ciborium::Value>, String> {
-    match path {
-        Some(Value::Array(xs)) => xs.borrow().iter().map(to_cbor).collect(),
-        Some(other) => Ok(vec![to_cbor(other)?]),
-        None => Err("expected a path".into()),
+/// A terminal navigator, parsed off the end of a path.
+enum Term {
+    Set(Value),
+    Add(Value),
+    Push(Value),
+    Del,
+}
+
+fn parse_term(v: &Value) -> Option<Result<Term, String>> {
+    let Value::Tagged(t) = v else { return None };
+    if t.0 != "term" {
+        return None;
     }
+    let Value::Array(parts) = &t.1 else {
+        return Some(Err("malformed #term".into()));
+    };
+    let parts = parts.borrow();
+    let op = parts.first().and_then(Value::as_str).unwrap_or("");
+    let payload = parts.get(1).cloned().unwrap_or(Value::Nil);
+    Some(Ok(match op {
+        "set" => Term::Set(payload),
+        "add" => Term::Add(payload),
+        "push" => Term::Push(payload),
+        "del" => Term::Del,
+        other => return Some(Err(format!("unknown terminal navigator {other:?}"))),
+    }))
+}
+
+/// Split a hop path into navigation steps (as CBOR, for durable) and an
+/// optional terminal. A terminal anywhere but last is an error.
+fn split_terminal(path: Option<&Value>) -> Result<(Vec<ciborium::Value>, Option<Term>), String> {
+    let Some(Value::Array(xs)) = path else {
+        return Err("expected a path array".into());
+    };
+    let xs = xs.borrow();
+    let mut steps = Vec::with_capacity(xs.len());
+    let mut term = None;
+    for (i, x) in xs.iter().enumerate() {
+        match parse_term(x) {
+            Some(t) => {
+                if i + 1 != xs.len() {
+                    return Err("a terminal navigator must be the last path element".into());
+                }
+                term = Some(t?);
+            }
+            None => steps.push(to_cbor(x)?),
+        }
+    }
+    Ok((steps, term))
 }
 
 // ---------------------------------------------------------------------------
@@ -159,21 +212,11 @@ fn run_reduce(
     tx: &mut Tx,
     event: &serde_json::Value,
 ) -> Result<(), String> {
-    let tx_val = Value::map(
-        [
-            ("seq", Value::Int(tx.seq() as i64)),
-            ("put", Value::Native(NativeId::TxPut)),
-            ("peek", Value::Native(NativeId::TxPeek)),
-            ("add", Value::Native(NativeId::TxAdd)),
-            ("push", Value::Native(NativeId::TxPush)),
-            ("delete", Value::Native(NativeId::TxDelete)),
-            ("clear", Value::Native(NativeId::TxClear)),
-        ]
-        .into_iter()
-        .map(|(k, v)| (Value::str(k), v))
-        .collect(),
-    );
+    // the event carries its own seq — there is no tx handle in hop
     let ev = from_json(event);
+    if matches!(ev, Value::Map(_)) {
+        ev.set_field("seq", Value::Int(tx.seq() as i64))?;
+    }
 
     let mut host = ReduceHost {
         schema,
@@ -183,7 +226,7 @@ fn run_reduce(
     // reducers see a frozen globals snapshot; global writes go to a
     // throwaway clone (reducers must be pure — replay depends on it)
     let mut globals = (**globals_snapshot).clone();
-    let mut exec = Exec::call(prog, reduce_idx, vec![tx_val, ev]);
+    let mut exec = Exec::call(prog, reduce_idx, vec![ev]);
     match interp::run(prog, &mut exec, &mut globals, &mut host) {
         Outcome::Done(_) => {
             for w in host.writes {
@@ -200,13 +243,6 @@ struct ReduceHost<'a> {
     schema: &'a Shape,
     db: durable::Db,
     writes: Vec<durable::Write>,
-}
-
-impl ReduceHost<'_> {
-    fn navs(&self, path: Option<&Value>) -> Result<Vec<durable::Nav>, String> {
-        let steps = path_steps(path)?;
-        dynpath::navs_for(self.schema, &steps).map_err(|e| e.to_string())
-    }
 }
 
 impl Host for ReduceHost<'_> {
@@ -228,44 +264,58 @@ impl Host for ReduceHost<'_> {
 
     fn native(&mut self, id: NativeId, args: Vec<Value>) -> Result<Value, String> {
         match id {
-            NativeId::TxPut => {
-                let navs = self.navs(args.first())?;
-                let val = to_cbor(args.get(1).unwrap_or(&Value::Nil))?;
-                let ws = dynpath::put(self.schema, None, &navs, &val).map_err(|e| e.to_string())?;
-                self.writes.extend(ws);
-                Ok(Value::Nil)
-            }
-            NativeId::TxDelete => {
-                let navs = self.navs(args.first())?;
-                let w = dynpath::delete(self.schema, None, &navs).map_err(|e| e.to_string())?;
-                self.writes.push(w);
-                Ok(Value::Nil)
-            }
-            NativeId::TxAdd => {
-                let navs = self.navs(args.first())?;
-                let val = to_cbor(args.get(1).unwrap_or(&Value::Nil))?;
-                let w = dynpath::add(self.schema, None, &navs, &val).map_err(|e| e.to_string())?;
-                self.writes.push(w);
-                Ok(Value::Nil)
-            }
-            NativeId::TxPush => {
-                let navs = self.navs(args.first())?;
-                let val = to_cbor(args.get(1).unwrap_or(&Value::Nil))?;
-                let w = dynpath::push(self.schema, None, &navs, &val).map_err(|e| e.to_string())?;
-                self.writes.push(w);
-                Ok(Value::Nil)
-            }
-            NativeId::TxClear => {
-                let navs = self.navs(args.first())?;
-                let w = dynpath::clear(self.schema, None, &navs).map_err(|e| e.to_string())?;
-                self.writes.push(w);
-                Ok(Value::Nil)
-            }
-            NativeId::TxPeek => {
-                // committed state only: an event's own writes are invisible
-                let navs = self.navs(args.first())?;
-                let v = dynpath::peek(&self.db, self.schema, None, &navs).map_err(|e| e.to_string())?;
-                from_cbor(&v)
+            // the same one function. Here a terminal navigator is legal:
+            // it reifies as a Write against committed state.
+            NativeId::StoreCall => {
+                let (steps, term) = split_terminal(args.first())?;
+                let navs =
+                    dynpath::navs_for(self.schema, &steps).map_err(|e| e.to_string())?;
+                match term {
+                    None => {
+                        let q = Query::new(navs);
+                        if q.is_collecting() {
+                            let vs = durable::query::select(&self.db, self.schema, &q)
+                                .map_err(|e| e.to_string())?;
+                            let mut out = Vec::with_capacity(vs.len());
+                            for v in &vs {
+                                out.push(from_cbor(v)?);
+                            }
+                            Ok(Value::array(out))
+                        } else {
+                            // committed state: an event's own writes are invisible
+                            let v = dynpath::peek(&self.db, self.schema, None, &q.navs)
+                                .map_err(|e| e.to_string())?;
+                            from_cbor(&v)
+                        }
+                    }
+                    Some(Term::Set(v)) => {
+                        let val = to_cbor(&v)?;
+                        let ws = dynpath::put(self.schema, None, &navs, &val)
+                            .map_err(|e| e.to_string())?;
+                        self.writes.extend(ws);
+                        Ok(Value::Nil)
+                    }
+                    Some(Term::Add(v)) => {
+                        let val = to_cbor(&v)?;
+                        let w = dynpath::add(self.schema, None, &navs, &val)
+                            .map_err(|e| e.to_string())?;
+                        self.writes.push(w);
+                        Ok(Value::Nil)
+                    }
+                    Some(Term::Push(v)) => {
+                        let val = to_cbor(&v)?;
+                        let w = dynpath::push(self.schema, None, &navs, &val)
+                            .map_err(|e| e.to_string())?;
+                        self.writes.push(w);
+                        Ok(Value::Nil)
+                    }
+                    Some(Term::Del) => {
+                        let w = dynpath::delete(self.schema, None, &navs)
+                            .map_err(|e| e.to_string())?;
+                        self.writes.push(w);
+                        Ok(Value::Nil)
+                    }
+                }
             }
             other => Err(format!("{other:?} is not available in a reducer")),
         }

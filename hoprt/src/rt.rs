@@ -35,6 +35,7 @@ pub trait Platform {
     fn dom_get(&mut self, sel: &str) -> String;
     fn dom_set(&mut self, sel: &str, html: &str);
     fn dom_clear(&mut self, sel: &str);
+    fn dom_focus(&mut self, sel: &str);
     /// Store natives (server VMs only). `None` = no store bound.
     fn store_native(
         &mut self,
@@ -122,33 +123,17 @@ impl Vm {
             globals.set(name, Value::Native(id));
         }
 
-        // modules — the store constructors are data/pure and exist on
-        // every side; store queries and dom/hui are side-specific natives
-        // that error if the platform has no backing for them.
-        let store_mod = Value::map(
-            [
-                ("leaf", mk_map(vec![("k", Value::str("leaf"))])),
-                ("sum", mk_map(vec![("k", Value::str("sum"))])),
-                ("map", Value::Native(NativeId::ShapeMap)),
-                ("list", Value::Native(NativeId::ShapeList)),
-                ("deque", Value::Native(NativeId::ShapeDeque)),
-                ("record", Value::Native(NativeId::ShapeRecord)),
-                ("append", Value::Native(NativeId::StoreAppend)),
-                ("one", Value::Native(NativeId::StoreOne)),
-                ("items", Value::Native(NativeId::StoreItems)),
-                ("entries", Value::Native(NativeId::StoreEntries)),
-                ("verify", Value::Native(NativeId::StoreVerify)),
-            ]
-            .into_iter()
-            .map(|(k, v)| (Value::str(k), v))
-            .collect(),
-        );
-        globals.set("store", store_mod);
+        // the store is one callable: store(path). Its module surface —
+        // shape constructors, the tape, navigators — is field access on
+        // the native (interp resolves via builtins::store_field). dom and
+        // hui stay plain module maps.
+        globals.set("store", Value::Native(NativeId::StoreCall));
         let dom_mod = Value::map(
             [
                 ("get", Value::Native(NativeId::DomGet)),
                 ("set", Value::Native(NativeId::DomSet)),
                 ("clear", Value::Native(NativeId::DomClear)),
+                ("focus", Value::Native(NativeId::DomFocus)),
             ]
             .into_iter()
             .map(|(k, v)| (Value::str(k), v))
@@ -212,10 +197,12 @@ impl Vm {
         self.start_flow(platform, callee, args);
     }
 
-    /// Activate a hui handler by id (a click in rendered HTML).
-    pub fn fire_handler(&mut self, platform: &mut dyn Platform, id: i64) {
+    /// Activate a hui handler by id (an event in rendered HTML). `ev` is
+    /// the DOM event as a value (a map with e.g. `key` for keyboard
+    /// events), or Nil where no event exists (the harness).
+    pub fn fire_handler(&mut self, platform: &mut dyn Platform, id: i64, ev: Value) {
         if let Some(h) = self.hui.handlers.get(&id).cloned() {
-            self.start_flow(platform, h, vec![Value::Nil]);
+            self.start_flow(platform, h, vec![ev]);
         }
     }
 
@@ -490,6 +477,11 @@ impl Host for StepHost<'_> {
             NativeId::DomClear => {
                 let sel = args.first().and_then(Value::as_str).ok_or("dom.clear(selector)")?;
                 self.platform.dom_clear(sel);
+                Ok(Value::Nil)
+            }
+            NativeId::DomFocus => {
+                let sel = args.first().and_then(Value::as_str).ok_or("dom.focus(selector)")?;
+                self.platform.dom_focus(sel);
                 Ok(Value::Nil)
             }
             NativeId::HuiRender => {

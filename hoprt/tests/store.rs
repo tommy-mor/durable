@@ -29,7 +29,7 @@ fn todo_persists_across_reopen_and_verifies() {
         host.assert_quiescent();
 
         assert_eq!(host.applied().unwrap(), 2);
-        let milk = host.store_one(arr(vec![s("todos"), i(0), s("text")])).unwrap();
+        let milk = host.store_get(arr(vec![s("todos"), i(0), s("text")])).unwrap();
         assert_eq!(milk, s("buy milk"));
         host.verify().unwrap();
     }
@@ -37,9 +37,9 @@ fn todo_persists_across_reopen_and_verifies() {
     // New process, same tape: catch-up restores the projection.
     let mut host = Cluster::with_data_dir(&["A"], TODO, false, dir.path()).expect("reopen");
     assert_eq!(host.applied().unwrap(), 2);
-    let milk = host.store_one(arr(vec![s("todos"), i(0), s("text")])).unwrap();
+    let milk = host.store_get(arr(vec![s("todos"), i(0), s("text")])).unwrap();
     assert_eq!(milk, s("buy milk"));
-    let second = host.store_one(arr(vec![s("todos"), i(1), s("text")])).unwrap();
+    let second = host.store_get(arr(vec![s("todos"), i(1), s("text")])).unwrap();
     assert_eq!(second, s("write the compiler"));
     host.verify().unwrap();
 
@@ -55,6 +55,6 @@ fn rebuild_from_tape_matches_live() {
     host.pump();
     host.rebuild().unwrap();
     host.verify().unwrap();
-    let created = host.store_one(arr(vec![s("stats"), s("created")])).unwrap();
+    let created = host.store_get(arr(vec![s("stats"), s("created")])).unwrap();
     assert_eq!(created, i(2));
 }

@@ -136,14 +136,16 @@ console.log('✓ connected; on_connect rendered the board');
 
 // type into the draft input and click "add"
 els.get('#draft').value = 'buy milk';
-const addId = Number(app.innerHTML.match(/<button[^>]*__hopHandler\((\d+)\)/)[1]);
+const addMatch = app.innerHTML.match(/<button[^>]*__hopHandler\((\d+)/);
+if (!addMatch) throw new Error(`no add-button handler in: ${app.innerHTML}`);
+const addId = Number(addMatch[1]);
 vm.fire_handler(addId);
 await until('todo appears', () => app.innerHTML.includes('buy milk'));
 await until('stats update', () => app.innerHTML.includes('0 done of 1'));
 console.log('✓ add: hopped to the server, cast re-rendered the board');
 
 // click the todo to toggle it
-const liId = Number(app.innerHTML.match(/<li[^>]*__hopHandler\((\d+)\)/)[1]);
+const liId = Number(app.innerHTML.match(/<li[^>]*__hopHandler\((\d+)/)[1]);
 vm.fire_handler(liId);
 await until('todo done', () =>
   app.innerHTML.includes('class="done"') && app.innerHTML.includes('1 done of 1'));

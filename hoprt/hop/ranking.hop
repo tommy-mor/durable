@@ -13,17 +13,17 @@ server let schema = store.record([
   ]))]
 ]);
 
-fn reduce(tx, event) {
+fn reduce(event) {
   if event.type == "vote" {
     let key = event.winner .. ">" .. event.loser;
-    tx.add(["scopes", event.scope, "edges", key], 1);
-    tx.add(["scopes", event.scope, "votes"], 1);
+    store(["scopes", event.scope, "edges", key, store.add(1)]);
+    store(["scopes", event.scope, "votes", store.add(1)]);
   } else {
     if event.type == "decay" {
-      let edges = tx.peek(["scopes", event.scope, "edges"]);
+      let edges = store(["scopes", event.scope, "edges"]);
       if edges {
         for k, w in edges {
-          tx.put(["scopes", event.scope, "edges", k], w * 0.9);
+          store(["scopes", event.scope, "edges", k, store.set(w * 0.9)]);
         }
       }
     }
@@ -37,8 +37,8 @@ fn pair_button(scope, a, b) {
     onclick = fn(e) {
       server!();
       store.append({ type = "vote", scope = scope, winner = a, loser = b });
-      let votes = store.one(["scopes", scope, "votes"]);
-      let edges = store.entries(["scopes", scope, "edges"]);
+      let votes = store(["scopes", scope, "votes"]);
+      let edges = store(["scopes", scope, "edges", store.entries]);
       cast browsers {
         hui.render("#app", ranking_view(scope, votes, edges));
       }
@@ -69,8 +69,8 @@ fn ranking_view(scope, votes, edges) {
       [:button, { id = "decay", onclick = fn(e) {
         server!();
         store.append({ type = "decay", scope = scope });
-        let v = store.one(["scopes", scope, "votes"]);
-        let es = store.entries(["scopes", scope, "edges"]);
+        let v = store(["scopes", scope, "votes"]);
+        let es = store(["scopes", scope, "edges", store.entries]);
         cast browsers {
           hui.render("#app", ranking_view(scope, v, es));
         }
@@ -84,16 +84,16 @@ fn ranking_view(scope, votes, edges) {
 fn vote(scope, winner, loser) {
   server!();
   store.append({ type = "vote", scope = scope, winner = winner, loser = loser });
-  let votes = store.one(["scopes", scope, "votes"]);
-  let edges = store.entries(["scopes", scope, "edges"]);
+  let votes = store(["scopes", scope, "votes"]);
+  let edges = store(["scopes", scope, "edges", store.entries]);
   cast browsers {
     hui.render("#app", ranking_view(scope, votes, edges));
   }
 }
 
 fn on_connect(sid) {
-  let votes = store.one(["scopes", "tools", "votes"]);
-  let edges = store.entries(["scopes", "tools", "edges"]);
+  let votes = store(["scopes", "tools", "votes"]);
+  let edges = store(["scopes", "tools", "edges", store.entries]);
   if !votes {
     votes = 0;
   }

@@ -86,7 +86,9 @@ Ported apps use a flat, small stdlib: `push(xs, v)`, `len(x)`,
 `sort(xs, cmp?)`, `floor(n)`, `tostring(v)`, `tonumber(v)`, `print(...)`,
 plus `session()` and the `store.*` / `hui.*` / `dom.*` modules. Arrays
 are 0-based (hop-values.md); `for i, v in xs` runs 0..len-1; map
-iteration is key-ordered and deterministic.
+iteration is key-ordered and deterministic. The store is one callable —
+`store(path)`, where collecting and terminal navigators in the path decide
+query vs mutation — specified in [hop-store.md](hop-store.md).
 
 ## What stays true across the rewrite
 

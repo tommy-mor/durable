@@ -2,6 +2,9 @@
 <html>
 <head>
   <meta charset="utf-8">
+  <!-- boot barrier: hopd holds this stylesheet until the app's first
+       render has landed, so the load event means "the page is live" -->
+  <link rel="stylesheet" href="/boot.css">
   <title>hop</title>
   <style>
     body { font-family: system-ui, sans-serif; max-width: 720px; margin: 40px auto; padding: 0 16px; }
@@ -25,6 +28,8 @@
 <body>
   <div id="app"></div>
   <div id="status">loading…</div>
-  <script type="module" src="/glue.js"></script>
+  <!-- async: a pending stylesheet would otherwise block this module,
+       and the barrier needs the ws session it opens -->
+  <script type="module" async src="/glue.js"></script>
 </body>
 </html>

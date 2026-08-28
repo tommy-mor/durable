@@ -253,6 +253,12 @@ pub fn run(
                 let name = prog.const_str(k);
                 match &obj {
                     Value::Map(_) => push!(obj.get_field(name)),
+                    Value::Native(NativeId::StoreCall) => {
+                        match crate::builtins::store_field(name) {
+                            Some(v) => push!(v),
+                            None => err!("store has no field .{}", name),
+                        }
+                    }
                     Value::Nil => err!("field .{} of nil", name),
                     o => err!("field .{} of {}", name, o.kind()),
                 }
@@ -646,6 +652,17 @@ fn call_native(id: NativeId, mut args: Vec<Value>, host: &mut dyn Host) -> Resul
             m.insert(Value::str("k"), Value::str("record"));
             m.insert(Value::str("fields"), fields);
             Ok(Value::map(m))
+        }
+        // terminal navigator constructors: pure data, meaning applied by
+        // the store when it sees them at the end of a path
+        NativeId::NavSet | NativeId::NavAdd | NativeId::NavPush => {
+            let op = match id {
+                NativeId::NavSet => "set",
+                NativeId::NavAdd => "add",
+                _ => "push",
+            };
+            let v = args.first().cloned().unwrap_or(Value::Nil);
+            Ok(Value::tagged("term", Value::array(vec![Value::str(op), v])))
         }
         other => host.native(other, args),
     }

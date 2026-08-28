@@ -109,14 +109,55 @@ pub fn resolve(schema: &Shape, namespace: Option<&str>, navs: &[Nav]) -> Result<
     Ok(Location { prefix, shape })
 }
 
+/// Recognize a tagged navigation combinator: CBOR tag 27 carrying
+/// `["nav", name]`. This is how untyped frontends spell the collecting
+/// steps of the query algebra — `all`, `keys`, `vals`, `first`, `last` —
+/// inside an ordinary path array.
+fn tagged_nav(step: &Value) -> Result<Option<Nav>> {
+    let Value::Tag(27, inner) = step else {
+        return Ok(None);
+    };
+    let Value::Array(parts) = inner.as_ref() else {
+        return Ok(None);
+    };
+    match (parts.first(), parts.get(1)) {
+        (Some(Value::Text(t)), Some(Value::Text(name))) if t == "nav" => match name.as_str() {
+            "all" => Ok(Some(Nav::All)),
+            "keys" => Ok(Some(Nav::Keys)),
+            "vals" => Ok(Some(Nav::Values)),
+            "entries" => Ok(Some(Nav::Entries)),
+            "first" => Ok(Some(Nav::First)),
+            "last" => Ok(Some(Nav::Last)),
+            other => Err(Error::Query(format!("unknown nav combinator {other:?}"))),
+        },
+        _ => Ok(None),
+    }
+}
+
 /// Turn a list of CBOR values into navs, choosing Field / Key / Index from
 /// the shape underfoot. Strings against a Record (or a Leaf interior) are
 /// fields; anything against a Map is a key; integers against a List are
-/// indices.
+/// indices. Tagged `#nav` steps become the collecting combinators.
 pub fn navs_for(schema: &Shape, steps: &[Value]) -> Result<Vec<Nav>> {
     let mut shape = schema.clone();
     let mut navs = Vec::with_capacity(steps.len());
     for step in steps {
+        if let Some(nav) = tagged_nav(step)? {
+            shape = match (&nav, &shape) {
+                (Nav::Keys, Shape::Map { .. }) => Shape::Leaf,
+                (_, Shape::Map { of } | Shape::List { of } | Shape::Deque { of }) => {
+                    of.as_ref().clone()
+                }
+                (_, other) => {
+                    return Err(Error::Query(format!(
+                        "nav combinator on a {}",
+                        other.kind_name()
+                    )));
+                }
+            };
+            navs.push(nav);
+            continue;
+        }
         let nav = match (&shape, step) {
             (Shape::Record { .. }, Value::Text(name)) => Nav::Field(name.clone()),
             (Shape::Map { .. }, v) => Nav::Key(v.clone()),
@@ -468,6 +509,63 @@ mod tests {
         )
         .unwrap();
         assert_eq!(text, Value::Text("milk".into()));
+    }
+
+    #[test]
+    fn tagged_nav_steps_build_collecting_queries() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path()).unwrap();
+        let s = schema();
+        for (i, text) in ["milk", "eggs"].iter().enumerate() {
+            let navs = navs_for(
+                &s,
+                &[
+                    Value::Text("todos".into()),
+                    Value::Integer(Integer::from(i as i64)),
+                    Value::Text("text".into()),
+                ],
+            )
+            .unwrap();
+            db.apply(
+                &put(&s, None, &navs, &Value::Text(text.to_string())).unwrap(),
+                Durability::DisableWal,
+            )
+            .unwrap();
+        }
+
+        let nav_all = Value::Tag(
+            27,
+            Box::new(Value::Array(vec![
+                Value::Text("nav".into()),
+                Value::Text("all".into()),
+            ])),
+        );
+        let navs = navs_for(
+            &s,
+            &[
+                Value::Text("todos".into()),
+                nav_all,
+                Value::Text("text".into()),
+            ],
+        )
+        .unwrap();
+        assert_eq!(navs[1], Nav::All);
+        let texts = crate::query::select(&db, &s, &Query::new(navs)).unwrap();
+        assert_eq!(
+            texts,
+            vec![Value::Text("milk".into()), Value::Text("eggs".into())]
+        );
+
+        // a collecting nav is still rejected on the write side
+        let nav_all = Value::Tag(
+            27,
+            Box::new(Value::Array(vec![
+                Value::Text("nav".into()),
+                Value::Text("all".into()),
+            ])),
+        );
+        let navs = navs_for(&s, &[Value::Text("todos".into()), nav_all]).unwrap();
+        assert!(put(&s, None, &navs, &Value::Bool(true)).is_err());
     }
 
     #[test]

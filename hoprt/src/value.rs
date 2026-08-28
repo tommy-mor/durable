@@ -28,23 +28,23 @@ pub enum NativeId {
     ShapeList,
     ShapeDeque,
     ShapeRecord,
-    // context: store (server side)
+    // context: the store — one callable. store(path) is a query when the
+    // path only navigates, a mutation when it ends in a terminal navigator
+    // (reducers only). Everything else on the module is a constant or a
+    // pure constructor resolved by field access on this native.
+    StoreCall,
     StoreAppend,
-    StoreOne,
     StoreItems,
-    StoreEntries,
     StoreVerify,
-    // context: reducer transaction
-    TxPut,
-    TxPeek,
-    TxAdd,
-    TxPush,
-    TxDelete,
-    TxClear,
+    // pure: terminal navigator constructors (store.set(v), store.add(n), …)
+    NavSet,
+    NavAdd,
+    NavPush,
     // context: browser side
     DomGet,
     DomSet,
     DomClear,
+    DomFocus,
     HuiRender,
 }
 

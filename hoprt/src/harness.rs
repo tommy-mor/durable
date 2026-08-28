@@ -109,6 +109,11 @@ impl Platform for SimPlatform<'_> {
             .insert(sel.to_string(), String::new());
     }
 
+    fn dom_focus(&mut self, sel: &str) {
+        let p = self.prefix();
+        self.shared.emit(format!("{p} [dom] focus {sel}"));
+    }
+
     fn store_native(
         &mut self,
         id: NativeId,
@@ -220,6 +225,11 @@ impl Cluster {
 
     /// Click a rendered hui handler by id on a browser VM.
     pub fn fire_handler(&mut self, addr: &str, id: i64) {
+        self.fire_handler_ev(addr, id, Value::Nil);
+    }
+
+    /// Fire a handler with an event value (e.g. a key map).
+    pub fn fire_handler_ev(&mut self, addr: &str, id: i64, ev: Value) {
         let (label, vm) = Self::browser(&mut self.browsers, addr);
         let mut platform = SimPlatform {
             label,
@@ -227,7 +237,7 @@ impl Cluster {
             shared: &mut self.shared,
             store: None,
         };
-        vm.fire_handler(&mut platform, id);
+        vm.fire_handler(&mut platform, id, ev);
     }
 
     /// Run a server-side function to completion and return its value —
@@ -347,8 +357,8 @@ impl Cluster {
         self.binding().native(NativeId::StoreAppend, vec![event])
     }
 
-    pub fn store_one(&mut self, path: Value) -> Result<Value, String> {
-        self.binding().native(NativeId::StoreOne, vec![path])
+    pub fn store_get(&mut self, path: Value) -> Result<Value, String> {
+        self.binding().native(NativeId::StoreCall, vec![path])
     }
 
     pub fn verify(&mut self) -> Result<(), String> {

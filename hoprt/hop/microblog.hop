@@ -20,22 +20,22 @@ server let schema = store.record([
   ["post_count", store.sum]
 ]);
 
-fn reduce(tx, event) {
+fn reduce(event) {
   if event.type == "join" {
-    tx.put(["users", event.sid, "name"], event.name);
+    store(["users", event.sid, "name", store.set(event.name)]);
   } else {
     if event.type == "follow" {
-      tx.push(["followers", event.who], event.sid);
+      store(["followers", event.who, store.push(event.sid)]);
     } else {
       if event.type == "post" {
-        let id = tx.seq;
-        tx.put(["posts", id], { author = event.sid, text = event.text });
-        tx.add(["post_count"], 1);
-        tx.push(["timelines", event.sid], id);
-        let fans = tx.peek(["followers", event.sid]);
+        let id = event.seq;
+        store(["posts", id, store.set({ author = event.sid, text = event.text })]);
+        store(["post_count", store.add(1)]);
+        store(["timelines", event.sid, store.push(id)]);
+        let fans = store(["followers", event.sid]);
         if fans {
           for i, fan in fans {
-            tx.push(["timelines", fan], id);
+            store(["timelines", fan, store.push(id)]);
           }
         }
       }
@@ -44,11 +44,11 @@ fn reduce(tx, event) {
 }
 
 fn gather_timeline(sid) {
-  let ids = store.one(["timelines", sid]);
+  let ids = store(["timelines", sid]);
   let rows = [];
   if ids {
     for i, id in ids {
-      let p = store.one(["posts", id]);
+      let p = store(["posts", id]);
       if p {
         p.id = id;
         push(rows, p);

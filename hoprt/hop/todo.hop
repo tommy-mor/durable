@@ -16,18 +16,18 @@ server let schema = store.record([
   ])]
 ]);
 
-fn reduce(tx, event) {
+fn reduce(event) {
   if event.type == "add" {
-    tx.put(["todos", tx.seq], { text = event.text, done = false });
-    tx.add(["stats", "created"], 1);
+    store(["todos", event.seq, store.set({ text = event.text, done = false })]);
+    store(["stats", "created", store.add(1)]);
   } else {
     if event.type == "toggle" {
-      let done = tx.peek(["todos", event.id, "done"]);
-      tx.put(["todos", event.id, "done"], !done);
+      let done = store(["todos", event.id, "done"]);
+      store(["todos", event.id, "done", store.set(!done)]);
       if done {
-        tx.add(["stats", "completed"], -1);
+        store(["stats", "completed", store.add(-1)]);
       } else {
-        tx.add(["stats", "completed"], 1);
+        store(["stats", "completed", store.add(1)]);
       }
     }
   }
@@ -43,8 +43,8 @@ fn todo_view(items) {
         server!();
         store.append({ type = "toggle", id = id });
         let snapshot = store.items(["todos"]);
-        let created = store.one(["stats", "created"]);
-        let completed = store.one(["stats", "completed"]);
+        let created = store(["stats", "created"]);
+        let completed = store(["stats", "completed"]);
         cast browsers {
           hui.render("#app", todo_app(snapshot, created, completed));
         }
@@ -77,8 +77,8 @@ fn add_todo(text) {
   server!();
   store.append({ type = "add", text = text });
   let snapshot = store.items(["todos"]);
-  let created = store.one(["stats", "created"]);
-  let completed = store.one(["stats", "completed"]);
+  let created = store(["stats", "created"]);
+  let completed = store(["stats", "completed"]);
   cast browsers {
     hui.render("#app", todo_app(snapshot, created, completed));
   }
@@ -86,8 +86,8 @@ fn add_todo(text) {
 
 fn on_connect(sid) {
   let snapshot = store.items(["todos"]);
-  let created = store.one(["stats", "created"]);
-  let completed = store.one(["stats", "completed"]);
+  let created = store(["stats", "created"]);
+  let completed = store(["stats", "completed"]);
   if !created {
     created = 0;
   }

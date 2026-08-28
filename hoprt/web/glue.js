@@ -2,7 +2,7 @@
 //
 // All protocol knowledge lives in hop-web (and hoprt): every binary frame
 // goes to vm.receive(); everything the VM sends comes back through the
-// callback. Rendered hui HTML calls window.__hopHandler(id).
+// callback. Rendered hui HTML calls window.__hopHandler(id, event).
 
 const status = document.getElementById('status');
 const say = (t) => { if (status) status.textContent = t; };
@@ -20,7 +20,7 @@ try {
   ws.binaryType = 'arraybuffer';
 
   const vm = new BrowserVm(src, (bytes) => ws.send(bytes));
-  window.__hopHandler = (id) => vm.fire_handler(id);
+  window.__hopHandler = (id, ev) => vm.fire_handler(id, ev);
 
   ws.onopen = () => say('connected');
   ws.onclose = () => say('disconnected — restart hopd and reload');

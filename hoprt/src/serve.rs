@@ -18,9 +18,10 @@ use std::collections::{HashMap, VecDeque};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{mpsc, Arc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tungstenite::Message;
 
@@ -38,6 +39,9 @@ enum Ev {
     /// happens on the VM thread.
     Pkt(String, Vec<u8>),
     Gone(String),
+    /// GET /reset — the app's `on_reset` hook decides what reset means
+    /// (typically: append a reset event to the log, re-render browsers).
+    Reset,
 }
 
 fn session_name(n: usize) -> String {
@@ -48,47 +52,90 @@ fn session_name(n: usize) -> String {
     }
 }
 
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
 /// Static assets: the shell page and glue.js are compiled in; the app's
 /// .hop source ships to the browser (both sides must compile the same
 /// program — the wire carries hop ids, not code); the wasm interpreter is
 /// served from `pkg_dir` (a `wasm-pack build --target web` output).
-fn http_thread(port: u16, ws_port: u16, app_src: String, pkg_dir: PathBuf) {
+///
+/// `/boot.css` is a boot barrier: the shell page references it as a
+/// stylesheet, so the window load event (what navigation waiters key on)
+/// holds until a ws session that began after this request has connected
+/// and received its first cast — i.e. until the first render has landed.
+/// Each request is handled on its own thread so the barrier never blocks
+/// the boot assets themselves.
+fn http_thread(
+    port: u16,
+    ws_port: u16,
+    app_src: String,
+    pkg_dir: PathBuf,
+    tx: mpsc::Sender<Ev>,
+    boot: Arc<AtomicU64>,
+) {
     let server = tiny_http::Server::http(("0.0.0.0", port)).expect("bind http");
     let config = format!(r#"{{"wsPort":{ws_port}}}"#);
     for req in server.incoming_requests() {
-        let (content, ctype): (Vec<u8>, &str) = match req.url() {
-            "/" | "/index.html" => (INDEX_HTML.into(), "text/html; charset=utf-8"),
-            "/glue.js" => (GLUE_JS.into(), "text/javascript"),
-            "/config.json" => (config.clone().into(), "application/json"),
-            "/app.hop" => (app_src.clone().into(), "text/plain; charset=utf-8"),
-            url => {
-                // /pkg/<file> — flat, no traversal: the last path component only
-                let served = url.strip_prefix("/pkg/").and_then(|f| {
-                    let name = Path::new(f).file_name()?;
-                    std::fs::read(pkg_dir.join(name)).ok().map(|bytes| {
-                        let ctype = if f.ends_with(".wasm") {
-                            "application/wasm"
-                        } else if f.ends_with(".js") {
-                            "text/javascript"
-                        } else {
-                            "application/octet-stream"
-                        };
-                        (bytes, ctype)
-                    })
-                });
-                match served {
-                    Some(x) => x,
-                    None => {
-                        let _ = req.respond(tiny_http::Response::empty(404));
-                        continue;
+        let (tx, boot, config, app_src, pkg_dir) =
+            (tx.clone(), boot.clone(), config.clone(), app_src.clone(), pkg_dir.clone());
+        thread::spawn(move || {
+            let (content, ctype): (Vec<u8>, &str) = match req.url() {
+                "/" | "/index.html" => (INDEX_HTML.into(), "text/html; charset=utf-8"),
+                "/glue.js" => (GLUE_JS.into(), "text/javascript"),
+                "/config.json" => (config.into(), "application/json"),
+                "/app.hop" => (app_src.into(), "text/plain; charset=utf-8"),
+                "/reset" => {
+                    let _ = tx.send(Ev::Reset);
+                    (b"ok".to_vec(), "text/plain; charset=utf-8")
+                }
+                "/boot.css" => {
+                    let start = now_millis();
+                    let deadline = start + 8000;
+                    while now_millis() < deadline {
+                        if boot.load(Ordering::SeqCst) > start {
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    // grace: the hello + first cast are in flight; let the
+                    // browser's wasm VM render before load fires
+                    thread::sleep(Duration::from_millis(75));
+                    (b"/* boot barrier */".to_vec(), "text/css")
+                }
+                url => {
+                    // /pkg/<file> — flat, no traversal: the last path component only
+                    let served = url.strip_prefix("/pkg/").and_then(|f| {
+                        let name = Path::new(f).file_name()?;
+                        std::fs::read(pkg_dir.join(name)).ok().map(|bytes| {
+                            let ctype = if f.ends_with(".wasm") {
+                                "application/wasm"
+                            } else if f.ends_with(".js") {
+                                "text/javascript"
+                            } else {
+                                "application/octet-stream"
+                            };
+                            (bytes, ctype)
+                        })
+                    });
+                    match served {
+                        Some(x) => x,
+                        None => {
+                            let _ = req.respond(tiny_http::Response::empty(404));
+                            return;
+                        }
                     }
                 }
-            }
-        };
-        let resp = tiny_http::Response::from_data(content).with_header(
-            tiny_http::Header::from_bytes(&b"Content-Type"[..], ctype.as_bytes()).unwrap(),
-        );
-        let _ = req.respond(resp);
+            };
+            let resp = tiny_http::Response::from_data(content).with_header(
+                tiny_http::Header::from_bytes(&b"Content-Type"[..], ctype.as_bytes()).unwrap(),
+            );
+            let _ = req.respond(resp);
+        });
     }
 }
 
@@ -193,6 +240,8 @@ impl Platform for ServePlatform<'_> {
 
     fn dom_clear(&mut self, _sel: &str) {}
 
+    fn dom_focus(&mut self, _sel: &str) {}
+
     fn store_native(
         &mut self,
         id: NativeId,
@@ -224,8 +273,15 @@ pub fn serve(
             pkg_dir.display()
         );
     }
-    thread::spawn(move || http_thread(http_port, ws_port, app_src, pkg_dir));
     let (tx, rx) = mpsc::channel::<Ev>();
+    // millis of the latest session connect (hello + first cast sent) —
+    // the /boot.css barrier waits on this
+    let boot = Arc::new(AtomicU64::new(0));
+    {
+        let tx = tx.clone();
+        let boot = boot.clone();
+        thread::spawn(move || http_thread(http_port, ws_port, app_src, pkg_dir, tx, boot));
+    }
     {
         let tx = tx.clone();
         thread::spawn(move || accept_thread(ws_port, tx));
@@ -270,6 +326,7 @@ pub fn serve(
                     store: binding.as_mut(),
                 };
                 vm.session_connect(&mut platform, &sid);
+                boot.store(now_millis(), Ordering::SeqCst);
             }
             Ev::Pkt(sid, bytes) => {
                 let pkt = match decode(&bytes) {
@@ -303,6 +360,16 @@ pub fn serve(
             Ev::Gone(sid) => {
                 sessions.remove(&sid);
                 println!("[hopd] session {sid} disconnected");
+            }
+            Ev::Reset => {
+                println!("[hopd] reset");
+                let mut platform = ServePlatform {
+                    outbox: &mut outbox,
+                    store: binding.as_mut(),
+                };
+                if !matches!(vm.globals.get("on_reset"), Value::Nil) {
+                    vm.fire(&mut platform, "on_reset", Vec::new());
+                }
             }
         }
         // drain everything the VM emitted in response

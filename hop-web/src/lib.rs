@@ -36,6 +36,21 @@ fn query(sel: &str) -> Option<web_sys::Element> {
     document().and_then(|d| d.query_selector(sel).ok().flatten())
 }
 
+/// DOM event → hop value: a map of the fields handlers care about.
+/// Absent fields (a click has no `key`) are simply omitted.
+fn event_value(ev: &JsValue) -> Value {
+    if ev.is_undefined() || ev.is_null() {
+        return Value::Nil;
+    }
+    let mut entries = std::collections::BTreeMap::new();
+    if let Ok(k) = js_sys::Reflect::get(ev, &JsValue::from_str("key")) {
+        if let Some(s) = k.as_string() {
+            entries.insert(Value::str("key"), Value::str(s));
+        }
+    }
+    Value::map(entries)
+}
+
 impl Platform for WebPlatform<'_> {
     fn send(&mut self, pkt: Value) {
         match encode(&pkt) {
@@ -57,6 +72,8 @@ impl Platform for WebPlatform<'_> {
             input.value()
         } else if let Some(ta) = el.dyn_ref::<web_sys::HtmlTextAreaElement>() {
             ta.value()
+        } else if let Some(select) = el.dyn_ref::<web_sys::HtmlSelectElement>() {
+            select.value()
         } else {
             el.text_content().unwrap_or_default()
         }
@@ -76,6 +93,13 @@ impl Platform for WebPlatform<'_> {
             ta.set_value("");
         } else {
             el.set_inner_html("");
+        }
+    }
+
+    fn dom_focus(&mut self, sel: &str) {
+        let Some(el) = query(sel) else { return };
+        if let Some(html) = el.dyn_ref::<web_sys::HtmlElement>() {
+            let _ = html.focus();
         }
     }
 
@@ -132,11 +156,13 @@ impl BrowserVm {
         }
     }
 
-    /// A click on hui-rendered HTML (`__hopHandler(id)`).
-    pub fn fire_handler(&mut self, id: f64) {
+    /// An event on hui-rendered HTML (`__hopHandler(id, event)`). The DOM
+    /// event crosses as a small map value — just `key` for now, which is
+    /// what keyboard handlers need.
+    pub fn fire_handler(&mut self, id: f64, ev: JsValue) {
         if let Some(vm) = &mut self.vm {
             let mut platform = WebPlatform { send: &self.send };
-            vm.fire_handler(&mut platform, id as i64);
+            vm.fire_handler(&mut platform, id as i64, event_value(&ev));
         }
     }
 

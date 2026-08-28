@@ -11,12 +11,12 @@ server let schema = store.record([
   ]))]
 ]);
 
-fn reduce(tx, event) {
+fn reduce(event) {
   if event.type == "say" {
-    tx.push(["rooms", event.room, "messages"], {
+    store(["rooms", event.room, "messages", store.push({
       who = event.sid,
       text = event.text
-    });
+    })]);
   }
 }
 
@@ -57,7 +57,7 @@ fn chat_view(room, rooms, messages) {
 }
 
 fn room_names() {
-  let entries = store.entries(["rooms"]);
+  let entries = store(["rooms", store.entries]);
   let names = ["lobby"];
   if entries {
     for i, pair in entries {
@@ -72,7 +72,7 @@ fn room_names() {
 
 fn paint(room) {
   let rooms = room_names();
-  let messages = store.one(["rooms", room, "messages"]);
+  let messages = store(["rooms", room, "messages"]);
   return { room = room, rooms = rooms, messages = messages };
 }
 

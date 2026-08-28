@@ -1,147 +1,497 @@
-// tournament.hop — collaborative single-elimination brackets (a challonge
-// on the tape).
+// tournament.hop — collaborative brackets on the tape (challonge parity).
 //
 //   cargo run -p hoprt --bin hopd -- hoprt/hop/tournament.hop
-//   open http://localhost:9000 in several tabs: anyone can create a
-//   tournament, enter players, start the bracket, and report results.
+//   open http://localhost:9000 in several tabs: create a tournament in one
+//   of three formats, enter and seed players, start it, report scores,
+//   reopen a match (results cascade back out), crown a champion.
 //   restart hopd: the JSONL tape rebuilds every bracket.
 //
-// Everything is four events — create / enter / start / report. The bracket
-// itself is *derived*: the reducer seeds it deterministically at "start"
-// (standard 1v8 4v5 2v7 3v6 order, so byes land on top seeds and no match
-// is ever empty) and advances winners by arithmetic on (round, slot).
-// store.verify() replays the tape and must reproduce the projection.
+// Eight events — create / enter / move / drop / start / report / unreport /
+// delete. Everything else is derived. The bracket is a *graph built at
+// start*: every match record carries w_to and l_to links ([mid, side] or
+// "champion"), so advancement is one generic `place` walk, double
+// elimination is just a different graph, and reopening a match is the same
+// walk in reverse. "__bye" is a real value that flows through the links,
+// which makes short brackets and losers-bracket holes uniform.
+//
+// A reducer reads *committed* state only — its own writes are invisible
+// until the event commits. The start builder therefore lays out the whole
+// bracket in a local map (seeding, bye resolution) and writes it once;
+// report-time advancement reads only keys committed by earlier events.
 
 server let schema = store.record([
   ["tournaments", store.map(store.record([
     ["name", store.leaf],
+    ["format", store.leaf],                 // "single" | "double" | "robin"
     ["status", store.leaf],                 // "signup" | "live" | "done"
     ["players", store.list(store.leaf)],
     ["rounds", store.leaf],
     ["champion", store.leaf],
-    ["matches", store.map(store.record([   // keyed "r<round>m<slot>"
+    ["matches", store.map(store.record([
       ["p1", store.leaf],
       ["p2", store.leaf],
       ["winner", store.leaf],
+      ["s1", store.leaf],
+      ["s2", store.leaf],
       ["round", store.leaf],
-      ["slot", store.leaf]
+      ["slot", store.leaf],
+      ["bracket", store.leaf],              // "w" | "l" | "gf" | "rr"
+      ["w_to", store.leaf],                 // [mid, side] | "champion" | nil
+      ["l_to", store.leaf]
     ]))]
   ]))]
 ]);
 
-// ── reducer ────────────────────────────────────────────────────────────
+// ── reducer ─────────────────────────────────────────────────────────────
 
-fn reduce(tx, event) {
+fn reduce(event) {
   if event.type == "create" {
-    tx.put(["tournaments", tx.seq, "name"], event.name);
-    tx.put(["tournaments", tx.seq, "status"], "signup");
+    store(["tournaments", event.seq, "name", store.set(event.name)]);
+    store(["tournaments", event.seq, "format", store.set(event.format || "single")]);
+    store(["tournaments", event.seq, "status", store.set("signup")]);
   } else if event.type == "enter" {
-    let st = tx.peek(["tournaments", event.tid, "status"]);
-    if st == "signup" {
-      tx.push(["tournaments", event.tid, "players"], event.player);
-    }
+    enter_player(event);
+  } else if event.type == "move" {
+    move_player(event);
+  } else if event.type == "drop" {
+    drop_player(event);
   } else if event.type == "start" {
-    let st = tx.peek(["tournaments", event.tid, "status"]);
+    let st = store(["tournaments", event.tid, "status"]);
     if st == "signup" {
-      start_bracket(tx, event.tid);
+      start_bracket(event.tid);
     }
   } else if event.type == "report" {
-    report_result(tx, event);
+    report_result(event);
+  } else if event.type == "unreport" {
+    unreport_match(event.tid, event.mid);
+  } else if event.type == "delete" {
+    store(["tournaments", event.tid, store.del]);
   }
 }
 
-// Lock signups and lay out round 1. Bracket position j (0-based) gets
-// seed seed_order(size)[j] (seed numbers stay 1-based — they're names,
-// like "seed 1"); entrants are seeded in entry order. Slots with no
-// second entrant are byes: the present player advances now.
-fn start_bracket(tx, tid) {
-  let players = tx.peek(["tournaments", tid, "players"]);
-  let n = len(players);
-  if n < 2 {
+fn enter_player(event) {
+  let st = store(["tournaments", event.tid, "status"]);
+  if st != "signup" || !event.player || event.player == "" || event.player == "__bye" {
     return;
   }
+  let players = store(["tournaments", event.tid, "players"]);
+  if players {
+    for _, p in players {
+      if p == event.player {
+        return;
+      }
+    }
+  }
+  store(["tournaments", event.tid, "players", store.push(event.player)]);
+}
+
+// promote entrant i one seed up (swap with i-1)
+fn move_player(event) {
+  let st = store(["tournaments", event.tid, "status"]);
+  let players = store(["tournaments", event.tid, "players"]);
+  let i = event.i;
+  if st == "signup" && players && i >= 1 && i < len(players) {
+    store(["tournaments", event.tid, "players", i - 1, store.set(players[i])]);
+    store(["tournaments", event.tid, "players", i, store.set(players[i - 1])]);
+  }
+}
+
+fn drop_player(event) {
+  let st = store(["tournaments", event.tid, "status"]);
+  let players = store(["tournaments", event.tid, "players"]);
+  let i = event.i;
+  if st == "signup" && players && i >= 0 && i < len(players) {
+    let n = len(players);
+    for _, j in range(i, n - 1) {
+      store(["tournaments", event.tid, "players", j, store.set(players[j + 1])]);
+    }
+    store(["tournaments", event.tid, "players", n - 1, store.del]);
+  }
+}
+
+// ── start: build the whole match graph locally, write it once ───────────
+
+fn start_bracket(tid) {
+  let players = store(["tournaments", tid, "players"]);
+  if len(players) < 2 {
+    return;
+  }
+  let format = store(["tournaments", tid, "format"]);
+  let built = nil;
+  if format == "double" {
+    built = build_double(players);
+  } else if format == "robin" {
+    built = build_robin(players);
+  } else {
+    built = build_single(players);
+  }
+  store(["tournaments", tid, "status", store.set("live")]);
+  store(["tournaments", tid, "rounds", store.set(built.rounds)]);
+  for mid, m in built.ms {
+    store(["tournaments", tid, "matches", mid, store.set(m)]);
+  }
+}
+
+fn build_single(players) {
+  let n = len(players);
   let size = pow2_from(1, n);
   let rounds = log2i(size);
-  tx.put(["tournaments", tid, "status"], "live");
-  tx.put(["tournaments", tid, "rounds"], rounds);
+  let ms = {};
+  for _, r in range(1, rounds + 1) {
+    for _, s in range(1, pow2i(rounds - r) + 1) {
+      let w_to = "champion";
+      if r < rounds {
+        w_to = ["r" .. (r + 1) .. "m" .. floor((s + 1) / 2), side_of(s)];
+      }
+      ms["r" .. r .. "m" .. s] = { round = r, slot = s, bracket = "w", w_to = w_to };
+    }
+  }
+  seed_round1(ms, players, size, "r");
+  for _, s in range(1, pow2i(rounds - 1) + 1) {
+    sim_auto(ms, "r1m" .. s);
+  }
+  return { ms = ms, rounds = rounds };
+}
 
+// Winners bracket "w", losers bracket "l", grand final "gf1" (+ "gf2" if
+// the LB champion takes gf1 — the bracket reset). LB alternates minor
+// rounds (survivors pair up) and major rounds (a WB loser drops in);
+// drop slots map by identity (no anti-rematch shuffle yet).
+fn build_double(players) {
+  let n = len(players);
+  let size = pow2_from(2, n);
+  let k = log2i(size);
+  let ms = {};
+  for _, r in range(1, k + 1) {
+    for _, s in range(1, pow2i(k - r) + 1) {
+      let w_to = ["gf1", "p1"];
+      if r < k {
+        w_to = ["w" .. (r + 1) .. "m" .. floor((s + 1) / 2), side_of(s)];
+      }
+      let l_to = ["gf1", "p2"];               // k == 1: loser straight to gf
+      if r == 1 && k > 1 {
+        l_to = ["l1m" .. floor((s + 1) / 2), side_of(s)];
+      } else if r > 1 {
+        l_to = ["l" .. (2 * r - 2) .. "m" .. s, "p2"];
+      }
+      ms["w" .. r .. "m" .. s] = { round = r, slot = s, bracket = "w", w_to = w_to, l_to = l_to };
+    }
+  }
+  for _, i in range(1, k) {
+    for _, s in range(1, pow2i(k - 1 - i) + 1) {
+      let minor = 2 * i - 1;
+      ms["l" .. minor .. "m" .. s] =
+        { round = minor, slot = s, bracket = "l", w_to = ["l" .. (2 * i) .. "m" .. s, "p1"] };
+      let mw = ["gf1", "p2"];
+      if i < k - 1 {
+        mw = ["l" .. (2 * i + 1) .. "m" .. floor((s + 1) / 2), side_of(s)];
+      }
+      ms["l" .. (2 * i) .. "m" .. s] = { round = 2 * i, slot = s, bracket = "l", w_to = mw };
+    }
+  }
+  ms["gf1"] = { round = 1, slot = 1, bracket = "gf" };
+  seed_round1(ms, players, size, "w");
+  for _, s in range(1, pow2i(k - 1) + 1) {
+    sim_auto(ms, "w1m" .. s);
+  }
+  return { ms = ms, rounds = k };
+}
+
+// Round robin by the circle method: fix seat 0, rotate the rest. Bye
+// pairings (odd field) are simply not created.
+fn build_robin(players) {
+  let ps = [];
+  for _, p in players {
+    push(ps, p);
+  }
+  if len(ps) % 2 == 1 {
+    push(ps, "__bye");
+  }
+  let m = len(ps);
+  let ms = {};
+  let pos = range(0, m);
+  for _, r in range(1, m) {
+    let cnt = 0;
+    for _, j in range(0, floor(m / 2)) {
+      let a = ps[pos[j]];
+      let b = ps[pos[m - 1 - j]];
+      if a != "__bye" && b != "__bye" {
+        cnt = cnt + 1;
+        ms["r" .. r .. "m" .. cnt] = { round = r, slot = cnt, bracket = "rr", p1 = a, p2 = b };
+      }
+    }
+    pos = rotate(pos);
+  }
+  return { ms = ms, rounds = m - 1 };
+}
+
+fn rotate(pos) {
+  let m = len(pos);
+  let out = [pos[0], pos[m - 1]];
+  for _, j in range(1, m - 1) {
+    push(out, pos[j]);
+  }
+  return out;
+}
+
+// Bracket position j gets seed order[j] (standard mirror-interleave:
+// 1 8 4 5 2 7 3 6 for size 8, so byes land on top seeds). Entrants are
+// seeded in list order — that is what the signup arrows reorder.
+fn seed_round1(ms, players, size, prefix) {
+  let n = len(players);
   let order = seed_order(size);
-  let p1s = {};
-  let p2s = {};
   for j, seed in order {
-    let slot = floor(j / 2) + 1;
+    let m = ms[prefix .. "1m" .. (floor(j / 2) + 1)];
+    let p = "__bye";
     if seed <= n {
-      if j % 2 == 0 {
-        p1s[slot] = players[seed - 1];
-      } else {
-        p2s[slot] = players[seed - 1];
-      }
+      p = players[seed - 1];
     }
-  }
-  for j, seed in order {
     if j % 2 == 0 {
-      let slot = floor(j / 2) + 1;
-      let mid = "r1m" .. slot;
-      let a = p1s[slot];
-      let b = p2s[slot];
-      tx.put(["tournaments", tid, "matches", mid, "round"], 1);
-      tx.put(["tournaments", tid, "matches", mid, "slot"], slot);
-      if a {
-        tx.put(["tournaments", tid, "matches", mid, "p1"], a);
-      }
-      if b {
-        tx.put(["tournaments", tid, "matches", mid, "p2"], b);
-      }
-      // seeding guarantees a is present whenever b is; a lone a is a bye
-      if a && !b {
-        tx.put(["tournaments", tid, "matches", mid, "winner"], a);
-        advance(tx, tid, 2, floor((slot + 1) / 2), slot % 2 == 1, a, rounds);
-      }
+      m.p1 = p;
+    } else {
+      m.p2 = p;
     }
   }
 }
 
-fn report_result(tx, event) {
-  let tid = event.tid;
-  let mid = event.match;
-  let p1 = tx.peek(["tournaments", tid, "matches", mid, "p1"]);
-  let p2 = tx.peek(["tournaments", tid, "matches", mid, "p2"]);
-  let w = tx.peek(["tournaments", tid, "matches", mid, "winner"]);
-  if p1 && p2 && !w && (event.winner == p1 || event.winner == p2) {
-    tx.put(["tournaments", tid, "matches", mid, "winner"], event.winner);
-    let round = tx.peek(["tournaments", tid, "matches", mid, "round"]);
-    let slot = tx.peek(["tournaments", tid, "matches", mid, "slot"]);
-    let rounds = tx.peek(["tournaments", tid, "rounds"]);
-    advance(tx, tid, round + 1, floor((slot + 1) / 2), slot % 2 == 1, event.winner, rounds);
-  }
-}
-
-// Winner of match (round-1, feeding slot) lands in `slot` of `round`,
-// as p1 if the feeder slot was odd. Past the last round there is no
-// next match: crown them.
-fn advance(tx, tid, round, slot, as_p1, player, rounds) {
-  if round > rounds {
-    tx.put(["tournaments", tid, "champion"], player);
-    tx.put(["tournaments", tid, "status"], "done");
+// bye resolution against the local map (start time, nothing committed yet)
+fn sim_auto(ms, mid) {
+  let m = ms[mid];
+  if m.winner || !m.p1 || !m.p2 {
     return;
   }
-  let mid = "r" .. round .. "m" .. slot;
-  tx.put(["tournaments", tid, "matches", mid, "round"], round);
-  tx.put(["tournaments", tid, "matches", mid, "slot"], slot);
-  if as_p1 {
-    tx.put(["tournaments", tid, "matches", mid, "p1"], player);
-  } else {
-    tx.put(["tournaments", tid, "matches", mid, "p2"], player);
+  if m.p1 != "__bye" && m.p2 != "__bye" {
+    return;
+  }
+  let w = m.p2;
+  if m.p2 == "__bye" {
+    w = m.p1;                                // both byes: w stays "__bye"
+  }
+  m.winner = w;
+  sim_place(ms, m.w_to, w);
+  if m.l_to {
+    sim_place(ms, m.l_to, "__bye");          // the loser of a bye is a bye
   }
 }
 
-// ── bracket math (v0 has no while: recursion) ──────────────────────────
+fn sim_place(ms, to, player) {
+  if to == "champion" {
+    return;                                  // unreachable with 2+ real players
+  }
+  let m = ms[to[0]];
+  if to[1] == "p1" {
+    m.p1 = player;
+  } else {
+    m.p2 = player;
+  }
+  sim_auto(ms, to[0]);
+}
+
+// ── report: one generic walk along the links ────────────────────────────
+
+fn report_result(event) {
+  let tid = event.tid;
+  let mid = event.mid;
+  let m = store(["tournaments", tid, "matches", mid]);
+  if !m || !m.p1 || !m.p2 || m.winner || m.p1 == "__bye" || m.p2 == "__bye" {
+    return;
+  }
+  if event.winner != m.p1 && event.winner != m.p2 {
+    return;
+  }
+  store(["tournaments", tid, "matches", mid, "winner", store.set(event.winner)]);
+  if event.s1 {
+    store(["tournaments", tid, "matches", mid, "s1", store.set(event.s1)]);
+  }
+  if event.s2 {
+    store(["tournaments", tid, "matches", mid, "s2", store.set(event.s2)]);
+  }
+  let loser = m.p2;
+  if event.winner == m.p2 {
+    loser = m.p1;
+  }
+  if m.bracket == "rr" {
+    rr_check_done(tid, mid, event.winner);
+    return;
+  }
+  if mid == "gf1" {
+    if event.winner == m.p1 {
+      crown(tid, event.winner);          // the WB champion stays undefeated
+    } else {
+      // first loss for the WB champion: reset — one match for everything
+      store(["tournaments", tid, "matches", "gf2", store.set(
+        { round = 2, slot = 1, bracket = "gf", p1 = m.p1, p2 = m.p2, w_to = "champion" })]);
+    }
+    return;
+  }
+  place(tid, m.w_to, event.winner);
+  if m.l_to {
+    place(tid, m.l_to, loser);
+  }
+}
+
+// Put `player` where a link points. If that fills a match against a bye,
+// the auto-win continues the walk. The other side is read from committed
+// state; the winner and loser walks of one report never share a match.
+fn place(tid, to, player) {
+  if to == "champion" {
+    crown(tid, player);
+    return;
+  }
+  let mid = to[0];
+  let side = to[1];
+  store(["tournaments", tid, "matches", mid, side, store.set(player)]);
+  let other = store(["tournaments", tid, "matches", mid, other_side(side)]);
+  if !other {
+    return;
+  }
+  let w = nil;
+  if player == "__bye" && other == "__bye" {
+    w = "__bye";
+  } else if other == "__bye" {
+    w = player;
+  } else if player == "__bye" {
+    w = other;
+  }
+  if w {
+    store(["tournaments", tid, "matches", mid, "winner", store.set(w)]);
+    let m = store(["tournaments", tid, "matches", mid]);
+    place(tid, m.w_to, w);
+    if m.l_to {
+      place(tid, m.l_to, "__bye");
+    }
+  }
+}
+
+fn crown(tid, player) {
+  store(["tournaments", tid, "champion", store.set(player)]);
+  store(["tournaments", tid, "status", store.set("done")]);
+}
+
+// All round-robin matches reported → standings decide the champion
+// (unique win-count max; a tie finishes the tournament without one).
+fn rr_check_done(tid, mid, winner) {
+  let ms = store(["tournaments", tid, "matches"]);
+  let total = 0;
+  let done = 0;
+  let wins = {};
+  for mid2, m2 in ms {
+    total = total + 1;
+    let w = m2.winner;
+    if mid2 == mid {
+      w = winner;                            // this event's write, not yet visible
+    }
+    if w {
+      done = done + 1;
+      if !wins[w] {
+        wins[w] = 0;
+      }
+      wins[w] = wins[w] + 1;
+    }
+  }
+  if done < total {
+    return;
+  }
+  let best = nil;
+  let bestw = -1;
+  let tie = false;
+  for p, w in wins {
+    if w > bestw {
+      best = p;
+      bestw = w;
+      tie = false;
+    } else if w == bestw {
+      tie = true;
+    }
+  }
+  store(["tournaments", tid, "status", store.set("done")]);
+  if !tie {
+    store(["tournaments", tid, "champion", store.set(best)]);
+  }
+}
+
+// ── unreport: the same walk in reverse ──────────────────────────────────
+
+fn unreport_match(tid, mid) {
+  let m = store(["tournaments", tid, "matches", mid]);
+  if !m || !m.winner {
+    return;
+  }
+  if m.p1 == "__bye" || m.p2 == "__bye" {
+    return;                                  // bye results are structural
+  }
+  retract_result(tid, mid);
+}
+
+// Clear a decided match, first pulling its winner (and loser) back out of
+// every downstream match — recursively, so a reopened semifinal also
+// reopens the final it fed.
+fn retract_result(tid, mid) {
+  let m = store(["tournaments", tid, "matches", mid]);
+  let loser = m.p2;
+  if m.winner == m.p2 {
+    loser = m.p1;
+  }
+  if m.bracket == "rr" {
+    store(["tournaments", tid, "status", store.set("live")]);
+    store(["tournaments", tid, "champion", store.del]);
+  } else if mid == "gf1" {
+    if store(["tournaments", tid, "matches", "gf2", "round"]) {
+      uncrown_if(tid, store(["tournaments", tid, "matches", "gf2", "winner"]));
+      store(["tournaments", tid, "matches", "gf2", store.del]);
+    } else {
+      uncrown(tid);
+    }
+  } else {
+    retract_from(tid, m.w_to, m.winner);
+    if m.l_to {
+      retract_from(tid, m.l_to, loser);
+    }
+  }
+  store(["tournaments", tid, "matches", mid, "winner", store.del]);
+  store(["tournaments", tid, "matches", mid, "s1", store.del]);
+  store(["tournaments", tid, "matches", mid, "s2", store.del]);
+}
+
+fn retract_from(tid, to, player) {
+  if to == "champion" {
+    uncrown(tid);
+    return;
+  }
+  let mid = to[0];
+  if store(["tournaments", tid, "matches", mid, "winner"]) {
+    retract_result(tid, mid);
+  }
+  store(["tournaments", tid, "matches", mid, to[1], store.del]);
+}
+
+fn uncrown(tid) {
+  store(["tournaments", tid, "champion", store.del]);
+  store(["tournaments", tid, "status", store.set("live")]);
+}
+
+fn uncrown_if(tid, had_winner) {
+  if had_winner {
+    uncrown(tid);
+  } else {
+    store(["tournaments", tid, "status", store.set("live")]);
+  }
+}
+
+// ── shared arithmetic ───────────────────────────────────────────────────
 
 fn pow2_from(p, n) {
   if p >= n {
     return p;
   }
   return pow2_from(p * 2, n);
+}
+
+fn pow2i(k) {
+  if k <= 0 {
+    return 1;
+  }
+  return 2 * pow2i(k - 1);
 }
 
 fn log2i(p) {
@@ -151,8 +501,6 @@ fn log2i(p) {
   return 1 + log2i(floor(p / 2));
 }
 
-// Standard bracket order: position j gets seed number out[j]. Built by
-// the classic mirror-interleave — for size 8: 1 8 4 5 2 7 3 6.
 fn seed_order(size) {
   if size == 1 {
     return [1];
@@ -166,6 +514,34 @@ fn seed_order(size) {
   return out;
 }
 
+fn side_of(s) {
+  if s % 2 == 1 {
+    return "p1";
+  }
+  return "p2";
+}
+
+fn other_side(side) {
+  if side == "p1" {
+    return "p2";
+  }
+  return "p1";
+}
+
+fn range(a, b) {
+  let out = [];
+  range_into(out, a, b);
+  return out;
+}
+
+fn range_into(out, a, b) {
+  if a >= b {
+    return;
+  }
+  push(out, a);
+  range_into(out, a + 1, b);
+}
+
 // ── server-side snapshots ───────────────────────────────────────────────
 
 fn snapshot(tid) {
@@ -175,11 +551,24 @@ fn snapshot(tid) {
       return { t = t };
     }
   }
-  return { list = store.items(["tournaments"]) };
+  // the lobby needs names and counts, not whole brackets: select the map
+  // keys, then point-read exactly what the list shows
+  let ids = store(["tournaments", store.keys]);
+  let list = [];
+  for _, id in ids {
+    push(list, {
+      id = id,
+      name = store(["tournaments", id, "name"]),
+      format = store(["tournaments", id, "format"]),
+      status = store(["tournaments", id, "status"]),
+      entrants = len(store(["tournaments", id, "players"]))
+    });
+  }
+  return { list = list };
 }
 
 fn load_t(tid) {
-  let name = store.one(["tournaments", tid, "name"]);
+  let name = store(["tournaments", tid, "name"]);
   if !name {
     return nil;
   }
@@ -188,14 +577,16 @@ fn load_t(tid) {
   return {
     id = tid,
     name = name,
-    status = store.one(["tournaments", tid, "status"]),
-    players = store.one(["tournaments", tid, "players"]),
+    format = store(["tournaments", tid, "format"]),
+    status = store(["tournaments", tid, "status"]),
+    players = store(["tournaments", tid, "players"]),
+    rounds = store(["tournaments", tid, "rounds"]),
     matches = ms,
-    champion = store.one(["tournaments", tid, "champion"])
+    champion = store(["tournaments", tid, "champion"])
   };
 }
 
-// ── views (hiccup; handlers are closures that hop) ──────────────────────
+// ── views ───────────────────────────────────────────────────────────────
 
 fn render(snap) {
   if snap.t {
@@ -208,15 +599,13 @@ fn render(snap) {
 fn lobby_view(list) {
   let rows = [];
   if list {
-    for i, t in list {
+    for _, t in list {
       let tid = t.id;
-      push(rows, [:li, {
-        class = "clickable",
-        id = "t-" .. tid,
-        onclick = fn(e) { open_t(tid); }
-      },
-        [:span, {}, t.name],
-        [:span, { class = "meta" }, "  (" .. t.status .. ", " .. len(t.players) .. " players)"]
+      push(rows, [:li, { id = "t-" .. tid },
+        [:span, { class = "clickable", style = "cursor:pointer", onclick = fn(e) { open_t(tid); } }, t.name],
+        [:span, { class = "meta" },
+          "  " .. fmt_name(t.format) .. " · " .. t.status .. " · " .. t.entrants .. " entrants  "],
+        [:button, { class = "pair meta", style = "font-size:0.75rem", onclick = fn(e) { delete_t(tid); } }, "✕"]
       ]);
     }
   }
@@ -224,16 +613,33 @@ fn lobby_view(list) {
     [:h1, {}, "tournaments"],
     [:div, { class = "row" },
       [:input, { id = "t-name", placeholder = "new tournament" }],
+      [:select, { id = "t-format" },
+        [:option, { value = "single" }, "single elimination"],
+        [:option, { value = "double" }, "double elimination"],
+        [:option, { value = "robin" }, "round robin"]
+      ],
       [:button, { id = "create", onclick = fn(e) { create_t(); } }, "create"]
     ],
     [:ul, { id = "t-list" }, rows]
   ];
 }
 
+fn fmt_name(format) {
+  if format == "double" {
+    return "double elim";
+  }
+  if format == "robin" {
+    return "round robin";
+  }
+  return "single elim";
+}
+
 fn t_view(t) {
   let body = [];
   if t.status == "signup" {
     body = signup_view(t);
+  } else if t.format == "robin" {
+    body = rr_view(t);
   } else {
     body = bracket_view(t);
   }
@@ -241,38 +647,69 @@ fn t_view(t) {
     [:div, { class = "row" },
       [:button, { id = "back", onclick = fn(e) { go_lobby(); } }, "lobby"],
       [:h1, {}, t.name],
-      [:span, { class = "meta", id = "t-status" }, t.status]
+      [:span, { class = "meta", id = "t-status" }, fmt_name(t.format) .. " · " .. t.status]
     ],
     [:input, { id = "current-tid", type = "hidden", value = t.id }],
     body
   ];
 }
 
+// signup: the list order *is* the seeding — ↑ promotes, ✕ removes
 fn signup_view(t) {
   let tid = t.id;
   let rows = [];
   if t.players {
     for i, p in t.players {
-      push(rows, [:li, {}, p]);
+      let idx = i;
+      let up = nil;
+      if i > 0 {
+        up = [:button, { class = "pair meta", style = "font-size:0.75rem",
+                         onclick = fn(e) { move_p(tid, idx); } }, "↑"];
+      }
+      push(rows, [:li, { id = "seed-" .. (i + 1) },
+        [:span, { class = "meta" }, (i + 1) .. ". "],
+        [:span, {}, p],
+        [:span, {}, "  "],
+        up,
+        [:button, { class = "pair meta", style = "font-size:0.75rem",
+                    onclick = fn(e) { drop_p(tid, idx); } }, "✕"]
+      ]);
     }
   }
   return [:div, {},
     [:div, { class = "row" },
       [:input, { id = "p-name", placeholder = "player name" }],
       [:button, { id = "enter", onclick = fn(e) { enter_p(tid); } }, "enter"],
-      [:button, { id = "start", onclick = fn(e) { start_t(tid); } }, "start bracket"]
+      [:button, { id = "start", onclick = fn(e) { start_t(tid); } }, "start"]
     ],
     [:ul, { id = "players" }, rows]
   ];
 }
 
 fn bracket_view(t) {
-  let cols = {};                          // round number → column of matches
-  for i, m in t.matches {
-    if !cols[m.round] {
-      cols[m.round] = [];
+  let banner = [];
+  if t.champion {
+    banner = [:h2, { id = "champion" }, "champion: " .. t.champion];
+  }
+  let sections = [banner, columns_view(t, "w")];
+  if t.format == "double" {
+    push(sections, [:h2, { class = "meta" }, "losers bracket"]);
+    push(sections, columns_view(t, "l"));
+    push(sections, [:h2, { class = "meta" }, "grand final"]);
+    push(sections, columns_view(t, "gf"));
+  }
+  return [:div, { id = "bracket" }, sections];
+}
+
+fn columns_view(t, b) {
+  let cols = {};
+  for _, m in t.matches {
+    if m.bracket == b {
+      if !cols[m.round] {
+        cols[m.round] = [];
+      }
+      push(cols[m.round], match_view(t, m));
     }
-    push(cols[m.round], match_view(t.id, m));
   }
   let colviews = [];
   for r, col in cols {
@@ -280,52 +717,146 @@ fn bracket_view(t) {
       class = "bracket-col",
       style = "display:flex;flex-direction:column;justify-content:space-around;gap:8px;flex:1"
     },
-      [:div, { class = "meta" }, "round " .. r],
+      [:div, { class = "meta" }, col_label(t, b, r)],
       col
     ]);
   }
+  return [:div, { class = "row", style = "align-items:stretch" }, colviews];
+}
+
+fn col_label(t, b, r) {
+  if b == "gf" {
+    if r == 2 {
+      return "reset";
+    }
+    return "grand final";
+  }
+  if b == "l" {
+    return "lb round " .. r;
+  }
+  let prefix = "";
+  if t.format == "double" {
+    prefix = "wb ";
+  }
+  let tail = t.rounds - r;
+  if tail == 0 {
+    return prefix .. "final";
+  }
+  if tail == 1 {
+    return prefix .. "semifinals";
+  }
+  if tail == 2 {
+    return prefix .. "quarterfinals";
+  }
+  return prefix .. "round " .. r;
+}
+
+fn rr_view(t) {
   let banner = [];
   if t.champion {
     banner = [:h2, { id = "champion" }, "champion: " .. t.champion];
   }
   return [:div, {},
     banner,
-    [:div, { class = "row", id = "bracket", style = "align-items:stretch" }, colviews]
+    standings_view(t),
+    columns_view(t, "rr")
   ];
 }
 
-fn match_view(tid, m) {
-  return [:div, { class = "card", id = "match-" .. m.id, style = "padding:8px" },
-    side_view(tid, m, m.p1),
-    side_view(tid, m, m.p2)
+// derived standings: W–L per player, most wins first
+fn standings_view(t) {
+  let stats = {};
+  if t.players {
+    for _, p in t.players {
+      stats[p] = { pl = p, w = 0, l = 0 };
+    }
+  }
+  for _, m in t.matches {
+    if m.winner {
+      let loser = m.p1;
+      if m.winner == m.p1 {
+        loser = m.p2;
+      }
+      stats[m.winner].w = stats[m.winner].w + 1;
+      stats[loser].l = stats[loser].l + 1;
+    }
+  }
+  let tbl = [];
+  for p, st in stats {
+    st.key = 0 - st.w;                       // sort_by is ascending
+    push(tbl, st);
+  }
+  sort_by(tbl, [:key, :l]);
+  let rows = [];
+  for i, st in tbl {
+    push(rows, [:li, {}, st.pl, [:span, { class = "meta" }, "  " .. st.w .. "–" .. st.l]]);
+  }
+  return [:div, { class = "card" },
+    [:div, { class = "meta" }, "standings"],
+    [:ul, { id = "standings" }, rows]
   ];
 }
 
-// A side is: a bye placeholder, the (bold) winner, a struck-out loser, a
-// clickable button when the match is ready, or a name waiting for its
-// opponent. Clicking reports the result — the closure hops.
-fn side_view(tid, m, p) {
+fn match_view(t, m) {
+  let open = m.p1 && m.p2 && !m.winner && m.p1 != "__bye" && m.p2 != "__bye";
+  let scores = nil;
+  if open {
+    scores = [:div, { class = "row", style = "gap:4px;margin:2px 0;flex-wrap:nowrap" },
+      [:input, { id = "s1-" .. m.id, placeholder = "0", style = "width:3em;flex:0 1 auto;padding:4px" }],
+      [:span, { class = "meta" }, "–"],
+      [:input, { id = "s2-" .. m.id, placeholder = "0", style = "width:3em;flex:0 1 auto;padding:4px" }]
+    ];
+  }
+  let reopen = nil;
+  if m.winner && m.p1 != "__bye" && m.p2 != "__bye" {
+    let tid = t.id;
+    let mid = m.id;
+    reopen = [:button, { class = "pair meta", style = "float:right;font-size:0.7rem",
+      onclick = fn(e) {
+        server!();
+        store.append({ type = "unreport", tid = tid, mid = mid });
+        cast browsers { refresh(); }
+      } }, "reopen"];
+  }
+  return [:div, { class = "card", id = "match-" .. m.id, style = "padding:8px;min-width:150px" },
+    reopen,
+    side_view(t.id, m, m.p1, m.s1),
+    scores,
+    side_view(t.id, m, m.p2, m.s2)
+  ];
+}
+
+// A side: a hole awaiting its feeder, a bye, the (bold) winner with score,
+// a struck-out loser, or — in an open match — a button that reports this
+// player as the winner with whatever scores are typed in. The closure hops.
+fn side_view(tid, m, p, sc) {
   if !p {
+    return [:div, { class = "meta" }, "…"];
+  }
+  if p == "__bye" {
     return [:div, { class = "meta" }, "bye"];
+  }
+  let scs = "";
+  if sc {
+    scs = "  " .. sc;
   }
   if m.winner {
     if m.winner == p {
-      return [:div, { style = "font-weight:600" }, p];
+      return [:div, { style = "font-weight:600" }, p .. scs];
     }
-    return [:div, { class = "meta", style = "text-decoration:line-through" }, p];
+    return [:div, { class = "meta", style = "text-decoration:line-through" }, p .. scs];
   }
-  if m.p1 && m.p2 {
+  if m.p1 && m.p2 && m.p1 != "__bye" && m.p2 != "__bye" {
     let mid = m.id;
     let name = p;
-    return [:button, {
-      class = "pair",
-      style = "display:block;width:100%;margin:2px 0",
+    return [:button, { class = "pair", style = "display:block;width:100%;margin:2px 0",
       onclick = fn(e) {
+        let a = tonumber(dom.get("#s1-" .. mid));
+        let b = tonumber(dom.get("#s2-" .. mid));
         server!();
-        store.append({ type = "report", tid = tid, match = mid, winner = name });
+        store.append({ type = "report", tid = tid, mid = mid, winner = name, s1 = a, s2 = b });
         cast browsers { refresh(); }
-      }
-    }, p];
+      } }, p];
   }
   return [:div, {}, p];
 }
@@ -342,12 +873,13 @@ fn refresh() {
 
 fn create_t() {
   let name = dom.get("#t-name");
+  let format = dom.get("#t-format");
   if name == "" {
     return;
   }
   dom.clear("#t-name");
   server!();
-  let tid = store.append({ type = "create", name = name });
+  let tid = store.append({ type = "create", name = name, format = format });
   let snap = snapshot(tid);
   let me = session();
   cast browsers { refresh(); }
@@ -379,9 +911,27 @@ fn enter_p(tid) {
   cast browsers { refresh(); }
 }
 
+fn move_p(tid, i) {
+  server!();
+  store.append({ type = "move", tid = tid, i = i });
+  cast browsers { refresh(); }
+}
+
+fn drop_p(tid, i) {
+  server!();
+  store.append({ type = "drop", tid = tid, i = i });
+  cast browsers { refresh(); }
+}
+
 fn start_t(tid) {
   server!();
   store.append({ type = "start", tid = tid });
+  cast browsers { refresh(); }
+}
+
+fn delete_t(tid) {
+  server!();
+  store.append({ type = "delete", tid = tid });
   cast browsers { refresh(); }
 }
 
