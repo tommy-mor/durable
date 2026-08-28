@@ -15,6 +15,18 @@ use std::rc::Rc;
 use durable::{cbor_to_json, dynpath, json_to_cbor, Nav, Query, Runtime, Shape, Tx};
 use mlua::{Function, Lua, LuaSerdeExt, Table, Value as LuaValue};
 
+/// JSON → Lua with `null` mapped to real `nil`, not mlua's NULL light
+/// userdata — NULL is truthy in Lua, which silently breaks `if x` guards
+/// on absent leaves (a missing `winner`, an unset flag).
+fn to_lua(lua: &Lua, v: &serde_json::Value) -> mlua::Result<LuaValue> {
+    lua.to_value_with(
+        v,
+        mlua::SerializeOptions::new()
+            .serialize_none_to_null(false)
+            .serialize_unit_to_null(false),
+    )
+}
+
 const STORE_LUA: &str = include_str!("../lua/store.lua");
 
 /// Load schema constructors (`store.leaf`, `store.record`, …).
@@ -102,7 +114,7 @@ pub fn bind(lua: &Lua, data_dir: &Path) -> mlua::Result<bool> {
                 let q = path_query(lua, &schema, path)?;
                 let v = rt.borrow().one(&q).map_err(mlua::Error::external)?;
                 match v {
-                    Some(v) => lua.to_value(&cbor_to_json(&v)),
+                    Some(v) => to_lua(lua, &cbor_to_json(&v)),
                     None => Ok(LuaValue::Nil),
                 }
             })?,
@@ -116,7 +128,7 @@ pub fn bind(lua: &Lua, data_dir: &Path) -> mlua::Result<bool> {
             lua.create_function(move |lua, path: LuaValue| {
                 let q = path_query(lua, &schema, path)?;
                 let vs = rt.borrow().select(&q).map_err(mlua::Error::external)?;
-                lua.to_value(&serde_json::Value::Array(
+                to_lua(lua, &serde_json::Value::Array(
                     vs.iter().map(cbor_to_json).collect(),
                 ))
             })?,
@@ -130,7 +142,7 @@ pub fn bind(lua: &Lua, data_dir: &Path) -> mlua::Result<bool> {
             lua.create_function(move |lua, path: LuaValue| {
                 let q = path_query(lua, &schema, path)?;
                 let v = rt.borrow().subtree(&q).map_err(mlua::Error::external)?;
-                lua.to_value(&cbor_to_json(&v))
+                to_lua(lua, &cbor_to_json(&v))
             })?,
         )?;
     }
@@ -148,7 +160,7 @@ pub fn bind(lua: &Lua, data_dir: &Path) -> mlua::Result<bool> {
                         .map(|(k, v)| serde_json::json!([cbor_to_json(k), cbor_to_json(v)]))
                         .collect(),
                 );
-                lua.to_value(&json)
+                to_lua(lua, &json)
             })?,
         )?;
     }
@@ -290,12 +302,12 @@ fn call_reduce(
             lua.create_function(move |lua, path: LuaValue| {
                 let navs = path_navs(lua, &schema, path)?;
                 let v = dynpath::peek(&db, &schema, None, &navs).map_err(mlua::Error::external)?;
-                lua.to_value(&cbor_to_json(&v))
+                to_lua(lua, &cbor_to_json(&v))
             })?,
         )?;
     }
 
-    let event_v = lua.to_value(event)?;
+    let event_v = to_lua(lua, event)?;
     reduce.call::<()>((tbl, event_v))?;
     for w in writes.borrow_mut().drain(..) {
         tx.write(w);

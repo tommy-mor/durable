@@ -1,0 +1,405 @@
+// tournament.hop — collaborative single-elimination brackets (a challonge
+// on the tape).
+//
+//   cargo run -p hoprt --bin hopd -- hoprt/hop/tournament.hop
+//   open http://localhost:9000 in several tabs: anyone can create a
+//   tournament, enter players, start the bracket, and report results.
+//   restart hopd: the JSONL tape rebuilds every bracket.
+//
+// Everything is four events — create / enter / start / report. The bracket
+// itself is *derived*: the reducer seeds it deterministically at "start"
+// (standard 1v8 4v5 2v7 3v6 order, so byes land on top seeds and no match
+// is ever empty) and advances winners by arithmetic on (round, slot).
+// store.verify() replays the tape and must reproduce the projection.
+
+server let schema = store.record([
+  ["tournaments", store.map(store.record([
+    ["name", store.leaf],
+    ["status", store.leaf],                 // "signup" | "live" | "done"
+    ["players", store.list(store.leaf)],
+    ["rounds", store.leaf],
+    ["champion", store.leaf],
+    ["matches", store.map(store.record([   // keyed "r<round>m<slot>"
+      ["p1", store.leaf],
+      ["p2", store.leaf],
+      ["winner", store.leaf],
+      ["round", store.leaf],
+      ["slot", store.leaf]
+    ]))]
+  ]))]
+]);
+
+// ── reducer ────────────────────────────────────────────────────────────
+
+fn reduce(tx, event) {
+  if event.type == "create" {
+    tx.put(["tournaments", tx.seq, "name"], event.name);
+    tx.put(["tournaments", tx.seq, "status"], "signup");
+  } else if event.type == "enter" {
+    let st = tx.peek(["tournaments", event.tid, "status"]);
+    if st == "signup" {
+      tx.push(["tournaments", event.tid, "players"], event.player);
+    }
+  } else if event.type == "start" {
+    let st = tx.peek(["tournaments", event.tid, "status"]);
+    if st == "signup" {
+      start_bracket(tx, event.tid);
+    }
+  } else if event.type == "report" {
+    report_result(tx, event);
+  }
+}
+
+// Lock signups and lay out round 1. Bracket position j (1-based) gets
+// seed seed_order(size)[j]; entrants are seeded in entry order. Slots
+// with no second entrant are byes: the present player advances now.
+fn start_bracket(tx, tid) {
+  let players = tx.peek(["tournaments", tid, "players"]);
+  let n = count(players);
+  if n < 2 {
+    return;
+  }
+  let size = pow2_from(1, n);
+  let rounds = log2i(size);
+  tx.put(["tournaments", tid, "status"], "live");
+  tx.put(["tournaments", tid, "rounds"], rounds);
+
+  let order = seed_order(size);
+  let p1s = {};
+  let p2s = {};
+  for j, seed in order {
+    let slot = math.floor((j + 1) / 2);
+    if seed <= n {
+      if j % 2 == 1 {
+        p1s[slot] = players[seed];
+      } else {
+        p2s[slot] = players[seed];
+      }
+    }
+  }
+  for j, seed in order {
+    if j % 2 == 1 {
+      let slot = math.floor((j + 1) / 2);
+      let mid = "r1m" .. slot;
+      let a = p1s[slot];
+      let b = p2s[slot];
+      tx.put(["tournaments", tid, "matches", mid, "round"], 1);
+      tx.put(["tournaments", tid, "matches", mid, "slot"], slot);
+      if a {
+        tx.put(["tournaments", tid, "matches", mid, "p1"], a);
+      }
+      if b {
+        tx.put(["tournaments", tid, "matches", mid, "p2"], b);
+      }
+      // seeding guarantees a is present whenever b is; a lone a is a bye
+      if a && !b {
+        tx.put(["tournaments", tid, "matches", mid, "winner"], a);
+        advance(tx, tid, 2, math.floor((slot + 1) / 2), slot % 2 == 1, a, rounds);
+      }
+    }
+  }
+}
+
+fn report_result(tx, event) {
+  let tid = event.tid;
+  let mid = event.match;
+  let p1 = tx.peek(["tournaments", tid, "matches", mid, "p1"]);
+  let p2 = tx.peek(["tournaments", tid, "matches", mid, "p2"]);
+  let w = tx.peek(["tournaments", tid, "matches", mid, "winner"]);
+  if p1 && p2 && !w && (event.winner == p1 || event.winner == p2) {
+    tx.put(["tournaments", tid, "matches", mid, "winner"], event.winner);
+    let round = tx.peek(["tournaments", tid, "matches", mid, "round"]);
+    let slot = tx.peek(["tournaments", tid, "matches", mid, "slot"]);
+    let rounds = tx.peek(["tournaments", tid, "rounds"]);
+    advance(tx, tid, round + 1, math.floor((slot + 1) / 2), slot % 2 == 1, event.winner, rounds);
+  }
+}
+
+// Winner of match (round-1, feeding slot) lands in `slot` of `round`,
+// as p1 if the feeder slot was odd. Past the last round there is no
+// next match: crown them.
+fn advance(tx, tid, round, slot, as_p1, player, rounds) {
+  if round > rounds {
+    tx.put(["tournaments", tid, "champion"], player);
+    tx.put(["tournaments", tid, "status"], "done");
+    return;
+  }
+  let mid = "r" .. round .. "m" .. slot;
+  tx.put(["tournaments", tid, "matches", mid, "round"], round);
+  tx.put(["tournaments", tid, "matches", mid, "slot"], slot);
+  if as_p1 {
+    tx.put(["tournaments", tid, "matches", mid, "p1"], player);
+  } else {
+    tx.put(["tournaments", tid, "matches", mid, "p2"], player);
+  }
+}
+
+// ── bracket math (v0 has no while/#: recursion and counting loops) ─────
+
+fn count(xs) {
+  let n = 0;
+  if xs {
+    for i, x in xs {
+      n = i;
+    }
+  }
+  return n;
+}
+
+fn pow2_from(p, n) {
+  if p >= n {
+    return p;
+  }
+  return pow2_from(p * 2, n);
+}
+
+fn log2i(p) {
+  if p <= 1 {
+    return 0;
+  }
+  return 1 + log2i(math.floor(p / 2));
+}
+
+// Standard bracket order: position j gets seed out[j]. Built by the
+// classic mirror-interleave — for size 8: 1 8 4 5 2 7 3 6.
+fn seed_order(size) {
+  if size == 1 {
+    return [1];
+  }
+  let prev = seed_order(math.floor(size / 2));
+  let out = [];
+  for i, x in prev {
+    table.insert(out, x);
+    table.insert(out, size + 1 - x);
+  }
+  return out;
+}
+
+// ── server-side snapshots ───────────────────────────────────────────────
+
+fn snapshot(tid) {
+  if tid {
+    let t = load_t(tid);
+    if t {
+      return { t = t };
+    }
+  }
+  return { list = store.items(["tournaments"]) };
+}
+
+fn load_t(tid) {
+  let name = store.one(["tournaments", tid, "name"]);
+  if !name {
+    return nil;
+  }
+  let ms = store.items(["tournaments", tid, "matches"]);
+  table.sort(ms, fn(a, b) {
+    if a.round == b.round {
+      return a.slot < b.slot;
+    }
+    return a.round < b.round;
+  });
+  return {
+    id = tid,
+    name = name,
+    status = store.one(["tournaments", tid, "status"]),
+    players = store.one(["tournaments", tid, "players"]),
+    matches = ms,
+    champion = store.one(["tournaments", tid, "champion"])
+  };
+}
+
+// ── views (hiccup; handlers are closures that hop) ──────────────────────
+
+fn render(snap) {
+  if snap.t {
+    hui.render("#app", t_view(snap.t));
+  } else {
+    hui.render("#app", lobby_view(snap.list));
+  }
+}
+
+fn lobby_view(list) {
+  let rows = [];
+  if list {
+    for i, t in list {
+      let tid = t.id;
+      table.insert(rows, [:li, {
+        class = "clickable",
+        id = "t-" .. tid,
+        onclick = fn(e) { open_t(tid); }
+      },
+        [:span, {}, t.name],
+        [:span, { class = "meta" }, "  (" .. t.status .. ", " .. count(t.players) .. " players)"]
+      ]);
+    }
+  }
+  return [:div, {},
+    [:h1, {}, "tournaments"],
+    [:div, { class = "row" },
+      [:input, { id = "t-name", placeholder = "new tournament" }],
+      [:button, { id = "create", onclick = fn(e) { create_t(); } }, "create"]
+    ],
+    [:ul, { id = "t-list" }, rows]
+  ];
+}
+
+fn t_view(t) {
+  let body = [];
+  if t.status == "signup" {
+    body = signup_view(t);
+  } else {
+    body = bracket_view(t);
+  }
+  return [:div, {},
+    [:div, { class = "row" },
+      [:button, { id = "back", onclick = fn(e) { go_lobby(); } }, "lobby"],
+      [:h1, {}, t.name],
+      [:span, { class = "meta", id = "t-status" }, t.status]
+    ],
+    [:input, { id = "current-tid", type = "hidden", value = t.id }],
+    body
+  ];
+}
+
+fn signup_view(t) {
+  let tid = t.id;
+  let rows = [];
+  if t.players {
+    for i, p in t.players {
+      table.insert(rows, [:li, {}, p]);
+    }
+  }
+  return [:div, {},
+    [:div, { class = "row" },
+      [:input, { id = "p-name", placeholder = "player name" }],
+      [:button, { id = "enter", onclick = fn(e) { enter_p(tid); } }, "enter"],
+      [:button, { id = "start", onclick = fn(e) { start_t(tid); } }, "start bracket"]
+    ],
+    [:ul, { id = "players" }, rows]
+  ];
+}
+
+fn bracket_view(t) {
+  let cols = [];
+  for i, m in t.matches {
+    if !cols[m.round] {
+      cols[m.round] = [];
+    }
+    table.insert(cols[m.round], match_view(t.id, m));
+  }
+  let colviews = [];
+  for r, col in cols {
+    table.insert(colviews, [:div, {
+      class = "bracket-col",
+      style = "display:flex;flex-direction:column;justify-content:space-around;gap:8px;flex:1"
+    },
+      [:div, { class = "meta" }, "round " .. r],
+      col
+    ]);
+  }
+  let banner = [];
+  if t.champion {
+    banner = [:h2, { id = "champion" }, "champion: " .. t.champion];
+  }
+  return [:div, {},
+    banner,
+    [:div, { class = "row", id = "bracket", style = "align-items:stretch" }, colviews]
+  ];
+}
+
+fn match_view(tid, m) {
+  return [:div, { class = "card", id = "match-" .. m.id, style = "padding:8px" },
+    side_view(tid, m, m.p1),
+    side_view(tid, m, m.p2)
+  ];
+}
+
+// A side is: a bye placeholder, the (bold) winner, a struck-out loser, a
+// clickable button when the match is ready, or a name waiting for its
+// opponent. Clicking reports the result — the closure hops.
+fn side_view(tid, m, p) {
+  if !p {
+    return [:div, { class = "meta" }, "bye"];
+  }
+  if m.winner {
+    if m.winner == p {
+      return [:div, { style = "font-weight:600" }, p];
+    }
+    return [:div, { class = "meta", style = "text-decoration:line-through" }, p];
+  }
+  if m.p1 && m.p2 {
+    let mid = m.id;
+    let name = p;
+    return [:button, {
+      class = "pair",
+      style = "display:block;width:100%;margin:2px 0",
+      onclick = fn(e) {
+        server!();
+        store.append({ type = "report", tid = tid, match = mid, winner = name });
+        cast browsers { refresh(); }
+      }
+    }, p];
+  }
+  return [:div, {}, p];
+}
+
+// ── interactions ────────────────────────────────────────────────────────
+
+fn refresh() {
+  let tid = tonumber(dom.get("#current-tid"));
+  server!();
+  let snap = snapshot(tid);
+  browser!();
+  render(snap);
+}
+
+fn create_t() {
+  let name = dom.get("#t-name");
+  if name == "" {
+    return;
+  }
+  dom.clear("#t-name");
+  server!();
+  let tid = store.append({ type = "create", name = name });
+  let snap = snapshot(tid);
+  let me = session();
+  cast browsers { refresh(); }
+  cast session(me) { render(snap); }
+}
+
+fn open_t(tid) {
+  server!();
+  let snap = snapshot(tid);
+  let me = session();
+  cast session(me) { render(snap); }
+}
+
+fn go_lobby() {
+  server!();
+  let snap = snapshot(nil);
+  let me = session();
+  cast session(me) { render(snap); }
+}
+
+fn enter_p(tid) {
+  let name = dom.get("#p-name");
+  if name == "" {
+    return;
+  }
+  dom.clear("#p-name");
+  server!();
+  store.append({ type = "enter", tid = tid, player = name });
+  cast browsers { refresh(); }
+}
+
+fn start_t(tid) {
+  server!();
+  store.append({ type = "start", tid = tid });
+  cast browsers { refresh(); }
+}
+
+fn on_connect(sid) {
+  let snap = snapshot(nil);
+  cast session(sid) { render(snap); }
+}
