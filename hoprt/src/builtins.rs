@@ -44,6 +44,9 @@ pub fn store_field(name: &str) -> Option<Value> {
         "all" | "keys" | "vals" | "first" | "last" | "entries" => {
             Value::tagged("nav", Value::str(name))
         }
+        // parametrized collecting navigators
+        "where" => Value::Native(NativeId::NavWhere),
+        "slice" => Value::Native(NativeId::NavSlice),
         // terminal navigators: a path ending in one is a mutation
         "set" => Value::Native(NativeId::NavSet),
         "add" => Value::Native(NativeId::NavAdd),

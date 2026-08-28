@@ -130,7 +130,68 @@ fn tagged_nav(step: &Value) -> Result<Option<Nav>> {
             "last" => Ok(Some(Nav::Last)),
             other => Err(Error::Query(format!("unknown nav combinator {other:?}"))),
         },
+        // parametrized combinators carry their arguments in a nested array:
+        // Tag27 ["nav", ["where", field, op, lit]] / ["nav", ["slice", a, b]]
+        (Some(Value::Text(t)), Some(Value::Array(args))) if t == "nav" => {
+            parametrized_nav(args).map(Some)
+        }
         _ => Ok(None),
+    }
+}
+
+fn parametrized_nav(args: &[Value]) -> Result<Nav> {
+    use crate::query::{Expr, Predicate};
+    let name = match args.first() {
+        Some(Value::Text(n)) => n.as_str(),
+        _ => return Err(Error::Query("nav combinator missing a name".into())),
+    };
+    match name {
+        "where" => {
+            let Some(Value::Text(field)) = args.get(1) else {
+                return Err(Error::Query("where needs a field name".into()));
+            };
+            match (args.get(2), args.get(3)) {
+                // where(field): the field exists
+                (None, _) => Ok(Nav::Where(Predicate::Exists(vec![Nav::Field(
+                    field.clone(),
+                )]))),
+                (Some(Value::Text(op)), Some(lit)) => {
+                    let f = Expr::Field(field.clone());
+                    let l = Expr::Lit(lit.clone());
+                    let pred = match op.as_str() {
+                        "==" => Predicate::Eq(f, l),
+                        "!=" => Predicate::Ne(f, l),
+                        "<" => Predicate::Lt(f, l),
+                        "<=" => Predicate::Le(f, l),
+                        ">" => Predicate::Gt(f, l),
+                        ">=" => Predicate::Ge(f, l),
+                        other => {
+                            return Err(Error::Query(format!("unknown where op {other:?}")))
+                        }
+                    };
+                    Ok(Nav::Where(pred))
+                }
+                _ => Err(Error::Query("where(field, op, value) — op is a string".into())),
+            }
+        }
+        "slice" => {
+            let bound = |v: Option<&Value>| -> Result<Option<u64>> {
+                match v {
+                    None | Some(Value::Null) => Ok(None),
+                    Some(Value::Integer(i)) => u64::try_from(*i)
+                        .map(Some)
+                        .map_err(|_| Error::Query("slice bounds must be non-negative".into())),
+                    Some(other) => Err(Error::Query(format!(
+                        "slice bound must be an integer, got {other:?}"
+                    ))),
+                }
+            };
+            Ok(Nav::Slice {
+                start: bound(args.get(1))?,
+                end: bound(args.get(2))?,
+            })
+        }
+        other => Err(Error::Query(format!("unknown nav combinator {other:?}"))),
     }
 }
 
@@ -465,6 +526,93 @@ mod tests {
             ),
             ("title".into(), Shape::Leaf),
         ])
+    }
+
+    #[test]
+    fn parametrized_navs_where_and_slice() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path()).unwrap();
+        let s = schema();
+        let items = [("milk", true), ("eggs", false), ("bread", false)];
+        for (i, (text, done)) in items.iter().enumerate() {
+            let navs = navs_for(
+                &s,
+                &[
+                    Value::Text("todos".into()),
+                    Value::Integer(Integer::from(i as i64)),
+                ],
+            )
+            .unwrap();
+            let rec = Value::Map(vec![
+                (Value::Text("text".into()), Value::Text(text.to_string())),
+                (Value::Text("done".into()), Value::Bool(*done)),
+            ]);
+            let ws = put(&s, None, &navs, &rec).unwrap();
+            db.apply(&ws, Durability::DisableWal).unwrap();
+        }
+
+        let nav = |parts: Vec<Value>| {
+            Value::Tag(
+                27,
+                Box::new(Value::Array(vec![
+                    Value::Text("nav".into()),
+                    Value::Array(parts),
+                ])),
+            )
+        };
+
+        // where(done == false) then project the text
+        let where_open = nav(vec![
+            Value::Text("where".into()),
+            Value::Text("done".into()),
+            Value::Text("==".into()),
+            Value::Bool(false),
+        ]);
+        let navs = navs_for(
+            &s,
+            &[
+                Value::Text("todos".into()),
+                where_open,
+                Value::Text("text".into()),
+            ],
+        )
+        .unwrap();
+        let texts = crate::query::select(&db, &s, &Query::new(navs)).unwrap();
+        assert_eq!(
+            texts,
+            vec![Value::Text("eggs".into()), Value::Text("bread".into())]
+        );
+
+        // slice(1, nil): everything after the first entry
+        let slice_tail = nav(vec![
+            Value::Text("slice".into()),
+            Value::Integer(Integer::from(1)),
+            Value::Null,
+        ]);
+        let navs = navs_for(
+            &s,
+            &[
+                Value::Text("todos".into()),
+                slice_tail,
+                Value::Text("text".into()),
+            ],
+        )
+        .unwrap();
+        let texts = crate::query::select(&db, &s, &Query::new(navs)).unwrap();
+        assert_eq!(
+            texts,
+            vec![Value::Text("eggs".into()), Value::Text("bread".into())]
+        );
+
+        // parametrized navs are still rejected on the write side
+        let where_again = nav(vec![
+            Value::Text("where".into()),
+            Value::Text("done".into()),
+            Value::Text("==".into()),
+            Value::Bool(false),
+        ]);
+        let navs = navs_for(&s, &[Value::Text("todos".into()), where_again]).unwrap();
+        assert!(put(&s, None, &navs, &Value::Bool(true)).is_err());
     }
 
     #[test]

@@ -48,6 +48,53 @@ fn todo_persists_across_reopen_and_verifies() {
     assert_eq!(log.lines().filter(|l| !l.trim().is_empty()).count(), 2);
 }
 
+// where/slice are parametrized navigators: plain data in the path.
+const FILTERED: &str = r#"
+server let schema = store.record([
+  ["todos", store.map(store.record([
+    ["text", store.leaf],
+    ["done", store.leaf]
+  ]))]
+]);
+
+fn reduce(event) {
+  if event.type == "add" {
+    store(["todos", event.seq, store.set({ text = event.text, done = event.done })]);
+  }
+}
+
+fn open_texts() {
+  return store(["todos", store.where("done", false), "text"]);
+}
+
+fn late_texts() {
+  return store(["todos", store.slice(1), "text"]);
+}
+"#;
+
+#[test]
+fn where_and_slice_navigators_filter_queries() {
+    let mut host = Cluster::new(&["A"], FILTERED, false).expect("host");
+    for (text, done) in [("milk", true), ("eggs", false), ("bread", false)] {
+        host.append(Value::map(
+            [
+                (s("type"), s("add")),
+                (s("text"), s(text)),
+                (s("done"), Value::Bool(done)),
+            ]
+            .into_iter()
+            .collect(),
+        ))
+        .unwrap();
+    }
+
+    let open = host.call_server("open_texts", vec![]).unwrap();
+    assert_eq!(open, arr(vec![s("eggs"), s("bread")]));
+
+    let late = host.call_server("late_texts", vec![]).unwrap();
+    assert_eq!(late, arr(vec![s("eggs"), s("bread")]));
+}
+
 #[test]
 fn rebuild_from_tape_matches_live() {
     let mut host = Cluster::new(&["A"], TODO, false).expect("host");

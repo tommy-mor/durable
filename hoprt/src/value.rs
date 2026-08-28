@@ -40,6 +40,9 @@ pub enum NativeId {
     NavSet,
     NavAdd,
     NavPush,
+    // pure: parametrized collecting navigators
+    NavWhere,
+    NavSlice,
     // context: browser side
     DomGet,
     DomSet,

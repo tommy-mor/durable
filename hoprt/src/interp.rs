@@ -653,6 +653,35 @@ fn call_native(id: NativeId, mut args: Vec<Value>, host: &mut dyn Host) -> Resul
             m.insert(Value::str("fields"), fields);
             Ok(Value::map(m))
         }
+        // parametrized collecting navigators: pure data.
+        //   store.where(field)             the field exists
+        //   store.where(field, v)          equality
+        //   store.where(field, op, v)      op ∈ == != < <= > >=
+        //   store.slice(start, end)        nil bounds are open
+        NativeId::NavWhere => {
+            let field = args.first().cloned().unwrap_or(Value::Nil);
+            let mut parts = vec![Value::str("where"), field];
+            match (args.get(1), args.get(2)) {
+                (None, _) => {}
+                (Some(v), None) => {
+                    parts.push(Value::str("=="));
+                    parts.push(v.clone());
+                }
+                (Some(op), Some(v)) => {
+                    parts.push(op.clone());
+                    parts.push(v.clone());
+                }
+            }
+            Ok(Value::tagged("nav", Value::array(parts)))
+        }
+        NativeId::NavSlice => Ok(Value::tagged(
+            "nav",
+            Value::array(vec![
+                Value::str("slice"),
+                args.first().cloned().unwrap_or(Value::Nil),
+                args.get(1).cloned().unwrap_or(Value::Nil),
+            ]),
+        )),
         // terminal navigator constructors: pure data, meaning applied by
         // the store when it sees them at the end of a path
         NativeId::NavSet | NativeId::NavAdd | NativeId::NavPush => {

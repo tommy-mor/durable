@@ -37,12 +37,26 @@ store.first     first element
 store.last      last element
 ```
 
-Navigators are plain data (CBOR tag 27, `["nav", name]`): they flow
-through packets, logs, and diagnostics like any other value.
+Two collecting navigators take arguments — predicates are data, not
+closures:
 
-The engine's `Where` predicates and `Slice` exist below this surface
-(durable's query algebra) and are future hop surface — predicates need a
-data syntax, not closures.
+```text
+store.where(field)             keep entries whose field exists
+store.where(field, v)          keep entries whose field == v
+store.where(field, op, v)      op ∈ "==" "!=" "<" "<=" ">" ">="
+store.slice(start, end)        a range of entries; nil bounds are open
+```
+
+```text
+store(["tournaments", store.where("status", "live"), "name"])
+store(["rooms", room, "messages", store.slice(50)])
+```
+
+Navigators are plain data (CBOR tag 27, `["nav", name]` or
+`["nav", [name, args…]]`): they flow through packets, logs, and
+diagnostics like any other value. The engine's `And`/`Or`/`Not`/path
+predicates exist below this surface (durable's query algebra) and can be
+surfaced the same way when an app needs them.
 
 ## Mutations
 
