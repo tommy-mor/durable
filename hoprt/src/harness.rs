@@ -181,7 +181,9 @@ impl Host {
             .vms
             .get(addr)
             .unwrap_or_else(|| panic!("no VM at address {addr}"));
-        let value = lua.to_value(pkt)?;
+        // null-safe: a null inside a packet must arrive as nil, never as
+        // mlua's truthy NULL userdata (same class of bug as the store fix)
+        let value = crate::store::to_lua(lua, pkt)?;
         lua.globals().get::<Function>("__receive")?.call::<()>(value)
     }
 

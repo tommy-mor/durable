@@ -1,5 +1,10 @@
 # network-aware Lua — linear placement marks over mlua
 
+> Companion: [`hop-semantics.md`](hop-semantics.md) inventories the
+> semantic decisions Hop has made so far — specified vs inherited-from-Lua
+> vs accidental — so Lua stays the reference implementation rather than
+> becoming the spec.
+
 *A brace-syntax layer that compiles to Lua. Function bodies may contain
 placement marks; execution hops between browser and server mid-body; the
 function boundary hops home. The runtime is Luau embedded in the Rust host

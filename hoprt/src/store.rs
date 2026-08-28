@@ -17,8 +17,9 @@ use mlua::{Function, Lua, LuaSerdeExt, Table, Value as LuaValue};
 
 /// JSON → Lua with `null` mapped to real `nil`, not mlua's NULL light
 /// userdata — NULL is truthy in Lua, which silently breaks `if x` guards
-/// on absent leaves (a missing `winner`, an unset flag).
-fn to_lua(lua: &Lua, v: &serde_json::Value) -> mlua::Result<LuaValue> {
+/// on absent leaves (a missing `winner`, an unset flag). Every JSON→Lua
+/// crossing in hoprt goes through this; see docs/hop-semantics.md §absence.
+pub(crate) fn to_lua(lua: &Lua, v: &serde_json::Value) -> mlua::Result<LuaValue> {
     lua.to_value_with(
         v,
         mlua::SerializeOptions::new()

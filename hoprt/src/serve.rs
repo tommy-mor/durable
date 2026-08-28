@@ -218,7 +218,7 @@ pub fn serve(
                     "        ~ wire {sid:>7} -> server   {kind:<5} {}",
                     pkt["hop"].as_str().unwrap_or("·")
                 );
-                let v = lua.to_value(&pkt)?;
+                let v = store::to_lua(&lua, &pkt)?;
                 let f: Function = lua.globals().get("__receive")?;
                 if let Err(e) = f.call::<()>(v) {
                     eprintln!("[hopd] receive error: {e}");
