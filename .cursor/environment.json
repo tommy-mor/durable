@@ -1,0 +1,4 @@
+{
+  "name": "durable",
+  "install": "./.cursor/install.sh"
+}

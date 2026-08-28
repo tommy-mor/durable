@@ -2,27 +2,28 @@
 <html>
 <head>
   <meta charset="utf-8">
-  <title>hop todo</title>
+  <title>hop</title>
   <style>
-    body { font-family: system-ui, sans-serif; max-width: 480px; margin: 40px auto; padding: 0 16px; }
-    h1 { font-weight: 600; }
-    form { display: flex; gap: 8px; }
-    input { flex: 1; padding: 8px; font-size: 1rem; }
-    button { padding: 8px 16px; font-size: 1rem; cursor: pointer; }
+    body { font-family: system-ui, sans-serif; max-width: 720px; margin: 40px auto; padding: 0 16px; }
+    h1, h2 { font-weight: 600; }
+    .row { display: flex; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; align-items: center; }
+    input, select { flex: 1; padding: 8px; font-size: 1rem; min-width: 120px; }
+    button { padding: 8px 14px; font-size: 1rem; cursor: pointer; }
     ul { padding: 0; }
-    li { list-style: none; cursor: pointer; padding: 8px; border-bottom: 1px solid #eee; }
-    li:hover { background: #f8f8f8; }
+    li { list-style: none; padding: 8px; border-bottom: 1px solid #eee; }
+    #todos li { cursor: pointer; }
     li.done { text-decoration: line-through; color: #999; }
+    li.clickable, button.pair { cursor: pointer; }
+    li.clickable:hover, .card:hover { background: #f8f8f8; }
+    .card { border: 1px solid #eee; border-radius: 8px; padding: 12px; margin: 8px 0; }
+    .meta { color: #888; font-size: 0.85rem; }
+    .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    @media (max-width: 640px) { .cols { grid-template-columns: 1fr; } }
     #status { color: #999; font-size: 0.85rem; margin-top: 24px; }
   </style>
 </head>
 <body>
-  <h1>todos</h1>
-  <form id="f">
-    <input id="text" placeholder="what needs doing?" autocomplete="off">
-    <button>add</button>
-  </form>
-  <ul id="todos"></ul>
+  <div id="app"></div>
   <div id="status">loading lua…</div>
   <script type="module" src="/glue.js"></script>
 </body>

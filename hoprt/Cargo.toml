@@ -3,11 +3,13 @@ name = "hoprt"
 version = "0.1.0"
 edition = "2021"
 default-run = "hoprt"
-description = "Spike: hop runtime for network-aware Lua — segment closures, coroutine flows, and a simulated browser/server wire, before the compiler exists"
+description = "Hop runtime: network-aware Lua, hiccup UI, and a durable JSONL/RocksDB store on the server VM"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+durable = { path = "../durable" }
 mlua = { version = "0.10", features = ["luau", "serialize"] }
 serde_json = "1.0"
+tempfile = "3.8"
 tiny_http = "0.12.0"
 tungstenite = "0.30.0"

@@ -1,0 +1,134 @@
+// chat.hop — rooms of messages, fan-out by broadcast snapshot.
+//
+// Nested path: rooms → record → messages list. A send is one ListPush
+// under that prefix. Switching rooms is a query, not a mutation.
+//
+//   cargo run -p hoprt --bin hopd -- hoprt/hop/chat.hop
+
+server let schema = store.record([
+  ["rooms", store.map(store.record([
+    ["messages", store.list(store.leaf)]
+  ]))]
+]);
+
+fn reduce(tx, event) {
+  if event.type == "say" {
+    tx.push(["rooms", event.room, "messages"], {
+      who = event.sid,
+      text = event.text
+    });
+  }
+}
+
+fn chat_view(room, rooms, messages) {
+  let room_links = [];
+  for i, r in rooms {
+    let name = r;
+    table.insert(room_links, [:button, {
+      class = "room",
+      id = "room-" .. name,
+      onclick = fn(e) { open_room(name); }
+    }, name]);
+  }
+  let lines = [];
+  if messages {
+    for i, m in messages {
+      table.insert(lines, [:li, { class = "msg" },
+        [:span, { class = "meta" }, m.who .. ": "],
+        m.text
+      ]);
+    }
+  }
+  return [:div, {},
+    [:h1, {}, "chat"],
+    [:input, { id = "current-room", type = "hidden", value = room }],
+    [:p, { class = "meta", id = "room-name" }, "room " .. room],
+    [:div, { class = "row", id = "room-bar" }, room_links],
+    [:div, { class = "row" },
+      [:input, { id = "new-room", placeholder = "new room" }],
+      [:button, { id = "open-room", onclick = fn(e) { open_typed_room(); } }, "open"]
+    ],
+    [:ul, { id = "messages" }, lines],
+    [:div, { class = "row" },
+      [:input, { id = "draft", placeholder = "message" }],
+      [:button, { id = "send", onclick = fn(e) { say(); } }, "send"]
+    ]
+  ];
+}
+
+fn room_names() {
+  let entries = store.entries(["rooms"]);
+  let names = ["lobby"];
+  if entries {
+    for i, pair in entries {
+      let n = pair[1];
+      if n != "lobby" {
+        table.insert(names, n);
+      }
+    }
+  }
+  return names;
+}
+
+fn paint(room) {
+  let rooms = room_names();
+  let messages = store.one(["rooms", room, "messages"]);
+  return { room = room, rooms = rooms, messages = messages };
+}
+
+fn say() {
+  let text = dom.get("#draft");
+  let room = dom.get("#current-room");
+  if text == "" {
+    return;
+  }
+  server!();
+  store.append({ type = "say", sid = session(), room = room, text = text });
+  cast browsers {
+    refresh_chat();
+  }
+}
+
+fn refresh_chat() {
+  let room = dom.get("#current-room");
+  if room == "" {
+    room = "lobby";
+  }
+  server!();
+  let snap = paint(room);
+  browser!();
+  hui.render("#app", chat_view(snap.room, snap.rooms, snap.messages));
+}
+
+fn open_typed_room() {
+  let name = dom.get("#new-room");
+  if name == "" {
+    return;
+  }
+  open_room(name);
+}
+
+fn open_room(room) {
+  server!();
+  let snap = paint(room);
+  let me = session();
+  cast session(me) {
+    hui.render("#app", chat_view(snap.room, snap.rooms, snap.messages));
+  }
+}
+
+fn on_connect(sid) {
+  let snap = paint("lobby");
+  cast session(sid) {
+    hui.render("#app", chat_view(snap.room, snap.rooms, snap.messages));
+  }
+}
+
+fn sim_say(room, text) {
+  server!();
+  store.append({ type = "say", sid = session(), room = room, text = text });
+}
+
+fn sim_demo() {
+  spawn sim_say("lobby", "hello tape");
+}

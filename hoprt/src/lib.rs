@@ -8,3 +8,4 @@
 pub mod compiler;
 pub mod harness;
 pub mod serve;
+pub mod store;
