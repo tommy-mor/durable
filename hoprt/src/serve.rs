@@ -16,7 +16,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::net::{TcpListener, TcpStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::mpsc;
 use std::thread;
@@ -29,12 +29,8 @@ use crate::rt::{Platform, SideId, Vm};
 use crate::store::{self, StoreBinding};
 use crate::value::{decode, encode, NativeId, Value};
 
-const INDEX_HTML: &str = "<!doctype html><meta charset=utf-8><title>hop</title>\
-<body style=\"font-family:system-ui;max-width:40em;margin:4em auto\">\
-<h1>hopd</h1><p>The server VM is running and speaking CBOR over the\
- WebSocket port. The browser backend (hop-web, the wasm build of the Hop\
- interpreter) is the next phase of the native rewrite; until it lands,\
- clients are programs that speak the packet protocol.</p>";
+const INDEX_HTML: &str = include_str!("../web/index.html");
+const GLUE_JS: &str = include_str!("../web/glue.js");
 
 enum Ev {
     Conn(String, mpsc::Sender<Vec<u8>>),
@@ -52,19 +48,44 @@ fn session_name(n: usize) -> String {
     }
 }
 
-fn http_thread(port: u16, ws_port: u16) {
+/// Static assets: the shell page and glue.js are compiled in; the app's
+/// .hop source ships to the browser (both sides must compile the same
+/// program — the wire carries hop ids, not code); the wasm interpreter is
+/// served from `pkg_dir` (a `wasm-pack build --target web` output).
+fn http_thread(port: u16, ws_port: u16, app_src: String, pkg_dir: PathBuf) {
     let server = tiny_http::Server::http(("0.0.0.0", port)).expect("bind http");
     let config = format!(r#"{{"wsPort":{ws_port}}}"#);
     for req in server.incoming_requests() {
-        let (content, ctype) = match req.url() {
-            "/" | "/index.html" => (INDEX_HTML.to_string(), "text/html; charset=utf-8"),
-            "/config.json" => (config.clone(), "application/json"),
-            _ => {
-                let _ = req.respond(tiny_http::Response::empty(404));
-                continue;
+        let (content, ctype): (Vec<u8>, &str) = match req.url() {
+            "/" | "/index.html" => (INDEX_HTML.into(), "text/html; charset=utf-8"),
+            "/glue.js" => (GLUE_JS.into(), "text/javascript"),
+            "/config.json" => (config.clone().into(), "application/json"),
+            "/app.hop" => (app_src.clone().into(), "text/plain; charset=utf-8"),
+            url => {
+                // /pkg/<file> — flat, no traversal: the last path component only
+                let served = url.strip_prefix("/pkg/").and_then(|f| {
+                    let name = Path::new(f).file_name()?;
+                    std::fs::read(pkg_dir.join(name)).ok().map(|bytes| {
+                        let ctype = if f.ends_with(".wasm") {
+                            "application/wasm"
+                        } else if f.ends_with(".js") {
+                            "text/javascript"
+                        } else {
+                            "application/octet-stream"
+                        };
+                        (bytes, ctype)
+                    })
+                });
+                match served {
+                    Some(x) => x,
+                    None => {
+                        let _ = req.respond(tiny_http::Response::empty(404));
+                        continue;
+                    }
+                }
             }
         };
-        let resp = tiny_http::Response::from_string(content).with_header(
+        let resp = tiny_http::Response::from_data(content).with_header(
             tiny_http::Header::from_bytes(&b"Content-Type"[..], ctype.as_bytes()).unwrap(),
         );
         let _ = req.respond(resp);
@@ -182,17 +203,28 @@ impl Platform for ServePlatform<'_> {
     }
 }
 
-/// Run the hop server forever. `data_dir` holds the JSONL log and RocksDB
-/// projection when the app declares `schema` + `reduce`. `log_packets`
-/// dumps every packet in diagnostic notation.
+/// Run the hop server forever. `app_src` is the .hop source, served to
+/// browsers (they compile it with the same compiler, in wasm). `pkg_dir`
+/// is the hop-web wasm-pack output. `data_dir` holds the JSONL log and
+/// RocksDB projection when the app declares `schema` + `reduce`.
+/// `log_packets` dumps every packet in diagnostic notation.
 pub fn serve(
     prog: Rc<Program>,
+    app_src: String,
     http_port: u16,
     ws_port: u16,
     data_dir: impl AsRef<Path>,
+    pkg_dir: PathBuf,
     log_packets: bool,
 ) -> Result<(), String> {
-    thread::spawn(move || http_thread(http_port, ws_port));
+    if !pkg_dir.join("hop_web.js").exists() {
+        eprintln!(
+            "[hopd] warning: {} has no hop_web.js — browsers won't boot.\n\
+             [hopd]          build it with: wasm-pack build hop-web --target web",
+            pkg_dir.display()
+        );
+    }
+    thread::spawn(move || http_thread(http_port, ws_port, app_src, pkg_dir));
     let (tx, rx) = mpsc::channel::<Ev>();
     {
         let tx = tx.clone();
@@ -202,7 +234,10 @@ pub fn serve(
     // the server VM lives on this thread
     let mut outbox: VecDeque<Value> = VecDeque::new();
     let mut vm = {
-        let mut platform = ServePlatform { outbox: &mut outbox, store: None };
+        let mut platform = ServePlatform {
+            outbox: &mut outbox,
+            store: None,
+        };
         Vm::new(prog, SideId::Server, &mut platform)?
     };
     let mut binding = store::bind(&vm, data_dir.as_ref())?;
@@ -230,7 +265,10 @@ pub fn serve(
                 let _ = out.send(encode(&hello).expect("hello encodes"));
                 sessions.insert(sid.clone(), out);
                 println!("[hopd] session {sid} connected");
-                let mut platform = ServePlatform { outbox: &mut outbox, store: binding.as_mut() };
+                let mut platform = ServePlatform {
+                    outbox: &mut outbox,
+                    store: binding.as_mut(),
+                };
                 vm.session_connect(&mut platform, &sid);
             }
             Ev::Pkt(sid, bytes) => {
@@ -256,7 +294,10 @@ pub fn serve(
                         crate::value::coerce_str(&pkt.get_field("hop"))
                     );
                 }
-                let mut platform = ServePlatform { outbox: &mut outbox, store: binding.as_mut() };
+                let mut platform = ServePlatform {
+                    outbox: &mut outbox,
+                    store: binding.as_mut(),
+                };
                 vm.receive(&mut platform, pkt);
             }
             Ev::Gone(sid) => {

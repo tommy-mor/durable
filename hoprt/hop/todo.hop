@@ -1,5 +1,6 @@
 // todo.hop — multiplayer todos on the durable store.
 //
+//   wasm-pack build hop-web --target web   (once; the browser interpreter)
 //   cargo run -p hoprt --bin hopd -- hoprt/hop/todo.hop
 //   open http://localhost:9000 in two tabs — they stay in sync.
 //   restart hopd: the JSONL tape restores the board.

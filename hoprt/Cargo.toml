@@ -6,10 +6,31 @@ default-run = "hoprt"
 description = "Hop runtime: a native IR interpreter with placement marks, hiccup UI, and a durable JSONL/RocksDB store on the server VM"
 license = "MIT OR Apache-2.0"
 
+[features]
+# The core (value/ir/interp/rt/builtins/compiler) is platform-neutral and
+# compiles for wasm32 — hop-web builds on it. Everything that touches the
+# filesystem, sockets, or RocksDB sits behind `server`.
+default = ["server"]
+server = ["dep:durable", "dep:tempfile", "dep:tiny_http", "dep:tungstenite"]
+
 [dependencies]
-durable = { path = "../durable" }
 ciborium = "0.2"
 serde_json = "1.0"
-tempfile = "3.8"
-tiny_http = "0.12.0"
-tungstenite = "0.30.0"
+durable = { path = "../durable", optional = true }
+tempfile = { version = "3.8", optional = true }
+tiny_http = { version = "0.12.0", optional = true }
+tungstenite = { version = "0.30.0", optional = true }
+
+[[bin]]
+name = "hoprt"
+path = "src/main.rs"
+required-features = ["server"]
+
+[[bin]]
+name = "hopc"
+path = "src/bin/hopc.rs"
+
+[[bin]]
+name = "hopd"
+path = "src/bin/hopd.rs"
+required-features = ["server"]

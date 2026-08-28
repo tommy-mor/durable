@@ -72,8 +72,17 @@ fn hopd_serves_the_todo_app_over_real_sockets() {
     thread::spawn(move || {
         // compile inside the thread: programs hold Rc values and are
         // thread-local, like everything else in a VM
-        let prog = hoprt::compiler::compile(include_str!("../hop/todo.hop")).expect("compile");
-        let _ = hoprt::serve::serve(std::rc::Rc::new(prog), HTTP_PORT, WS_PORT, data_path, false);
+        let src = include_str!("../hop/todo.hop");
+        let prog = hoprt::compiler::compile(src).expect("compile");
+        let _ = hoprt::serve::serve(
+            std::rc::Rc::new(prog),
+            src.to_string(),
+            HTTP_PORT,
+            WS_PORT,
+            data_path,
+            std::path::PathBuf::from("../hop-web/pkg"),
+            false,
+        );
     });
 
     // ── tab A connects: hello, then the on_connect snapshot (empty board)

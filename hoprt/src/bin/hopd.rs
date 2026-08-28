@@ -1,12 +1,14 @@
 //! hopd — serve a .hop application over CBOR-binary WebSockets.
 //!
-//! Usage: hopd <app.hop> [http_port] [ws_port] [--data <dir>] [--log]
+//! Usage: hopd <app.hop> [http_port] [ws_port] [--data <dir>] [--web <pkg_dir>] [--log]
 //!
 //! Compiles the app with hopc, runs the server VM, and routes hop packets
-//! over WebSockets. If the app declares `schema` and `fn reduce`, the
-//! server VM opens a durable store (JSONL log + RocksDB projection) at
-//! `--data` (default `./hop-data`). `--log` dumps every packet in
-//! diagnostic notation.
+//! over WebSockets. Real tabs get the shell page + glue.js and the wasm
+//! interpreter from `--web` (default `./hop-web/pkg`, a
+//! `wasm-pack build hop-web --target web` output). If the app declares
+//! `schema` and `fn reduce`, the server VM opens a durable store (JSONL
+//! log + RocksDB projection) at `--data` (default `./hop-data`). `--log`
+//! dumps every packet in diagnostic notation.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -17,6 +19,7 @@ fn main() -> ExitCode {
     let mut input = None;
     let mut ports: Vec<u16> = Vec::new();
     let mut data_dir = PathBuf::from("hop-data");
+    let mut pkg_dir = PathBuf::from("hop-web/pkg");
     let mut log_packets = false;
     let mut i = 0;
     while i < args.len() {
@@ -27,6 +30,16 @@ fn main() -> ExitCode {
                     Some(p) => data_dir = PathBuf::from(p),
                     None => {
                         eprintln!("hopd: --data needs a directory");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+            "--web" => {
+                i += 1;
+                match args.get(i) {
+                    Some(p) => pkg_dir = PathBuf::from(p),
+                    None => {
+                        eprintln!("hopd: --web needs a directory");
                         return ExitCode::FAILURE;
                     }
                 }
@@ -48,7 +61,7 @@ fn main() -> ExitCode {
         i += 1;
     }
     let Some(path) = input else {
-        eprintln!("usage: hopd <app.hop> [http_port] [ws_port] [--data <dir>] [--log]");
+        eprintln!("usage: hopd <app.hop> [http_port] [ws_port] [--data <dir>] [--web <pkg_dir>] [--log]");
         return ExitCode::FAILURE;
     };
     let http_port = ports.first().copied().unwrap_or(9000);
@@ -74,7 +87,7 @@ fn main() -> ExitCode {
         prog.hops.len()
     );
 
-    match hoprt::serve::serve(Rc::new(prog), http_port, ws_port, data_dir, log_packets) {
+    match hoprt::serve::serve(Rc::new(prog), src, http_port, ws_port, data_dir, pkg_dir, log_packets) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("hopd: {e}");

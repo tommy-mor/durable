@@ -42,10 +42,15 @@ hoprt/
 
 `durable`, RocksDB, and the HTTP/WS stack sit behind the default `server`
 feature; the core (value/ir/interp/rt/builtins/compiler) compiles for
-wasm32. A `hop-web` crate (wasm-bindgen: dom hooks, WebSocket byte
-bridge) replaces wasmoon+glue.js as the browser backend — phase 2 of this
-rewrite; until it lands, hopd serves fake-browser clients (the ws tests)
-but not real tabs.
+wasm32. The `hop-web` crate is the browser backend: the same interpreter
+built for wasm32 with a web-sys DOM platform (`BrowserVm`), replacing the
+Lua-era wasmoon+glue. glue.js is a dumb pipe — it opens the WebSocket and
+forwards binary frames both ways; all protocol knowledge (the hello, the
+packet grammar, hui handler ids) lives in the wasm. hopd ships the app's
+`.hop` *source* to the tab, which compiles it with the same compiler —
+the wire carries hop ids and data, never code, so both sides must simply
+hold the same program. Build with `wasm-pack build hop-web --target web`;
+hopd serves the pkg from `--web` (default `hop-web/pkg`).
 
 ## The IR
 

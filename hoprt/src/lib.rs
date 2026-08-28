@@ -10,10 +10,13 @@
 
 pub mod builtins;
 pub mod compiler;
+#[cfg(feature = "server")]
 pub mod harness;
 pub mod interp;
 pub mod ir;
 pub mod rt;
+#[cfg(feature = "server")]
 pub mod serve;
+#[cfg(feature = "server")]
 pub mod store;
 pub mod value;
