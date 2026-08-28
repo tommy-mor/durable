@@ -1,5 +1,11 @@
 # network-aware Lua — linear placement marks over mlua
 
+> **Historical.** The Lua backend (`hoprt/lua/`, `hoprt/web/`, the
+> Playwright e2e harness) has been removed; hoprt is now a native Rust IR
+> interpreter, described in [`hop-ir.md`](hop-ir.md) and
+> [`hop-values.md`](hop-values.md). File paths and run commands below
+> describe the Lua era and no longer exist.
+
 > Companion: [`hop-semantics.md`](hop-semantics.md) inventories the
 > semantic decisions Hop has made so far — specified vs inherited-from-Lua
 > vs accidental — so Lua stays the reference implementation rather than

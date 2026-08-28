@@ -1,5 +1,9 @@
 # Hop semantics — the decisions already made
 
+> **Historical.** Written during the Lua era; the Lua backend has since
+> been removed. The native rewrite is described in [`hop-ir.md`](hop-ir.md)
+> and [`hop-values.md`](hop-values.md).
+
 Hop currently runs on Lua: Luau on the server, Lua 5.4 (wasmoon) in the
 browser, `hopc` lowering `.hop` into pleasantly stupid code like
 `rt.at("server", seg, { i = i })`. That is the right arrangement — Lua is

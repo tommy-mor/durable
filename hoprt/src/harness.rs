@@ -1,235 +1,370 @@
-//! The simulated cluster: one "server" Luau VM plus n "browser" Luau VMs in
-//! one process, connected by a queue that carries only serialized packets.
-//! Swapping the queue for a WebSocket changes no semantics — that's the
-//! claim this harness exists to test.
+//! The simulated cluster: one server VM plus n browser VMs in one process,
+//! connected by a queue that carries only CBOR-encoded packets — every hop
+//! round-trips through the codec, which is both the copy-at-hop and a
+//! standing test of the encoding. Swapping the queue for a WebSocket
+//! changes no semantics — that's the claim this harness exists to test.
 
-use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use mlua::{Function, Lua, LuaSerdeExt, Value as LuaValue};
+use crate::compiler;
+use crate::ir::Program;
+use crate::rt::{Platform, SideId, Vm};
+use crate::store::{self, StoreBinding};
+use crate::value::{decode, encode, NativeId, Value};
 
-use crate::store;
-
-type Queue = Rc<RefCell<VecDeque<serde_json::Value>>>;
-type Log = Rc<RefCell<Vec<String>>>;
-
-const HOPRT_LUA: &str = include_str!("../lua/hoprt.lua");
-const HUI_LUA: &str = include_str!("../lua/hui.lua");
-
-pub struct Host {
-    vms: HashMap<String, Lua>,
-    queue: Queue,
-    log: Log,
+struct Shared {
+    queue: VecDeque<Vec<u8>>,
+    log: Vec<String>,
     verbose: bool,
+    /// per-browser simulated DOM: addr → selector → contents
+    doms: HashMap<String, HashMap<String, String>>,
+}
+
+impl Shared {
+    fn emit(&mut self, line: String) {
+        if self.verbose {
+            println!("{line}");
+        }
+        self.log.push(line);
+    }
+}
+
+/// The per-VM [`Platform`]: labels transcript lines, logs the wire, backs
+/// dom.* with a stored fake DOM, and (server only) carries the store.
+struct SimPlatform<'a> {
+    label: String,
+    is_server: bool,
+    shared: &'a mut Shared,
+    store: Option<&'a mut StoreBinding>,
+}
+
+impl SimPlatform<'_> {
+    fn prefix(&self) -> String {
+        if self.is_server {
+            "[server]".to_string()
+        } else {
+            format!("[browser {}]", self.label)
+        }
+    }
+}
+
+impl Platform for SimPlatform<'_> {
+    fn send(&mut self, pkt: Value) {
+        let to = pkt.get_field("to");
+        let kind = pkt.get_field("kind");
+        let detail = match kind.as_str().unwrap_or("?") {
+            "reply" => format!("value={}", pkt.get_field("value")),
+            "error" => format!("err={}", pkt.get_field("err")),
+            _ => format!(
+                "{} vars={}",
+                crate::value::coerce_str(&pkt.get_field("hop")),
+                pkt.get_field("vars")
+            ),
+        };
+        let line = format!(
+            "        ~ wire {:>7} -> {:<8} {:<5} {}",
+            self.label,
+            crate::value::coerce_str(&to),
+            kind.as_str().unwrap_or("?"),
+            detail
+        );
+        self.shared.emit(line);
+        match encode(&pkt) {
+            Ok(bytes) => self.shared.queue.push_back(bytes),
+            Err(e) => self.shared.emit(format!("!! unencodable packet: {e}")),
+        }
+    }
+
+    fn print(&mut self, line: String) {
+        let p = self.prefix();
+        self.shared.emit(format!("{p} {line}"));
+    }
+
+    fn dom_get(&mut self, sel: &str) -> String {
+        self.shared
+            .doms
+            .get(&self.label)
+            .and_then(|d| d.get(sel))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn dom_set(&mut self, sel: &str, html: &str) {
+        let p = self.prefix();
+        self.shared.emit(format!("{p} [dom] {sel} := {html}"));
+        self.shared
+            .doms
+            .entry(self.label.clone())
+            .or_default()
+            .insert(sel.to_string(), html.to_string());
+    }
+
+    fn dom_clear(&mut self, sel: &str) {
+        self.shared
+            .doms
+            .entry(self.label.clone())
+            .or_default()
+            .insert(sel.to_string(), String::new());
+    }
+
+    fn store_native(
+        &mut self,
+        id: NativeId,
+        args: Vec<Value>,
+        _prog: &Rc<Program>,
+    ) -> Option<Result<Value, String>> {
+        self.store.as_mut().map(|b| b.native(id, args))
+    }
+}
+
+pub struct Cluster {
+    server: Vm,
+    store: Option<StoreBinding>,
+    browsers: Vec<(String, Vm)>,
+    shared: Shared,
     data_dir: PathBuf,
     _keep: Option<tempfile::TempDir>,
 }
 
-fn compact(v: &serde_json::Value) -> String {
-    serde_json::to_string(v).unwrap_or_default()
-}
-
-fn emit(log: &Log, verbose: bool, line: String) {
-    if verbose {
-        println!("{line}");
-    }
-    log.borrow_mut().push(line);
-}
-
-impl Host {
-    /// Build the cluster. Every VM loads the identical `app_code` program.
-    /// The server VM gets a fresh durable data dir (temp).
-    pub fn new(sessions: &[&str], app_code: &str, verbose: bool) -> mlua::Result<Self> {
-        let keep = tempfile::tempdir().map_err(mlua::Error::external)?;
+impl Cluster {
+    /// Compile `.hop` source and build the cluster. Every VM loads the
+    /// identical program. The server VM gets a fresh durable data dir.
+    pub fn new(sessions: &[&str], hop_src: &str, verbose: bool) -> Result<Self, String> {
+        let keep = tempfile::tempdir().map_err(|e| e.to_string())?;
         let data_dir = keep.path().to_path_buf();
-        Self::with_data(sessions, app_code, verbose, data_dir, Some(keep))
+        Self::with_data(sessions, hop_src, verbose, data_dir, Some(keep))
     }
 
     /// Build the cluster against an existing data directory (reopen / persist).
     pub fn with_data_dir(
         sessions: &[&str],
-        app_code: &str,
+        hop_src: &str,
         verbose: bool,
         data_dir: impl AsRef<Path>,
-    ) -> mlua::Result<Self> {
-        Self::with_data(
-            sessions,
-            app_code,
-            verbose,
-            data_dir.as_ref().to_path_buf(),
-            None,
-        )
+    ) -> Result<Self, String> {
+        Self::with_data(sessions, hop_src, verbose, data_dir.as_ref().to_path_buf(), None)
     }
 
     fn with_data(
         sessions: &[&str],
-        app_code: &str,
+        hop_src: &str,
         verbose: bool,
         data_dir: PathBuf,
         keep: Option<tempfile::TempDir>,
-    ) -> mlua::Result<Self> {
-        let queue: Queue = Rc::new(RefCell::new(VecDeque::new()));
-        let log: Log = Rc::new(RefCell::new(Vec::new()));
-        let mut vms = HashMap::new();
-        let mut addrs = vec!["server".to_string()];
-        addrs.extend(sessions.iter().map(|s| s.to_string()));
-        for addr in addrs {
-            let vm = Self::make_vm(
-                &addr,
-                app_code,
-                queue.clone(),
-                log.clone(),
-                verbose,
-                &data_dir,
-            )?;
-            vms.insert(addr, vm);
-        }
-        Ok(Self {
-            vms,
-            queue,
-            log,
+    ) -> Result<Self, String> {
+        let prog = Rc::new(compiler::compile(hop_src)?);
+        let mut shared = Shared {
+            queue: VecDeque::new(),
+            log: Vec::new(),
             verbose,
-            data_dir,
-            _keep: keep,
-        })
+            doms: HashMap::new(),
+        };
+
+        let server = {
+            let mut platform = SimPlatform {
+                label: "server".into(),
+                is_server: true,
+                shared: &mut shared,
+                store: None,
+            };
+            Vm::new(prog.clone(), SideId::Server, &mut platform)?
+        };
+        let store = store::bind(&server, &data_dir)?;
+
+        let mut browsers = Vec::new();
+        for s in sessions {
+            let mut platform = SimPlatform {
+                label: s.to_string(),
+                is_server: false,
+                shared: &mut shared,
+                store: None,
+            };
+            let vm = Vm::new(prog.clone(), SideId::Browser(s.to_string()), &mut platform)?;
+            browsers.push((s.to_string(), vm));
+        }
+
+        Ok(Self { server, store, browsers, shared, data_dir, _keep: keep })
     }
 
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
     }
 
-    /// Evaluate a Lua chunk on the server VM. Used by persistence tests.
-    pub fn eval_server<R: mlua::FromLuaMulti>(&self, code: &str) -> mlua::Result<R> {
-        self.vms["server"].load(code).set_name("eval-server").call(())
+    /// Simulate an event: run a global entry point as a flow on one VM.
+    pub fn fire(&mut self, addr: &str, entry: &str) {
+        self.fire_args(addr, entry, Vec::new());
     }
 
-    fn make_vm(
-        addr: &str,
-        app_code: &str,
-        queue: Queue,
-        log: Log,
-        verbose: bool,
-        data_dir: &Path,
-    ) -> mlua::Result<Lua> {
-        let lua = Lua::new();
-        let is_server = addr == "server";
-        lua.globals()
-            .set("SIDE", if is_server { "server" } else { "browser" })?;
-        if !is_server {
-            lua.globals().set("SESSION", addr)?;
-        }
-
-        let from = addr.to_string();
-        let send_log = log.clone();
-        let send = lua.create_function(move |lua, pkt: LuaValue| {
-            let json: serde_json::Value = lua.from_value(pkt)?;
-            let to = json["to"].as_str().unwrap_or("?");
-            let kind = json["kind"].as_str().unwrap_or("?");
-            let detail = match kind {
-                "reply" => format!("value={}", compact(&json["value"])),
-                "error" => format!("err={}", compact(&json["err"])),
-                _ => format!(
-                    "{} vars={}",
-                    json["hop"].as_str().unwrap_or("?"),
-                    compact(&json["vars"])
-                ),
+    pub fn fire_args(&mut self, addr: &str, entry: &str, args: Vec<Value>) {
+        if addr == "server" {
+            let mut platform = SimPlatform {
+                label: "server".into(),
+                is_server: true,
+                shared: &mut self.shared,
+                store: self.store.as_mut(),
             };
-            emit(
-                &send_log,
-                verbose,
-                format!("        ~ wire {from:>7} -> {to:<8} {kind:<5} {detail}"),
-            );
-            queue.borrow_mut().push_back(json);
-            Ok(())
-        })?;
-        lua.globals().set("__send", send)?;
-
-        let print_log = log.clone();
-        let print_fn = lua.create_function(move |_, msg: String| {
-            emit(&print_log, verbose, msg);
-            Ok(())
-        })?;
-        lua.globals().set("__print", print_fn)?;
-
-        lua.load(HOPRT_LUA).set_name("hoprt.lua").exec()?;
-        lua.load(HUI_LUA).set_name("hui.lua").exec()?;
-        if is_server {
-            store::install_constructors(&lua)?;
+            self.server.fire(&mut platform, entry, args);
+        } else {
+            let (label, vm) = Self::browser(&mut self.browsers, addr);
+            let mut platform = SimPlatform {
+                label,
+                is_server: false,
+                shared: &mut self.shared,
+                store: None,
+            };
+            vm.fire(&mut platform, entry, args);
         }
-        lua.load(app_code).set_name("app.lua").exec()?;
-        if is_server {
-            store::bind(&lua, data_dir)?;
-        }
-        Ok(lua)
     }
 
-    /// Simulate an event: call a global entry point on one VM.
-    pub fn fire(&self, addr: &str, entry: &str) -> mlua::Result<()> {
-        self.vms[addr].globals().get::<Function>(entry)?.call::<()>(())
+    /// Click a rendered hui handler by id on a browser VM.
+    pub fn fire_handler(&mut self, addr: &str, id: i64) {
+        let (label, vm) = Self::browser(&mut self.browsers, addr);
+        let mut platform = SimPlatform {
+            label,
+            is_server: false,
+            shared: &mut self.shared,
+            store: None,
+        };
+        vm.fire_handler(&mut platform, id);
     }
 
-    /// Like `fire`, with one argument — e.g. clicking a rendered hui
-    /// handler by calling `__handler_fire(id)`.
-    pub fn fire_with(&self, addr: &str, entry: &str, arg: i64) -> mlua::Result<()> {
-        self.vms[addr].globals().get::<Function>(entry)?.call::<()>(arg)
+    /// Run a server-side function to completion and return its value —
+    /// the replacement for the Lua era's eval_server. It may cast (the
+    /// packets queue as usual) but not hop.
+    pub fn call_server(&mut self, name: &str, args: Vec<Value>) -> Result<Value, String> {
+        let mut platform = SimPlatform {
+            label: "server".into(),
+            is_server: true,
+            shared: &mut self.shared,
+            store: self.store.as_mut(),
+        };
+        self.server.call_sync(&mut platform, name, args)
     }
 
-    fn deliver(&self, addr: &str, pkt: &serde_json::Value) -> mlua::Result<()> {
-        let lua = self
-            .vms
-            .get(addr)
+    fn browser<'b>(browsers: &'b mut [(String, Vm)], addr: &str) -> (String, &'b mut Vm) {
+        let (label, vm) = browsers
+            .iter_mut()
+            .find(|(a, _)| a == addr)
             .unwrap_or_else(|| panic!("no VM at address {addr}"));
-        // null-safe: a null inside a packet must arrive as nil, never as
-        // mlua's truthy NULL userdata (same class of bug as the store fix)
-        let value = crate::store::to_lua(lua, pkt)?;
-        lua.globals().get::<Function>("__receive")?.call::<()>(value)
+        (label.clone(), vm)
     }
 
     /// Drain the queue to quiescence. "browsers" fans out to every browser
     /// VM — enumerating connected sessions at delivery time, per the
     /// design's at-most-once contract.
-    pub fn pump(&self) -> mlua::Result<()> {
+    pub fn pump(&mut self) {
         loop {
-            let pkt = self.queue.borrow_mut().pop_front();
-            let Some(pkt) = pkt else { break };
-            match pkt["to"].as_str() {
-                Some("browsers") => {
-                    let mut sessions: Vec<&String> =
-                        self.vms.keys().filter(|a| a.as_str() != "server").collect();
-                    sessions.sort();
-                    for addr in sessions {
-                        self.deliver(addr, &pkt)?;
+            let Some(bytes) = self.shared.queue.pop_front() else { break };
+            let pkt = decode(&bytes).expect("undecodable packet on the queue");
+            let to = pkt.get_field("to");
+            let to = crate::value::coerce_str(&to);
+            match to.as_str() {
+                "server" => {
+                    let mut platform = SimPlatform {
+                        label: "server".into(),
+                        is_server: true,
+                        shared: &mut self.shared,
+                        store: self.store.as_mut(),
+                    };
+                    self.server.receive(&mut platform, pkt);
+                }
+                "browsers" => {
+                    let mut order: Vec<usize> = (0..self.browsers.len()).collect();
+                    order.sort_by(|&a, &b| self.browsers[a].0.cmp(&self.browsers[b].0));
+                    for i in order {
+                        let (label, vm) = &mut self.browsers[i];
+                        let mut platform = SimPlatform {
+                            label: label.clone(),
+                            is_server: false,
+                            shared: &mut self.shared,
+                            store: None,
+                        };
+                        vm.receive(&mut platform, pkt.clone());
                     }
                 }
-                Some(addr) => self.deliver(addr, &pkt)?,
-                None => panic!("packet without target: {}", compact(&pkt)),
+                addr => {
+                    let (label, vm) = Self::browser(&mut self.browsers, addr);
+                    let mut platform = SimPlatform {
+                        label,
+                        is_server: false,
+                        shared: &mut self.shared,
+                        store: None,
+                    };
+                    vm.receive(&mut platform, pkt);
+                }
             }
         }
-        Ok(())
     }
 
     /// Every VM must have zero suspended flows once the queue is drained; a
     /// leaked flow means a reply was lost or misrouted.
-    pub fn assert_quiescent(&self) -> mlua::Result<()> {
-        for (addr, lua) in &self.vms {
-            let (ok, flow): (bool, Option<String>) = lua
-                .load("return rt.quiescent()")
-                .set_name("quiescence-check")
-                .call(())?;
-            assert!(ok, "VM {addr} leaked a suspended flow: {flow:?}");
+    pub fn assert_quiescent(&self) {
+        if let Err(e) = self.server.quiescent() {
+            panic!("server VM leaked: {e}");
         }
-        Ok(())
+        for (addr, vm) in &self.browsers {
+            if let Err(e) = vm.quiescent() {
+                panic!("VM {addr} leaked: {e}");
+            }
+        }
     }
 
-    /// The merged transcript: wire log and every VM's prints, in order.
+    /// The merged transcript: wire log, prints, and dom writes, in order.
     pub fn log(&self) -> Vec<String> {
-        self.log.borrow().clone()
+        self.shared.log.clone()
+    }
+
+    /// The last rendered contents of a selector on a browser VM.
+    pub fn dom(&self, addr: &str, sel: &str) -> String {
+        self.shared
+            .doms
+            .get(addr)
+            .and_then(|d| d.get(sel))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Set a fake input value (what dom.get will return on that browser).
+    pub fn set_dom(&mut self, addr: &str, sel: &str, value: &str) {
+        self.shared
+            .doms
+            .entry(addr.to_string())
+            .or_default()
+            .insert(sel.to_string(), value.to_string());
+    }
+
+    // -- store passthroughs (server-side reads for tests) -------------------
+
+    fn binding(&mut self) -> &mut StoreBinding {
+        self.store.as_mut().expect("app has no store bound")
+    }
+
+    /// Append an event directly (a server-only append, as if from a
+    /// server-origin flow).
+    pub fn append(&mut self, event: Value) -> Result<Value, String> {
+        self.binding().native(NativeId::StoreAppend, vec![event])
+    }
+
+    pub fn store_one(&mut self, path: Value) -> Result<Value, String> {
+        self.binding().native(NativeId::StoreOne, vec![path])
+    }
+
+    pub fn verify(&mut self) -> Result<(), String> {
+        self.binding().verify()
+    }
+
+    pub fn rebuild(&mut self) -> Result<(), String> {
+        self.binding().rebuild()
+    }
+
+    pub fn applied(&mut self) -> Result<u64, String> {
+        self.binding().applied()
     }
 
     pub fn banner(&self, text: &str) {
-        if self.verbose {
+        if self.shared.verbose {
             println!("{text}");
         }
     }

@@ -50,12 +50,13 @@ fn reduce(tx, event) {
   }
 }
 
-// Lock signups and lay out round 1. Bracket position j (1-based) gets
-// seed seed_order(size)[j]; entrants are seeded in entry order. Slots
-// with no second entrant are byes: the present player advances now.
+// Lock signups and lay out round 1. Bracket position j (0-based) gets
+// seed seed_order(size)[j] (seed numbers stay 1-based — they're names,
+// like "seed 1"); entrants are seeded in entry order. Slots with no
+// second entrant are byes: the present player advances now.
 fn start_bracket(tx, tid) {
   let players = tx.peek(["tournaments", tid, "players"]);
-  let n = count(players);
+  let n = len(players);
   if n < 2 {
     return;
   }
@@ -68,18 +69,18 @@ fn start_bracket(tx, tid) {
   let p1s = {};
   let p2s = {};
   for j, seed in order {
-    let slot = math.floor((j + 1) / 2);
+    let slot = floor(j / 2) + 1;
     if seed <= n {
-      if j % 2 == 1 {
-        p1s[slot] = players[seed];
+      if j % 2 == 0 {
+        p1s[slot] = players[seed - 1];
       } else {
-        p2s[slot] = players[seed];
+        p2s[slot] = players[seed - 1];
       }
     }
   }
   for j, seed in order {
-    if j % 2 == 1 {
-      let slot = math.floor((j + 1) / 2);
+    if j % 2 == 0 {
+      let slot = floor(j / 2) + 1;
       let mid = "r1m" .. slot;
       let a = p1s[slot];
       let b = p2s[slot];
@@ -94,7 +95,7 @@ fn start_bracket(tx, tid) {
       // seeding guarantees a is present whenever b is; a lone a is a bye
       if a && !b {
         tx.put(["tournaments", tid, "matches", mid, "winner"], a);
-        advance(tx, tid, 2, math.floor((slot + 1) / 2), slot % 2 == 1, a, rounds);
+        advance(tx, tid, 2, floor((slot + 1) / 2), slot % 2 == 1, a, rounds);
       }
     }
   }
@@ -111,7 +112,7 @@ fn report_result(tx, event) {
     let round = tx.peek(["tournaments", tid, "matches", mid, "round"]);
     let slot = tx.peek(["tournaments", tid, "matches", mid, "slot"]);
     let rounds = tx.peek(["tournaments", tid, "rounds"]);
-    advance(tx, tid, round + 1, math.floor((slot + 1) / 2), slot % 2 == 1, event.winner, rounds);
+    advance(tx, tid, round + 1, floor((slot + 1) / 2), slot % 2 == 1, event.winner, rounds);
   }
 }
 
@@ -134,17 +135,7 @@ fn advance(tx, tid, round, slot, as_p1, player, rounds) {
   }
 }
 
-// ── bracket math (v0 has no while/#: recursion and counting loops) ─────
-
-fn count(xs) {
-  let n = 0;
-  if xs {
-    for i, x in xs {
-      n = i;
-    }
-  }
-  return n;
-}
+// ── bracket math (v0 has no while: recursion) ──────────────────────────
 
 fn pow2_from(p, n) {
   if p >= n {
@@ -157,20 +148,20 @@ fn log2i(p) {
   if p <= 1 {
     return 0;
   }
-  return 1 + log2i(math.floor(p / 2));
+  return 1 + log2i(floor(p / 2));
 }
 
-// Standard bracket order: position j gets seed out[j]. Built by the
-// classic mirror-interleave — for size 8: 1 8 4 5 2 7 3 6.
+// Standard bracket order: position j gets seed number out[j]. Built by
+// the classic mirror-interleave — for size 8: 1 8 4 5 2 7 3 6.
 fn seed_order(size) {
   if size == 1 {
     return [1];
   }
-  let prev = seed_order(math.floor(size / 2));
+  let prev = seed_order(floor(size / 2));
   let out = [];
   for i, x in prev {
-    table.insert(out, x);
-    table.insert(out, size + 1 - x);
+    push(out, x);
+    push(out, size + 1 - x);
   }
   return out;
 }
@@ -193,12 +184,7 @@ fn load_t(tid) {
     return nil;
   }
   let ms = store.items(["tournaments", tid, "matches"]);
-  table.sort(ms, fn(a, b) {
-    if a.round == b.round {
-      return a.slot < b.slot;
-    }
-    return a.round < b.round;
-  });
+  sort_by(ms, [:round, :slot]);
   return {
     id = tid,
     name = name,
@@ -224,13 +210,13 @@ fn lobby_view(list) {
   if list {
     for i, t in list {
       let tid = t.id;
-      table.insert(rows, [:li, {
+      push(rows, [:li, {
         class = "clickable",
         id = "t-" .. tid,
         onclick = fn(e) { open_t(tid); }
       },
         [:span, {}, t.name],
-        [:span, { class = "meta" }, "  (" .. t.status .. ", " .. count(t.players) .. " players)"]
+        [:span, { class = "meta" }, "  (" .. t.status .. ", " .. len(t.players) .. " players)"]
       ]);
     }
   }
@@ -267,7 +253,7 @@ fn signup_view(t) {
   let rows = [];
   if t.players {
     for i, p in t.players {
-      table.insert(rows, [:li, {}, p]);
+      push(rows, [:li, {}, p]);
     }
   }
   return [:div, {},
@@ -281,16 +267,16 @@ fn signup_view(t) {
 }
 
 fn bracket_view(t) {
-  let cols = [];
+  let cols = {};                          // round number → column of matches
   for i, m in t.matches {
     if !cols[m.round] {
       cols[m.round] = [];
     }
-    table.insert(cols[m.round], match_view(t.id, m));
+    push(cols[m.round], match_view(t.id, m));
   }
   let colviews = [];
   for r, col in cols {
-    table.insert(colviews, [:div, {
+    push(colviews, [:div, {
       class = "bracket-col",
       style = "display:flex;flex-direction:column;justify-content:space-around;gap:8px;flex:1"
     },

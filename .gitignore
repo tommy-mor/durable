@@ -37,9 +37,4 @@ target/
 # hopd default data dir
 hop-data/
 
-# Playwright
-hoprt/e2e/node_modules/
-hoprt/e2e/test-results/
-hoprt/e2e/playwright-report/
-hoprt/e2e/playwright/.cache/
 repomix-output.xml

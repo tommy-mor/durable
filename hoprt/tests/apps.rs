@@ -1,213 +1,183 @@
 //! Simulated-cluster tests for the larger hop apps. These prove hopc +
 //! the durable store can run ranking (Sum edges + decay), microblog
-//! (fan-out-on-write timelines), and chat (nested list under a map)
-//! without a browser.
+//! (fan-out-on-write timelines), chat (nested list under a map), and the
+//! tournament bracket without a browser. Store reads go through the same
+//! natives the apps use; every scenario ends with replay verification.
 
-use hoprt::compiler;
-use hoprt::harness::Host;
+use hoprt::harness::Cluster;
+use hoprt::value::Value;
 
-fn compile(src: &str) -> String {
-    let lua = compiler::compile(src).expect("hopc compile");
-    let dom = "dom = {\
-        set = function(sel, html) print(\"[dom] \" .. sel .. \" := \" .. html) end,\
-        get = function() return \"\" end,\
-        clear = function() end\
-    }\n";
-    format!("{dom}{lua}")
+fn s(x: &str) -> Value {
+    Value::str(x)
+}
+
+fn i(x: i64) -> Value {
+    Value::Int(x)
+}
+
+fn arr(items: Vec<Value>) -> Value {
+    Value::array(items)
+}
+
+fn map(entries: &[(&str, Value)]) -> Value {
+    Value::map(
+        entries
+            .iter()
+            .map(|(k, v)| (Value::str(*k), v.clone()))
+            .collect(),
+    )
+}
+
+fn arr_len(v: &Value) -> usize {
+    match v {
+        Value::Array(a) => a.borrow().len(),
+        Value::Nil => 0,
+        other => panic!("expected array, got {other}"),
+    }
 }
 
 #[test]
 fn ranking_votes_and_decay() {
-    let code = compile(include_str!("../hop/ranking.hop"));
-    let host = Host::new(&["A", "B"], &code, false).expect("host");
-    host.fire("A", "sim_demo").unwrap();
-    host.pump().unwrap();
-    host.assert_quiescent().unwrap();
+    let mut host = Cluster::new(&["A", "B"], include_str!("../hop/ranking.hop"), false).unwrap();
+    host.fire("A", "sim_demo");
+    host.pump();
+    host.assert_quiescent();
 
-    let votes: i64 = host
-        .eval_server(r#"return store.one({"scopes", "tools", "votes"})"#)
+    let votes = host.store_one(arr(vec![s("scopes"), s("tools"), s("votes")])).unwrap();
+    assert_eq!(votes, i(3));
+    let rg_grep = host
+        .store_one(arr(vec![s("scopes"), s("tools"), s("edges"), s("ripgrep>grep")]))
         .unwrap();
-    assert_eq!(votes, 3);
+    assert_eq!(rg_grep, i(1));
 
-    let rg_grep: i64 = host
-        .eval_server(r#"return store.one({"scopes", "tools", "edges", "ripgrep>grep"})"#)
+    // decay is a server-only append (no hop). verify replay after.
+    host.append(map(&[("type", s("decay")), ("scope", s("tools"))])).unwrap();
+    host.verify().unwrap();
+    let decayed = host
+        .store_one(arr(vec![s("scopes"), s("tools"), s("edges"), s("ripgrep>grep")]))
         .unwrap();
-    assert_eq!(rg_grep, 1);
-
-    host.eval_server::<()>(
-        r#"
-        rt.start_flow(function()
-          store.append({ type = "decay", scope = "tools" })
-        end)
-    "#,
-    )
-    .unwrap();
-    // decay is a server-only append from the server VM (no hop). verify replay.
-    host.eval_server::<()>("store.verify()").unwrap();
-    let decayed: f64 = host
-        .eval_server(r#"return store.one({"scopes", "tools", "edges", "ripgrep>grep"})"#)
-        .unwrap();
-    assert!((decayed - 0.9).abs() < 1e-9, "{decayed}");
+    match decayed {
+        Value::Float(f) => assert!((f - 0.9).abs() < 1e-9, "{f}"),
+        other => panic!("expected float edge after decay, got {other}"),
+    }
 }
 
 #[test]
-fn microblog_fanout_on_write() {
-    let code = compile(include_str!("../hop/microblog.hop"));
-    let host = Host::new(&["A", "B"], &code, false).expect("host");
+fn microblog_fans_out_on_write() {
+    let mut host = Cluster::new(&["A", "B"], include_str!("../hop/microblog.hop"), false).unwrap();
 
-    host.eval_server::<()>(
-        r#"
-        rt.start_flow(function()
-          store.append({ type = "join", sid = "A", name = "Ada" })
-          store.append({ type = "join", sid = "B", name = "Bob" })
-          store.append({ type = "follow", sid = "B", who = "A" })
-          store.append({ type = "post", sid = "A", text = "hello tape" })
-        end)
-    "#,
-    )
-    .unwrap();
+    host.append(map(&[("type", s("join")), ("sid", s("A")), ("name", s("Ada"))])).unwrap();
+    host.append(map(&[("type", s("join")), ("sid", s("B")), ("name", s("Bob"))])).unwrap();
+    host.append(map(&[("type", s("follow")), ("sid", s("B")), ("who", s("A"))])).unwrap();
+    host.append(map(&[("type", s("post")), ("sid", s("A")), ("text", s("hello tape"))])).unwrap();
 
-    let count: i64 = host.eval_server(r#"return store.one({"post_count"})"#).unwrap();
-    assert_eq!(count, 1);
+    let count = host.store_one(arr(vec![s("post_count")])).unwrap();
+    assert_eq!(count, i(1));
 
     // A's own timeline and B's (follower) both got the post id (seq 3 —
     // join, join, follow, post).
-    let a_n: i64 = host
-        .eval_server(r#"local t = store.one({"timelines", "A"}); return #t"#)
-        .unwrap();
-    let b_n: i64 = host
-        .eval_server(r#"local t = store.one({"timelines", "B"}); return #t"#)
-        .unwrap();
-    assert_eq!(a_n, 1, "author timeline");
-    assert_eq!(b_n, 1, "follower timeline");
-    let text: String = host
-        .eval_server(r#"return store.one({"posts", 3, "text"})"#)
-        .unwrap();
-    assert_eq!(text, "hello tape");
-    host.eval_server::<()>("store.verify()").unwrap();
+    let a_tl = host.store_one(arr(vec![s("timelines"), s("A")])).unwrap();
+    let b_tl = host.store_one(arr(vec![s("timelines"), s("B")])).unwrap();
+    assert_eq!(arr_len(&a_tl), 1, "author timeline");
+    assert_eq!(arr_len(&b_tl), 1, "follower timeline");
+    let text = host.store_one(arr(vec![s("posts"), i(3), s("text")])).unwrap();
+    assert_eq!(text, s("hello tape"));
+    host.verify().unwrap();
 }
 
 #[test]
 fn tournament_bracket_lifecycle() {
-    let code = compile(include_str!("../hop/tournament.hop"));
-    let host = Host::new(&["A", "B"], &code, false).expect("host");
+    let mut host = Cluster::new(&["A", "B"], include_str!("../hop/tournament.hop"), false).unwrap();
 
     // create (seq 0 = tid), five entrants, start. size 8, rounds 3;
     // standard order 1 8 4 5 2 7 3 6 puts byes on seeds 1, 2, 3.
-    host.eval_server::<()>(
-        r#"
-        rt.start_flow(function()
-          store.append({ type = "create", name = "spring cup" })
-          store.append({ type = "enter", tid = 0, player = "a" })
-          store.append({ type = "enter", tid = 0, player = "b" })
-          store.append({ type = "enter", tid = 0, player = "c" })
-          store.append({ type = "enter", tid = 0, player = "d" })
-          store.append({ type = "enter", tid = 0, player = "e" })
-          store.append({ type = "start", tid = 0 })
-        end)
-    "#,
-    )
-    .unwrap();
+    host.append(map(&[("type", s("create")), ("name", s("spring cup"))])).unwrap();
+    for p in ["a", "b", "c", "d", "e"] {
+        host.append(map(&[("type", s("enter")), ("tid", i(0)), ("player", s(p))])).unwrap();
+    }
+    host.append(map(&[("type", s("start")), ("tid", i(0))])).unwrap();
 
-    let status: String = host
-        .eval_server(r#"return store.one({"tournaments", 0, "status"})"#)
-        .unwrap();
-    assert_eq!(status, "live");
-    let rounds: i64 = host
-        .eval_server(r#"return store.one({"tournaments", 0, "rounds"})"#)
-        .unwrap();
-    assert_eq!(rounds, 3);
+    let t = |host: &mut Cluster, rest: Vec<Value>| {
+        let mut path = vec![s("tournaments"), i(0)];
+        path.extend(rest);
+        host.store_one(arr(path)).unwrap()
+    };
+
+    assert_eq!(t(&mut host, vec![s("status")]), s("live"));
+    assert_eq!(t(&mut host, vec![s("rounds")]), i(3));
 
     // byes resolved at start: a (seed 1) already through to r2m1 as p1;
     // b and c (seeds 2, 3) feed BOTH sides of r2m2 — playable immediately
-    let bye_winner: String = host
-        .eval_server(r#"return store.one({"tournaments", 0, "matches", "r1m1", "winner"})"#)
-        .unwrap();
-    assert_eq!(bye_winner, "a");
-    let r2m2: (String, String) = host
-        .eval_server(
-            r#"return store.one({"tournaments", 0, "matches", "r2m2", "p1"}),
-                      store.one({"tournaments", 0, "matches", "r2m2", "p2"})"#,
-        )
-        .unwrap();
-    assert_eq!(r2m2, ("b".into(), "c".into()));
+    assert_eq!(t(&mut host, vec![s("matches"), s("r1m1"), s("winner")]), s("a"));
+    assert_eq!(t(&mut host, vec![s("matches"), s("r2m2"), s("p1")]), s("b"));
+    assert_eq!(t(&mut host, vec![s("matches"), s("r2m2"), s("p2")]), s("c"));
 
     // guards: entering after start is a no-op; reporting a decided match
     // is a no-op; a winner not in the match is a no-op
-    host.eval_server::<()>(
-        r#"
-        rt.start_flow(function()
-          store.append({ type = "enter", tid = 0, player = "late" })
-          store.append({ type = "report", tid = 0, match = "r1m1", winner = "e" })
-          store.append({ type = "report", tid = 0, match = "r1m2", winner = "nobody" })
-        end)
-    "#,
-    )
+    host.append(map(&[("type", s("enter")), ("tid", i(0)), ("player", s("late"))])).unwrap();
+    host.append(map(&[
+        ("type", s("report")),
+        ("tid", i(0)),
+        ("match", s("r1m1")),
+        ("winner", s("d")),
+    ]))
     .unwrap();
-    let n: i64 = host
-        .eval_server(r#"return count(store.one({"tournaments", 0, "players"}))"#)
-        .unwrap();
-    assert_eq!(n, 5, "signup is locked");
-    let still_a: String = host
-        .eval_server(r#"return store.one({"tournaments", 0, "matches", "r1m1", "winner"})"#)
-        .unwrap();
-    assert_eq!(still_a, "a", "decided match cannot be re-reported");
+    let players = t(&mut host, vec![s("players")]);
+    assert_eq!(arr_len(&players), 5, "signup is locked");
+    assert_eq!(
+        t(&mut host, vec![s("matches"), s("r1m1"), s("winner")]),
+        s("a"),
+        "decided match cannot be re-reported"
+    );
 
     // play it out: e beats d, a beats e, c beats b, c beats a
-    host.eval_server::<()>(
-        r#"
-        rt.start_flow(function()
-          store.append({ type = "report", tid = 0, match = "r1m2", winner = "e" })
-          store.append({ type = "report", tid = 0, match = "r2m1", winner = "a" })
-          store.append({ type = "report", tid = 0, match = "r2m2", winner = "c" })
-          store.append({ type = "report", tid = 0, match = "r3m1", winner = "c" })
-        end)
-    "#,
-    )
-    .unwrap();
+    for (mid, w) in [("r1m2", "e"), ("r2m1", "a"), ("r2m2", "c"), ("r3m1", "c")] {
+        host.append(map(&[
+            ("type", s("report")),
+            ("tid", i(0)),
+            ("match", s(mid)),
+            ("winner", s(w)),
+        ]))
+        .unwrap();
+    }
 
-    let champion: String = host
-        .eval_server(r#"return store.one({"tournaments", 0, "champion"})"#)
-        .unwrap();
-    assert_eq!(champion, "c");
-    let status: String = host
-        .eval_server(r#"return store.one({"tournaments", 0, "status"})"#)
-        .unwrap();
-    assert_eq!(status, "done");
+    assert_eq!(t(&mut host, vec![s("champion")]), s("c"));
+    assert_eq!(t(&mut host, vec![s("status")]), s("done"));
 
     // the view renders from the same snapshot the browsers would get
-    host.eval_server::<()>("render(snapshot(0))").unwrap();
+    let snap = host.call_server("snapshot", vec![i(0)]).unwrap();
+    host.call_server("render", vec![snap]).unwrap();
     let log = host.log().join("\n");
     assert!(log.contains("champion: c"), "{log}");
 
     // the whole bracket — seeding, byes, advancement — replays from the tape
-    host.eval_server::<()>("store.verify()").unwrap();
+    host.verify().unwrap();
 }
 
 #[test]
-fn chat_nested_room_messages() {
-    let code = compile(include_str!("../hop/chat.hop"));
-    let host = Host::new(&["A", "B"], &code, false).expect("host");
-    host.fire("A", "sim_demo").unwrap();
-    host.pump().unwrap();
+fn chat_rooms_are_isolated_lists() {
+    let mut host = Cluster::new(&["A", "B"], include_str!("../hop/chat.hop"), false).unwrap();
+    host.fire("A", "sim_demo");
+    host.pump();
 
-    host.eval_server::<()>(
-        r#"
-        rt.start_flow(function()
-          store.append({ type = "say", sid = "B", room = "lobby", text = "hi ada" })
-          store.append({ type = "say", sid = "A", room = "random", text = "side room" })
-        end)
-    "#,
-    )
+    host.append(map(&[
+        ("type", s("say")),
+        ("sid", s("B")),
+        ("room", s("lobby")),
+        ("text", s("hi ada")),
+    ]))
+    .unwrap();
+    host.append(map(&[
+        ("type", s("say")),
+        ("sid", s("B")),
+        ("room", s("random")),
+        ("text", s("psst")),
+    ]))
     .unwrap();
 
-    let n: i64 = host
-        .eval_server(r#"local m = store.one({"rooms", "lobby", "messages"}); return #m"#)
-        .unwrap();
-    assert_eq!(n, 2);
-    let side: i64 = host
-        .eval_server(r#"local m = store.one({"rooms", "random", "messages"}); return #m"#)
-        .unwrap();
-    assert_eq!(side, 1);
-    host.eval_server::<()>("store.verify()").unwrap();
+    let lobby = host.store_one(arr(vec![s("rooms"), s("lobby"), s("messages")])).unwrap();
+    assert_eq!(arr_len(&lobby), 2);
+    let random = host.store_one(arr(vec![s("rooms"), s("random"), s("messages")])).unwrap();
+    assert_eq!(arr_len(&random), 1);
+    host.verify().unwrap();
 }

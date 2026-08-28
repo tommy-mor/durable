@@ -51,7 +51,7 @@ fn gather_timeline(sid) {
       let p = store.one(["posts", id]);
       if p {
         p.id = id;
-        table.insert(rows, p);
+        push(rows, p);
       }
     }
   }
@@ -72,7 +72,7 @@ fn blog_view(me, users, feed) {
   for i, u in users {
     if u.id != me {
       let id = u.id;
-      table.insert(people, [:li, { class = "user" },
+      push(people, [:li, { class = "user" },
         u.name .. " (" .. id .. ") ",
         [:button, {
           class = "follow",
@@ -92,7 +92,7 @@ fn blog_view(me, users, feed) {
   }
   let posts = [];
   for i, p in feed {
-    table.insert(posts, [:li, { class = "post" },
+    push(posts, [:li, { class = "post" },
       [:span, { class = "meta" }, name_of(p.author, users) .. ": "],
       p.text
     ]);

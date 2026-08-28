@@ -36,7 +36,7 @@ fn todo_view(items) {
   let rows = [];
   for i, item in items {
     let id = item.id;
-    table.insert(rows, [:li, {
+    push(rows, [:li, {
       class = item.done && "done",
       onclick = fn(e) {
         server!();

@@ -1,9 +1,8 @@
 // demo.hop — the pipeline demo, in hopc v0 syntax.
 //
-// Compiled by hopc into the Lua that lua/app.lua previously hand-wrote,
-// then run on the hoprt cluster. Placement marks split function bodies;
-// what crosses each hop is computed by the compiler (liveness), not
-// declared by the programmer.
+// Compiled by hopc to Hop IR and run on the hoprt cluster. Placement
+// marks split function bodies; what crosses each hop is computed by the
+// compiler (liveness), not declared by the programmer.
 
 server let taken = { alice = true, bob = true, root = true };
 server let members = { };
@@ -54,7 +53,7 @@ fn delete_account() {
 fn wb_connect() {
   server!();
   n_members = n_members + 1;
-  let color = palette[((n_members - 1) % 4) + 1];
+  let color = palette[(n_members - 1) % 4];
   members[session()] = color;
   print("session " .. session() .. " joins as " .. color);
 }

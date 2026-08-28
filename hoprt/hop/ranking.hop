@@ -22,7 +22,7 @@ fn reduce(tx, event) {
     if event.type == "decay" {
       let edges = tx.peek(["scopes", event.scope, "edges"]);
       if edges {
-        for k, w in pairs edges {
+        for k, w in edges {
           tx.put(["scopes", event.scope, "edges", k], w * 0.9);
         }
       }
@@ -53,7 +53,7 @@ fn ranking_view(scope, votes, edges) {
   let rows = [];
   if edges {
     for i, pair in edges {
-      table.insert(rows, [:li, { class = "edge" }, pair[1] .. "  " .. pair[2]]);
+      push(rows, [:li, { class = "edge" }, pair[0] .. "  " .. pair[1]]);
     }
   }
   return [:div, {},

@@ -24,7 +24,7 @@ fn chat_view(room, rooms, messages) {
   let room_links = [];
   for i, r in rooms {
     let name = r;
-    table.insert(room_links, [:button, {
+    push(room_links, [:button, {
       class = "room",
       id = "room-" .. name,
       onclick = fn(e) { open_room(name); }
@@ -33,7 +33,7 @@ fn chat_view(room, rooms, messages) {
   let lines = [];
   if messages {
     for i, m in messages {
-      table.insert(lines, [:li, { class = "msg" },
+      push(lines, [:li, { class = "msg" },
         [:span, { class = "meta" }, m.who .. ": "],
         m.text
       ]);
@@ -61,9 +61,9 @@ fn room_names() {
   let names = ["lobby"];
   if entries {
     for i, pair in entries {
-      let n = pair[1];
+      let n = pair[0];
       if n != "lobby" {
-        table.insert(names, n);
+        push(names, n);
       }
     }
   }

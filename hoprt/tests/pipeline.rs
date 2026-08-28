@@ -1,23 +1,25 @@
-//! The full pipeline, asserted: .hop source → hopc → Lua → three Luau VMs
-//! exchanging serialized packets → transcript.
+//! The full pipeline, asserted: .hop source → hopc → Hop IR → three native
+//! VMs exchanging CBOR-encoded packets → transcript. Assertions are on
+//! packets, transcripts, and rendered output — never on VM internals.
 
-use hoprt::compiler;
-use hoprt::harness::Host;
+use hoprt::harness::Cluster;
 
-fn run(app_code: &str) -> Vec<String> {
-    let host = Host::new(&["A", "B"], app_code, false).expect("host");
-    host.fire("A", "demo_join").unwrap();
-    host.fire("B", "demo_join").unwrap();
-    host.pump().unwrap();
-    host.fire("A", "demo_flows").unwrap();
-    host.pump().unwrap();
-    host.fire("B", "demo_stroke").unwrap();
-    host.pump().unwrap();
-    host.assert_quiescent().unwrap();
+fn run(src: &str) -> Vec<String> {
+    let mut host = Cluster::new(&["A", "B"], src, false).expect("cluster");
+    host.fire("A", "demo_join");
+    host.fire("B", "demo_join");
+    host.pump();
+    host.fire("A", "demo_flows");
+    host.pump();
+    host.fire("B", "demo_stroke");
+    host.pump();
+    host.assert_quiescent();
     host.log()
 }
 
-fn assert_transcript(log: &[String]) {
+#[test]
+fn demo_app_transcript() {
+    let log = run(include_str!("../hop/demo.hop"));
     let all = log.join("\n");
     let has = |needle: &str| {
         assert!(all.contains(needle), "transcript missing {needle:?}:\n{all}");
@@ -45,107 +47,120 @@ fn assert_transcript(log: &[String]) {
 }
 
 #[test]
-fn hand_compiled_app_runs() {
-    let app = include_str!("../lua/app.lua");
-    // app.lua's transcript differs slightly in wording; assert the shared core
-    let log = run(app);
-    let all = log.join("\n");
-    assert!(all.contains("'carol' is available"), "{all}");
-    assert!(all.contains("reserved handle"), "{all}");
-    assert!(all.contains("deleted 3 items"), "{all}");
-}
-
-#[test]
-fn hopc_compiled_hop_runs() {
-    let src = include_str!("../hop/demo.hop");
-    let lua = compiler::compile(src).expect("hopc compile");
-    let log = run(&lua);
-    assert_transcript(&log);
-}
-
-#[test]
 fn liveness_ships_only_what_the_remainder_uses() {
-    let src = include_str!("../hop/demo.hop");
-    let lua = compiler::compile(src).expect("hopc compile");
-    // check_handle hop 1 ships handle; hop 2 ships ok plus handle, which is
-    // still live because the result line echoes it
-    assert!(lua.contains(r#"rt.at("server", "check_handle:1", { handle = handle })"#), "{lua}");
-    assert!(lua.contains(r#"rt.at(rt.session(), "check_handle:2", { handle = handle, ok = ok })"#), "{lua}");
+    // ship sets are asserted on the wire itself: the vars map of each call
+    // and cast packet, in diagnostic notation (map keys are ordered).
+    let log = run(include_str!("../hop/demo.hop"));
+    let all = log.join("\n");
+    let has = |needle: &str| {
+        assert!(all.contains(needle), "wire missing {needle:?}:\n{all}");
+    };
+
+    // check_handle hop 1 ships handle; hop 2 ships ok plus handle, which
+    // is still live because the result line echoes it
+    has(r#"check_handle:1 vars={handle: "carol"}"#);
+    has(r#"check_handle:2 vars={handle: "carol", ok: true}"#);
+
     // delete_account chain: {} → {n} → {n, yes} → {msg} — n and yes are
     // dead after the last server segment and dropped from the final hop
-    assert!(lua.contains(r#"rt.at("server", "delete_account:1", {  })"#), "{lua}");
-    assert!(lua.contains(r#"rt.at(rt.session(), "delete_account:2", { n = n })"#), "{lua}");
-    assert!(lua.contains(r#"rt.at("server", "delete_account:3", { n = n, yes = yes })"#), "{lua}");
-    assert!(lua.contains(r#"rt.at(rt.session(), "delete_account:4", { msg = msg })"#), "{lua}");
-    // nested casts: outer captures {from, to}; inner adds color
-    assert!(lua.contains(r#"rt.cast("server", "stroke:c1", { from = from, to = to })"#), "{lua}");
-    assert!(lua.contains(r#"rt.cast("browsers", "stroke:c2", { color = color, from = from, to = to })"#), "{lua}");
+    has("delete_account:1 vars={}");
+    has("delete_account:2 vars={n: 3}");
+    has("delete_account:3 vars={n: 3, yes: true}");
+    has(r#"delete_account:4 vars={msg: "deleted 3 items"}"#);
+
+    // nested casts: outer captures {from, to}; inner adds the server-side
+    // color
+    has(r#"stroke:c1 vars={from: "(1,1)", to: "(2,3)"}"#);
+    has(r#"stroke:c2 vars={color: "steelblue", from: "(1,1)", to: "(2,3)"}"#);
 }
 
 #[test]
 fn todo_app_runs_on_simulated_cluster() {
     let src = include_str!("../hop/todo.hop");
-    let lua = compiler::compile(src).expect("hopc compile");
-    // the simulated cluster has no DOM; stub it with a print
-    let dom_stub = "dom = {\
-        set = function(sel, html) print(\"[dom] \" .. sel .. \" := \" .. html) end,\
-        get = function() return \"\" end,\
-        clear = function() end\
-    }\n";
-    let code = format!("{dom_stub}{lua}");
+    let mut host = Cluster::new(&["A", "B"], src, false).expect("cluster");
+    host.fire("A", "sim_demo");
+    host.pump();
 
-    let host = Host::new(&["A", "B"], &code, false).expect("host");
-    host.fire("A", "sim_demo").unwrap();
-    host.pump().unwrap();
+    // Renders go to #app. After two adds the first item's onclick is
+    // handler 4 (render 1 mints button=1, milk=2; render 2 mints button=3,
+    // milk=4, compiler=5).
+    host.fire_handler("A", 4);
+    host.pump();
+    host.assert_quiescent();
 
-    // Renders go to #app (form button + one <li> per item). After two adds
-    // the first item's onclick is handler 4 (button=3, milk=4, compiler=5).
-    host.fire_with("A", "__handler_fire", 4).unwrap();
-    host.pump().unwrap();
-    host.assert_quiescent().unwrap();
-
-    let all = host.log().join("\n");
     for tab in ["A", "B"] {
-        let prefix = format!("[browser {tab}] [dom] #app :=");
-        assert!(all.contains(&prefix), "tab {tab} missing #app render:\n{all}");
-        assert!(
-            all.contains("class=\"done\"") && all.contains("buy milk"),
-            "tab {tab} missing struck-through milk:\n{all}"
-        );
-        assert!(
-            all.contains("write the compiler"),
-            "tab {tab} missing second item:\n{all}"
-        );
+        let app = host.dom(tab, "#app");
+        assert!(app.contains("buy milk"), "tab {tab}: {app}");
+        assert!(app.contains("write the compiler"), "tab {tab}: {app}");
+        assert!(app.contains("class=\"done\""), "tab {tab} missing struck-through milk: {app}");
+        assert!(app.contains("1 done of 2"), "tab {tab} stats: {app}");
     }
 }
 
 #[test]
 fn lambda_with_marks_ships_only_its_captures() {
-    let src = include_str!("../hop/todo.hop");
-    let lua = compiler::compile(src).expect("hopc compile");
-    // the onclick lambda hops to the server carrying only the loop index it
+    // the onclick lambda hops to the server carrying only the id it
     // captured — not item, rows, or the items array
-    assert!(lua.contains(r#"return rt.at("server", "todo_view:l1:1", { id = id })"#), "{lua}");
-    // its server segment is registered like any other, and the cast inside
-    // it carries the snapshot
-    assert!(lua.contains(r#"rt.register("todo_view:l1:1""#), "{lua}");
-    assert!(
-        lua.contains(r#"rt.cast("browsers", "todo_view:c1", { completed = completed, created = created, snapshot = snapshot })"#),
-        "{lua}"
-    );
+    let src = include_str!("../hop/todo.hop");
+    let mut host = Cluster::new(&["A"], src, false).expect("cluster");
+    host.fire("A", "sim_demo");
+    host.pump();
+    host.fire_handler("A", 4);
+    host.pump();
+    host.assert_quiescent();
+
+    let all = host.log().join("\n");
+    assert!(all.contains("todo_view:l1:1 vars={id: 0}"), "{all}");
+    // its cast carries the snapshot back out
+    assert!(all.contains("todo_view:c1 vars={completed: 1, created: 2, snapshot:"), "{all}");
 }
 
 #[test]
-fn hopc_emits_pairs_when_asked() {
-    let lua = compiler::compile("fn f(t) { for k, v in pairs t { print(k); } }").expect("pairs");
-    assert!(lua.contains("for k, v in pairs(t) do"), "{lua}");
-    let lua = compiler::compile("fn f(t) { for i, v in t { print(v); } }").expect("ipairs");
-    assert!(lua.contains("for i, v in ipairs(t) do"), "{lua}");
+fn map_iteration_is_deterministic_key_order() {
+    let src = r#"
+        fn go() {
+          let m = { b = 2, a = 1, c = 3 };
+          for k, v in m {
+            print(k .. "=" .. v);
+          }
+        }
+    "#;
+    let mut host = Cluster::new(&["A"], src, false).expect("cluster");
+    host.fire("A", "go");
+    host.pump();
+    let all = host.log().join("\n");
+    let a = all.find("a=1").expect("a=1");
+    let b = all.find("b=2").expect("b=2");
+    let c = all.find("c=3").expect("c=3");
+    assert!(a < b && b < c, "map iteration out of key order:\n{all}");
+}
+
+#[test]
+fn arrays_are_zero_based() {
+    let src = r#"
+        fn go() {
+          let xs = ["first", "second"];
+          print(xs[0] .. "/" .. tostring(xs[2]));
+          for i, x in xs {
+            print(i .. ":" .. x);
+          }
+        }
+    "#;
+    let mut host = Cluster::new(&["A"], src, false).expect("cluster");
+    host.fire("A", "go");
+    host.pump();
+    let all = host.log().join("\n");
+    assert!(all.contains("first/nil"), "{all}");
+    assert!(all.contains("0:first"), "{all}");
+    assert!(all.contains("1:second"), "{all}");
 }
 
 #[test]
 fn marks_rejected_inside_branches() {
     let src = "fn f(x) { if x { server!(); } }";
-    let err = compiler::compile(src).unwrap_err();
+    let err = match hoprt::compiler::compile(src) {
+        Err(e) => e,
+        Ok(_) => panic!("nested mark compiled"),
+    };
     assert!(err.contains("top level"), "{err}");
 }

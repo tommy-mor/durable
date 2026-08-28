@@ -1,18 +1,19 @@
-//! hopd's server: real sockets around the same runtime.
+//! hopd's server: real sockets around the same runtime. The wire is CBOR
+//! binary; readable packet dumps come from log mode (`--log`), rendered in
+//! diagnostic notation by the value model.
 //!
-//! Three threads plus one VM:
-//! - a tiny_http thread serving the static pieces (index.html, glue.js,
-//!   hoprt.lua, and the hopc-compiled app.lua),
+//! Threads:
+//! - a tiny_http thread (a placeholder page until the hop-web wasm browser
+//!   backend lands — fake-browser clients speak the ws protocol today),
 //! - a WebSocket accept thread assigning session ids,
-//! - one connection thread per tab (50ms read timeout so one thread can
+//! - one connection thread per client (50ms read timeout so one thread can
 //!   both read the socket and drain its outbound queue),
-//! - and the main thread owning the server Luau VM and all routing.
+//! - and the main thread owning the server VM and all routing.
 //!
 //! Identity rides the connection: whatever a client claims, `origin` and
 //! `reply_to` are overwritten with the session id of the socket the packet
 //! arrived on.
 
-use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
@@ -21,19 +22,25 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-use crate::store;
-
-use mlua::{Function, Lua, LuaSerdeExt, Value as LuaValue};
 use tungstenite::Message;
 
-const INDEX_HTML: &str = include_str!("../web/index.html");
-const GLUE_JS: &str = include_str!("../web/glue.js");
-const HOPRT_LUA: &str = include_str!("../lua/hoprt.lua");
-const HUI_LUA: &str = include_str!("../lua/hui.lua");
+use crate::ir::Program;
+use crate::rt::{Platform, SideId, Vm};
+use crate::store::{self, StoreBinding};
+use crate::value::{decode, encode, NativeId, Value};
+
+const INDEX_HTML: &str = "<!doctype html><meta charset=utf-8><title>hop</title>\
+<body style=\"font-family:system-ui;max-width:40em;margin:4em auto\">\
+<h1>hopd</h1><p>The server VM is running and speaking CBOR over the\
+ WebSocket port. The browser backend (hop-web, the wasm build of the Hop\
+ interpreter) is the next phase of the native rewrite; until it lands,\
+ clients are programs that speak the packet protocol.</p>";
 
 enum Ev {
-    Conn(String, mpsc::Sender<String>),
-    Pkt(String, serde_json::Value),
+    Conn(String, mpsc::Sender<Vec<u8>>),
+    /// Raw frame bytes — Values are Rc-based and thread-local, so decoding
+    /// happens on the VM thread.
+    Pkt(String, Vec<u8>),
     Gone(String),
 }
 
@@ -45,17 +52,13 @@ fn session_name(n: usize) -> String {
     }
 }
 
-fn http_thread(port: u16, ws_port: u16, app_code: String) {
+fn http_thread(port: u16, ws_port: u16) {
     let server = tiny_http::Server::http(("0.0.0.0", port)).expect("bind http");
     let config = format!(r#"{{"wsPort":{ws_port}}}"#);
     for req in server.incoming_requests() {
         let (content, ctype) = match req.url() {
             "/" | "/index.html" => (INDEX_HTML.to_string(), "text/html; charset=utf-8"),
-            "/glue.js" => (GLUE_JS.to_string(), "application/javascript"),
             "/config.json" => (config.clone(), "application/json"),
-            "/hoprt.lua" => (HOPRT_LUA.to_string(), "text/plain; charset=utf-8"),
-            "/hui.lua" => (HUI_LUA.to_string(), "text/plain; charset=utf-8"),
-            "/app.lua" => (app_code.clone(), "text/plain; charset=utf-8"),
             _ => {
                 let _ = req.respond(tiny_http::Response::empty(404));
                 continue;
@@ -90,22 +93,20 @@ fn conn_thread(stream: TcpStream, sid: String, tx: mpsc::Sender<Ev>) {
         .set_read_timeout(Some(Duration::from_millis(50)))
         .ok();
 
-    let (out_tx, out_rx) = mpsc::channel::<String>();
+    let (out_tx, out_rx) = mpsc::channel::<Vec<u8>>();
     if tx.send(Ev::Conn(sid.clone(), out_tx)).is_err() {
         return;
     }
     loop {
-        while let Ok(msg) = out_rx.try_recv() {
-            if ws.send(Message::Text(msg.into())).is_err() {
+        while let Ok(bytes) = out_rx.try_recv() {
+            if ws.send(Message::Binary(bytes.into())).is_err() {
                 let _ = tx.send(Ev::Gone(sid));
                 return;
             }
         }
         match ws.read() {
-            Ok(Message::Text(t)) => {
-                if let Ok(json) = serde_json::from_str::<serde_json::Value>(t.as_str()) {
-                    let _ = tx.send(Ev::Pkt(sid.clone(), json));
-                }
+            Ok(Message::Binary(b)) => {
+                let _ = tx.send(Ev::Pkt(sid.clone(), b.to_vec()));
             }
             Ok(Message::Close(_)) => {
                 let _ = tx.send(Ev::Gone(sid));
@@ -125,37 +126,73 @@ fn conn_thread(stream: TcpStream, sid: String, tx: mpsc::Sender<Ev>) {
     }
 }
 
-fn route(sessions: &HashMap<String, mpsc::Sender<String>>, pkt: &serde_json::Value) {
-    let text = pkt.to_string();
-    match pkt["to"].as_str() {
+fn route(sessions: &HashMap<String, mpsc::Sender<Vec<u8>>>, pkt: &Value) {
+    let Ok(bytes) = encode(pkt) else {
+        eprintln!("[hopd] unencodable packet: {pkt}");
+        return;
+    };
+    let to = pkt.get_field("to");
+    match to.as_str() {
         Some("browsers") => {
             for out in sessions.values() {
-                let _ = out.send(text.clone());
+                let _ = out.send(bytes.clone());
             }
         }
         Some(addr) => {
             if let Some(out) = sessions.get(addr) {
-                let _ = out.send(text);
+                let _ = out.send(bytes);
             }
             // a vanished session is a dropped packet: at-most-once, by design
         }
-        None => eprintln!("[hopd] packet without target: {text}"),
+        None => eprintln!("[hopd] packet without target: {pkt}"),
     }
 }
 
-/// Run the hop server forever: compile-side callers pass the already
-/// compiled Lua chunk for the app. `data_dir` holds the JSONL log and
-/// RocksDB projection when the app declares `schema` + `reduce`.
+/// The server VM's platform: packets queue for routing; prints go to
+/// stdout; there is no DOM on this side.
+struct ServePlatform<'a> {
+    outbox: &'a mut VecDeque<Value>,
+    store: Option<&'a mut StoreBinding>,
+}
+
+impl Platform for ServePlatform<'_> {
+    fn send(&mut self, pkt: Value) {
+        self.outbox.push_back(pkt);
+    }
+
+    fn print(&mut self, line: String) {
+        println!("{line}");
+    }
+
+    fn dom_get(&mut self, _sel: &str) -> String {
+        String::new()
+    }
+
+    fn dom_set(&mut self, _sel: &str, _html: &str) {}
+
+    fn dom_clear(&mut self, _sel: &str) {}
+
+    fn store_native(
+        &mut self,
+        id: NativeId,
+        args: Vec<Value>,
+        _prog: &Rc<Program>,
+    ) -> Option<Result<Value, String>> {
+        self.store.as_mut().map(|b| b.native(id, args))
+    }
+}
+
+/// Run the hop server forever. `data_dir` holds the JSONL log and RocksDB
+/// projection when the app declares `schema` + `reduce`. `log_packets`
+/// dumps every packet in diagnostic notation.
 pub fn serve(
-    app_code: String,
+    prog: Rc<Program>,
     http_port: u16,
     ws_port: u16,
     data_dir: impl AsRef<Path>,
-) -> mlua::Result<()> {
-    {
-        let app = app_code.clone();
-        thread::spawn(move || http_thread(http_port, ws_port, app));
-    }
+    log_packets: bool,
+) -> Result<(), String> {
+    thread::spawn(move || http_thread(http_port, ws_port));
     let (tx, rx) = mpsc::channel::<Ev>();
     {
         let tx = tx.clone();
@@ -163,66 +200,64 @@ pub fn serve(
     }
 
     // the server VM lives on this thread
-    let lua = Lua::new();
-    lua.globals().set("SIDE", "server")?;
-    let outbox: Rc<RefCell<VecDeque<serde_json::Value>>> = Rc::new(RefCell::new(VecDeque::new()));
-    let ob = outbox.clone();
-    let send = lua.create_function(move |lua, pkt: LuaValue| {
-        let json: serde_json::Value = lua.from_value(pkt)?;
-        ob.borrow_mut().push_back(json);
-        Ok(())
-    })?;
-    lua.globals().set("__send", send)?;
-    let print_fn = lua.create_function(|_, msg: String| {
-        println!("{msg}");
-        Ok(())
-    })?;
-    lua.globals().set("__print", print_fn)?;
-    lua.load(HOPRT_LUA).set_name("hoprt.lua").exec()?;
-    lua.load(HUI_LUA).set_name("hui.lua").exec()?;
-    store::install_constructors(&lua)?;
-    lua.load(&app_code).set_name("app.lua").exec()?;
-    let bound = store::bind(&lua, data_dir.as_ref())?;
-    if bound {
+    let mut outbox: VecDeque<Value> = VecDeque::new();
+    let mut vm = {
+        let mut platform = ServePlatform { outbox: &mut outbox, store: None };
+        Vm::new(prog, SideId::Server, &mut platform)?
+    };
+    let mut binding = store::bind(&vm, data_dir.as_ref())?;
+    if binding.is_some() {
         println!(
             "[hopd] durable store at {}  (log.jsonl + proj/)",
             data_dir.as_ref().display()
         );
     }
 
-    let mut sessions: HashMap<String, mpsc::Sender<String>> = HashMap::new();
-    println!("[hopd] serving http://localhost:{http_port}  (ws on :{ws_port})");
+    let mut sessions: HashMap<String, mpsc::Sender<Vec<u8>>> = HashMap::new();
+    println!("[hopd] serving http://localhost:{http_port}  (ws on :{ws_port}, CBOR binary)");
 
     for ev in rx {
         match ev {
             Ev::Conn(sid, out) => {
-                let _ = out.send(format!(r#"{{"kind":"hello","session":"{sid}"}}"#));
+                let hello = Value::map(
+                    [
+                        (Value::str("kind"), Value::str("hello")),
+                        (Value::str("session"), Value::str(sid.as_str())),
+                    ]
+                    .into_iter()
+                    .collect(),
+                );
+                let _ = out.send(encode(&hello).expect("hello encodes"));
                 sessions.insert(sid.clone(), out);
                 println!("[hopd] session {sid} connected");
-                if let Err(e) = lua
-                    .load(format!("__session_connect(\"{sid}\")"))
-                    .set_name("session-connect")
-                    .exec()
-                {
-                    eprintln!("[hopd] on_connect error: {e}");
-                }
+                let mut platform = ServePlatform { outbox: &mut outbox, store: binding.as_mut() };
+                vm.session_connect(&mut platform, &sid);
             }
-            Ev::Pkt(sid, mut pkt) => {
-                let kind = pkt["kind"].as_str().unwrap_or("").to_string();
+            Ev::Pkt(sid, bytes) => {
+                let pkt = match decode(&bytes) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("[hopd] undecodable packet from {sid}: {e}");
+                        continue;
+                    }
+                };
+                let kind = pkt.get_field("kind");
+                let kind = kind.as_str().unwrap_or("");
                 if kind == "call" || kind == "cast" {
                     // never trust a claimed identity
-                    pkt["origin"] = serde_json::Value::String(sid.clone());
-                    pkt["reply_to"] = serde_json::Value::String(sid.clone());
+                    let _ = pkt.set_field("origin", Value::str(sid.as_str()));
+                    let _ = pkt.set_field("reply_to", Value::str(sid.as_str()));
                 }
-                println!(
-                    "        ~ wire {sid:>7} -> server   {kind:<5} {}",
-                    pkt["hop"].as_str().unwrap_or("·")
-                );
-                let v = store::to_lua(&lua, &pkt)?;
-                let f: Function = lua.globals().get("__receive")?;
-                if let Err(e) = f.call::<()>(v) {
-                    eprintln!("[hopd] receive error: {e}");
+                if log_packets {
+                    println!("        ~ wire {sid:>7} -> server   {pkt}");
+                } else {
+                    println!(
+                        "        ~ wire {sid:>7} -> server   {kind:<5} {}",
+                        crate::value::coerce_str(&pkt.get_field("hop"))
+                    );
                 }
+                let mut platform = ServePlatform { outbox: &mut outbox, store: binding.as_mut() };
+                vm.receive(&mut platform, pkt);
             }
             Ev::Gone(sid) => {
                 sessions.remove(&sid);
@@ -230,15 +265,17 @@ pub fn serve(
             }
         }
         // drain everything the VM emitted in response
-        loop {
-            let pkt = outbox.borrow_mut().pop_front();
-            let Some(pkt) = pkt else { break };
-            println!(
-                "        ~ wire  server -> {:<8} {:<5} {}",
-                pkt["to"].as_str().unwrap_or("?"),
-                pkt["kind"].as_str().unwrap_or("?"),
-                pkt["hop"].as_str().unwrap_or("·")
-            );
+        while let Some(pkt) = outbox.pop_front() {
+            if log_packets {
+                println!("        ~ wire  server -> {pkt}");
+            } else {
+                println!(
+                    "        ~ wire  server -> {:<8} {:<5} {}",
+                    crate::value::coerce_str(&pkt.get_field("to")),
+                    crate::value::coerce_str(&pkt.get_field("kind")),
+                    crate::value::coerce_str(&pkt.get_field("hop")),
+                );
+            }
             route(&sessions, &pkt);
         }
     }

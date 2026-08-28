@@ -1,20 +1,23 @@
-//! hopd — serve a .hop application to real browsers.
+//! hopd — serve a .hop application over CBOR-binary WebSockets.
 //!
-//! Usage: hopd <app.hop> [http_port] [ws_port] [--data <dir>]
+//! Usage: hopd <app.hop> [http_port] [ws_port] [--data <dir>] [--log]
 //!
-//! Compiles the app with hopc, serves the page + Lua to browsers over HTTP,
-//! runs the server VM, and routes hop packets over WebSockets. If the app
-//! declares `schema` and `fn reduce`, the server VM opens a durable store
-//! (JSONL log + RocksDB projection) at `--data` (default `./hop-data`).
+//! Compiles the app with hopc, runs the server VM, and routes hop packets
+//! over WebSockets. If the app declares `schema` and `fn reduce`, the
+//! server VM opens a durable store (JSONL log + RocksDB projection) at
+//! `--data` (default `./hop-data`). `--log` dumps every packet in
+//! diagnostic notation.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::rc::Rc;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut input = None;
     let mut ports: Vec<u16> = Vec::new();
     let mut data_dir = PathBuf::from("hop-data");
+    let mut log_packets = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -28,6 +31,7 @@ fn main() -> ExitCode {
                     }
                 }
             }
+            "--log" => log_packets = true,
             a if a.starts_with('-') => {
                 eprintln!("hopd: unknown flag {a}");
                 return ExitCode::FAILURE;
@@ -44,7 +48,7 @@ fn main() -> ExitCode {
         i += 1;
     }
     let Some(path) = input else {
-        eprintln!("usage: hopd <app.hop> [http_port] [ws_port] [--data <dir>]");
+        eprintln!("usage: hopd <app.hop> [http_port] [ws_port] [--data <dir>] [--log]");
         return ExitCode::FAILURE;
     };
     let http_port = ports.first().copied().unwrap_or(9000);
@@ -57,16 +61,20 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let lua = match hoprt::compiler::compile(&src) {
-        Ok(l) => l,
+    let prog = match hoprt::compiler::compile(&src) {
+        Ok(p) => p,
         Err(e) => {
             eprintln!("hopd: {path}: {e}");
             return ExitCode::FAILURE;
         }
     };
-    println!("[hopd] compiled {path} ({} lines of Lua)", lua.lines().count());
+    println!(
+        "[hopd] compiled {path} ({} functions, {} hops)",
+        prog.fns.len(),
+        prog.hops.len()
+    );
 
-    match hoprt::serve::serve(lua, http_port, ws_port, data_dir) {
+    match hoprt::serve::serve(Rc::new(prog), http_port, ws_port, data_dir, log_packets) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("hopd: {e}");

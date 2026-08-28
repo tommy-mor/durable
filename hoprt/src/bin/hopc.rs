@@ -1,6 +1,6 @@
-//! hopc — compile .hop source to Lua for the hoprt runtime.
+//! hopc — compile .hop source to Hop IR and print the listing.
 //!
-//! Usage: hopc <input.hop> [-o <output.lua>]   (default: stdout)
+//! Usage: hopc <input.hop> [-o <output.txt>]   (default: stdout)
 
 use std::process::ExitCode;
 
@@ -20,7 +20,7 @@ fn main() -> ExitCode {
         i += 1;
     }
     let Some(input) = input else {
-        eprintln!("usage: hopc <input.hop> [-o <output.lua>]");
+        eprintln!("usage: hopc <input.hop> [-o <output.txt>]");
         return ExitCode::FAILURE;
     };
 
@@ -31,21 +31,22 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let lua = match hoprt::compiler::compile(&src) {
-        Ok(l) => l,
+    let prog = match hoprt::compiler::compile(&src) {
+        Ok(p) => p,
         Err(e) => {
             eprintln!("hopc: {input}: {e}");
             return ExitCode::FAILURE;
         }
     };
+    let listing = prog.listing();
     match output {
         Some(path) => {
-            if let Err(e) = std::fs::write(&path, lua) {
+            if let Err(e) = std::fs::write(&path, listing) {
                 eprintln!("hopc: write {path}: {e}");
                 return ExitCode::FAILURE;
             }
         }
-        None => print!("{lua}"),
+        None => print!("{listing}"),
     }
     ExitCode::SUCCESS
 }

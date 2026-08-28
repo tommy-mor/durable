@@ -1,4 +1,4 @@
-//! hopc v0 — compiles `.hop` source to Lua targeting the hoprt runtime.
+//! hopc — compiles `.hop` source to Hop IR (see ir.rs, docs/hop-ir.md).
 //!
 //! The v0 language is the smallest thing that exercises every runtime
 //! semantic:
@@ -13,7 +13,7 @@
 //!        | "spawn" call ";"                        start a flow (an "event")
 //!        | "return" expr? ";"
 //!        | "if" expr block ("else" (block|if))?
-//!        | "for" k "," v "in" ["pairs"] expr block ipairs, or pairs if marked
+//!        | "for" k "," v "in" expr block           k = index (0-based) / key
 //!        | lvalue "=" expr ";"                     assignment
 //!        | expr ";"
 //! expr  := ... | ":name"                           keyword → string literal
@@ -22,25 +22,26 @@
 //!
 //! Compilation of a marked function: the body splits into segments at the
 //! marks; segment 0 becomes the origin function; each later segment is
-//! registered under a stable hop id (`name:i`) and chained via
-//! `rt.at(target, "name:i", { live vars })`. What crosses each hop is
-//! computed here, statically: the variables referenced by the remainder
+//! compiled as a separate IR function registered under a stable hop id
+//! (`name:i`) and chained via the `At` instruction. What crosses each hop
+//! is computed here, statically: the variables referenced by the remainder
 //! that are in scope before the mark. Cast bodies compile the same way
 //! under `name:cN` ids with their own captured-vars set.
 //!
-//! Lambdas may contain marks. A lambda's segment 0 is emitted inline as a
-//! real Lua closure, so whatever it captures (loop variables, locals) is
-//! captured by Lua's own lexical scoping on the VM where the lambda was
-//! built — closures never cross the wire. Only the marked remainder ships,
-//! as usual, under `enclosing:lN:i` hop ids. This is what makes hiccup
+//! Lambdas may contain marks. A lambda's segment 0 becomes a closure whose
+//! captures are copied from the enclosing frame at the `Closure`
+//! instruction — closures never cross the wire. Only the marked remainder
+//! ships, under `enclosing:lN:i` hop ids. This is what makes hiccup
 //! attributes like `onclick = fn(e) { server!(); ... }` work.
 //!
 //! v0 restrictions (deliberate): marks only at the top level of a function
 //! or lambda body; flows originate on the browser; no while loops; no
 //! try/catch (errors still propagate — they surface at the flow origin).
 
-use std::collections::BTreeSet;
-use std::fmt::Write as _;
+use std::collections::{BTreeSet, HashMap};
+
+use crate::ir::{BinOp, Function, Instr, Program, UnOp};
+use crate::value::Value;
 
 // ---------------------------------------------------------------------------
 // Lexer
@@ -216,8 +217,9 @@ enum Stmt {
     Assign(Expr, Expr),
     Return(Option<Expr>),
     If(Expr, Vec<Stmt>, Option<Vec<Stmt>>),
-    /// `for k, v in expr { ... }` — ipairs. `for k, v in pairs expr` — pairs.
-    For(String, String, Expr, Vec<Stmt>, bool),
+    /// `for k, v in expr { ... }` — arrays yield (0-based index, element),
+    /// maps yield (key, value) in key order.
+    For(String, String, Expr, Vec<Stmt>),
     Mark(Side),
     Cast(CastTarget, Vec<Stmt>),
     Spawn(Expr),
@@ -369,15 +371,9 @@ impl Parser {
             self.expect(Tok::Comma)?;
             let v = self.ident()?;
             self.eat_kw("in")?;
-            let pairs = if self.at_kw("pairs") {
-                self.pos += 1;
-                true
-            } else {
-                false
-            };
             let e = self.expr()?;
             let body = self.block()?;
-            return Ok(Stmt::For(k, v, e, body, pairs));
+            return Ok(Stmt::For(k, v, e, body));
         }
         if self.at_kw("cast") {
             self.eat_kw("cast")?;
@@ -471,7 +467,7 @@ impl Parser {
         let lhs = self.concat_expr()?;
         let op = match self.peek() {
             Some(Tok::Eq) => "==",
-            Some(Tok::Ne) => "~=",
+            Some(Tok::Ne) => "!=",
             Some(Tok::Lt) => "<",
             Some(Tok::Gt) => ">",
             Some(Tok::Le) => "<=",
@@ -593,7 +589,7 @@ impl Parser {
                 Ok(e)
             }
             Tok::LBrace => {
-                // table literal: { name = expr, ... }
+                // map literal: { name = expr, ... }
                 let mut fields = Vec::new();
                 while !matches!(self.peek(), Some(Tok::RBrace)) {
                     let name = self.ident()?;
@@ -681,7 +677,7 @@ fn refs_stmts(ss: &[Stmt], out: &mut BTreeSet<String>) {
                     refs_stmts(e, out);
                 }
             }
-            Stmt::For(_, _, e, body, _) => {
+            Stmt::For(_, _, e, body) => {
                 refs_expr(e, out);
                 refs_stmts(body, out);
             }
@@ -727,7 +723,7 @@ fn check_no_nested_marks(ss: &[Stmt]) -> Result<(), String> {
                     reject(e, "branches; marks must be at the top level of a function body")?;
                 }
             }
-            Stmt::For(_, _, _, body, _) => {
+            Stmt::For(_, _, _, body) => {
                 reject(body, "loop bodies; marks must be at the top level of a function body")?
             }
             Stmt::Cast(_, body) => reject(body, "cast bodies")?,
@@ -735,36 +731,6 @@ fn check_no_nested_marks(ss: &[Stmt]) -> Result<(), String> {
         }
     }
     Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Codegen
-// ---------------------------------------------------------------------------
-
-struct Gen {
-    /// rt.register(...) blocks, emitted after all function definitions.
-    regs: Vec<String>,
-    /// per-function counters for stable `name:cN` / `name:lN` hop ids
-    cast_n: u32,
-    lambda_n: u32,
-    fn_name: String,
-}
-
-fn lua_str(s: &str) -> String {
-    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n"))
-}
-
-fn vars_table(names: &BTreeSet<String>) -> String {
-    let fields: Vec<String> = names.iter().map(|n| format!("{n} = {n}")).collect();
-    format!("{{ {} }}", fields.join(", "))
-}
-
-fn hop_target(side: Side) -> &'static str {
-    match side {
-        Side::Server => "\"server\"",
-        // browser!() returns to the flow's origin session
-        Side::Browser => "rt.session()",
-    }
 }
 
 /// Split a flow body at its top-level marks.
@@ -784,286 +750,599 @@ fn split_segments(body: &[Stmt], name: &str) -> Result<Vec<(Side, Vec<Stmt>)>, S
     Ok(segs)
 }
 
-impl Gen {
-    fn emit_expr(&mut self, e: &Expr, scope: &[String]) -> Result<String, String> {
-        Ok(match e {
-            Expr::Num(n) => n.clone(),
-            Expr::Str(s) => lua_str(s),
-            Expr::Bool(true) => "true".into(),
-            Expr::Bool(false) => "false".into(),
-            Expr::Nil => "nil".into(),
-            Expr::Ident(n) => n.clone(),
-            Expr::Field(b, f) => format!("{}.{}", self.emit_expr(b, scope)?, f),
-            Expr::Index(a, b) => {
-                format!("{}[{}]", self.emit_expr(a, scope)?, self.emit_expr(b, scope)?)
-            }
-            Expr::Call(f, args) => {
-                // session() is the runtime's identity primitive
-                if matches!(f.as_ref(), Expr::Ident(n) if n == "session") && args.is_empty() {
-                    return Ok("rt.session()".into());
-                }
-                let mut parts = Vec::new();
-                for a in args {
-                    parts.push(self.emit_expr(a, scope)?);
-                }
-                format!("{}({})", self.emit_expr(f, scope)?, parts.join(", "))
-            }
-            Expr::Unary(op, a) => {
-                if *op == "not" {
-                    format!("not ({})", self.emit_expr(a, scope)?)
-                } else {
-                    format!("{}({})", op, self.emit_expr(a, scope)?)
-                }
-            }
-            Expr::Binary(op, a, b) => format!(
-                "({} {} {})",
-                self.emit_expr(a, scope)?,
-                op,
-                self.emit_expr(b, scope)?
-            ),
-            Expr::Table(fs) => {
-                let mut parts = Vec::new();
-                for (k, v) in fs {
-                    parts.push(format!("{} = {}", k, self.emit_expr(v, scope)?));
-                }
-                format!("{{ {} }}", parts.join(", "))
-            }
-            Expr::Array(items) => {
-                let mut parts = Vec::new();
-                for v in items {
-                    parts.push(self.emit_expr(v, scope)?);
-                }
-                format!("{{ {} }}", parts.join(", "))
-            }
-            Expr::Fn(params, body) => self.lambda(params, body, scope)?,
-        })
+// ---------------------------------------------------------------------------
+// Codegen: AST → IR
+// ---------------------------------------------------------------------------
+
+#[derive(PartialEq, Eq, Hash)]
+enum CKey {
+    Str(String),
+    Int(i64),
+    FloatBits(u64),
+}
+
+#[derive(Default)]
+struct Cg {
+    consts: Vec<Value>,
+    const_ix: HashMap<CKey, u32>,
+    fns: Vec<Function>,
+    hops: HashMap<String, usize>,
+    named: HashMap<String, usize>,
+    server_lets: Vec<(String, usize)>,
+}
+
+impl Cg {
+    fn k_str(&mut self, s: &str) -> u32 {
+        let key = CKey::Str(s.to_string());
+        if let Some(&i) = self.const_ix.get(&key) {
+            return i;
+        }
+        let i = self.consts.len() as u32;
+        self.consts.push(Value::str(s));
+        self.const_ix.insert(key, i);
+        i
     }
 
-    /// A lambda's segment 0 is a real Lua closure — captures are lexical,
-    /// on the VM where the lambda was built. The marked remainder ships
-    /// under `enclosing:lN:i` hop ids like any other segments.
-    fn lambda(&mut self, params: &[String], body: &[Stmt], scope: &[String]) -> Result<String, String> {
-        self.lambda_n += 1;
-        let prefix = format!("{}:l{}", self.fn_name, self.lambda_n);
-        let mut base: Vec<String> = scope.to_vec();
-        base.extend(params.iter().cloned());
-        let inner = self.flow_body(&prefix, body, &base)?;
-        Ok(format!("function({})\n{}  end", params.join(", "), inner))
+    fn k_int(&mut self, n: i64) -> u32 {
+        let key = CKey::Int(n);
+        if let Some(&i) = self.const_ix.get(&key) {
+            return i;
+        }
+        let i = self.consts.len() as u32;
+        self.consts.push(Value::Int(n));
+        self.const_ix.insert(key, i);
+        i
     }
 
-    /// Emit a flow body (used by named fns and lambdas): segment 0's code,
-    /// with the chain to segment 1 if marks are present. Registers later
-    /// segments under `{prefix}:{i}`.
-    fn flow_body(&mut self, prefix: &str, body: &[Stmt], base_scope: &[String]) -> Result<String, String> {
-        check_no_nested_marks(body)?;
-        let segs = split_segments(body, prefix)?;
-        let n = segs.len();
-
-        if n == 1 {
-            let mut out = String::new();
-            let mut scope = base_scope.to_vec();
-            self.stmts(&segs[0].1, &mut scope, 1, &mut out)?;
-            return Ok(out);
+    fn k_float(&mut self, f: f64) -> u32 {
+        let key = CKey::FloatBits(f.to_bits());
+        if let Some(&i) = self.const_ix.get(&key) {
+            return i;
         }
-
-        // ship set for each hop i (into segment i):
-        //   refs(segments i..end) ∩ scope at the end of segment i-1
-        let mut ship: Vec<BTreeSet<String>> = vec![BTreeSet::new(); n];
-        let mut scope_end: Vec<Vec<String>> = vec![Vec::new(); n];
-        scope_end[0] = base_scope.to_vec();
-        scope_end[0].extend(toplevel_lets(&segs[0].1));
-        for i in 1..n {
-            let mut refs = BTreeSet::new();
-            for (_, seg) in &segs[i..] {
-                refs_stmts(seg, &mut refs);
-            }
-            ship[i] = refs.into_iter().filter(|r| scope_end[i - 1].contains(r)).collect();
-            scope_end[i] = ship[i].iter().cloned().collect();
-            scope_end[i].extend(toplevel_lets(&segs[i].1));
-        }
-
-        // segment 0 plus the chain into segment 1
-        let mut out = String::new();
-        let mut scope = base_scope.to_vec();
-        self.stmts(&segs[0].1, &mut scope, 1, &mut out)?;
-        let _ = writeln!(
-            out,
-            "  return rt.at({}, {}, {})",
-            hop_target(segs[1].0),
-            lua_str(&format!("{prefix}:1")),
-            vars_table(&ship[1])
-        );
-
-        // registered segments 1..n-1
-        for i in 1..n {
-            let mut reg = String::new();
-            let _ = writeln!(reg, "rt.register({}, function(__vars)", lua_str(&format!("{prefix}:{i}")));
-            for v in &ship[i] {
-                let _ = writeln!(reg, "  local {v} = __vars.{v}");
-            }
-            let mut seg_scope: Vec<String> = ship[i].iter().cloned().collect();
-            self.stmts(&segs[i].1, &mut seg_scope, 1, &mut reg)?;
-            if i + 1 < n {
-                let _ = writeln!(
-                    reg,
-                    "  return rt.at({}, {}, {})",
-                    hop_target(segs[i + 1].0),
-                    lua_str(&format!("{prefix}:{}", i + 1)),
-                    vars_table(&ship[i + 1])
-                );
-            }
-            let _ = writeln!(reg, "end)");
-            self.regs.push(reg);
-        }
-
-        Ok(out)
+        let i = self.consts.len() as u32;
+        self.consts.push(Value::Float(f));
+        self.const_ix.insert(key, i);
+        i
     }
 
-    /// Emit statements at `indent`, tracking `scope` (in-scope locals) so
-    /// cast sites and lambdas know what is capturable.
-    fn stmts(&mut self, ss: &[Stmt], scope: &mut Vec<String>, indent: usize, out: &mut String) -> Result<(), String> {
-        let pad = "  ".repeat(indent);
-        for s in ss {
-            match s {
-                Stmt::Let(n, e) => {
-                    let rhs = self.emit_expr(e, scope)?;
-                    let _ = writeln!(out, "{pad}local {n} = {rhs}");
-                    scope.push(n.clone());
-                }
-                Stmt::Assign(l, r) => {
-                    let lhs = self.emit_expr(l, scope)?;
-                    let rhs = self.emit_expr(r, scope)?;
-                    let _ = writeln!(out, "{pad}{lhs} = {rhs}");
-                }
-                Stmt::Return(Some(e)) => {
-                    let v = self.emit_expr(e, scope)?;
-                    let _ = writeln!(out, "{pad}return {v}");
-                }
-                Stmt::Return(None) => {
-                    let _ = writeln!(out, "{pad}return");
-                }
-                Stmt::If(c, t, e) => {
-                    let cond = self.emit_expr(c, scope)?;
-                    let _ = writeln!(out, "{pad}if {cond} then");
-                    let mut inner = scope.clone();
-                    self.stmts(t, &mut inner, indent + 1, out)?;
-                    if let Some(e) = e {
-                        let _ = writeln!(out, "{pad}else");
-                        let mut inner = scope.clone();
-                        self.stmts(e, &mut inner, indent + 1, out)?;
-                    }
-                    let _ = writeln!(out, "{pad}end");
-                }
-                Stmt::For(k, v, e, body, pairs) => {
-                    let it = self.emit_expr(e, scope)?;
-                    let iter = if *pairs { "pairs" } else { "ipairs" };
-                    let _ = writeln!(out, "{pad}for {k}, {v} in {iter}({it}) do");
-                    let mut inner = scope.clone();
-                    inner.push(k.clone());
-                    inner.push(v.clone());
-                    self.stmts(body, &mut inner, indent + 1, out)?;
-                    let _ = writeln!(out, "{pad}end");
-                }
-                Stmt::Mark(_) => {
-                    unreachable!("marks are split before emission; nested marks are rejected")
-                }
-                Stmt::Cast(target, body) => {
-                    self.cast_n += 1;
-                    let id = format!("{}:c{}", self.fn_name, self.cast_n);
-                    // captured = referenced by body ∩ in scope here
-                    let mut refs = BTreeSet::new();
-                    refs_stmts(body, &mut refs);
-                    let captured: BTreeSet<String> =
-                        refs.into_iter().filter(|n| scope.contains(n)).collect();
-                    // register the body as a segment
-                    let mut reg = String::new();
-                    let _ = writeln!(reg, "rt.register({}, function(__vars)", lua_str(&id));
-                    let mut body_scope: Vec<String> = captured.iter().cloned().collect();
-                    for n in &captured {
-                        let _ = writeln!(reg, "  local {n} = __vars.{n}");
-                    }
-                    self.stmts(body, &mut body_scope, 1, &mut reg)?;
-                    let _ = writeln!(reg, "end)");
-                    self.regs.push(reg);
-                    // the send site
-                    let tgt = match target {
-                        CastTarget::Browsers => "\"browsers\"".to_string(),
-                        CastTarget::Server => "\"server\"".to_string(),
-                        CastTarget::Session(e) => self.emit_expr(e, scope)?,
-                    };
-                    let _ = writeln!(
-                        out,
-                        "{pad}rt.cast({}, {}, {})",
-                        tgt,
-                        lua_str(&id),
-                        vars_table(&captured)
-                    );
-                }
-                Stmt::Spawn(e) => {
-                    let call = self.emit_expr(e, scope)?;
-                    let _ = writeln!(out, "{pad}rt.start_flow(function() {call} end)");
-                }
-                Stmt::Expr(e) => {
-                    let v = self.emit_expr(e, scope)?;
-                    let _ = writeln!(out, "{pad}{v}");
-                }
-            }
-        }
-        Ok(())
+    fn add_fn(&mut self, f: Function) -> usize {
+        self.fns.push(f);
+        self.fns.len() - 1
     }
 }
 
-fn emit_fn(name: &str, params: &[String], body: &[Stmt], out: &mut String, regs: &mut Vec<String>) -> Result<(), String> {
-    let mut gen = Gen {
-        regs: Vec::new(),
-        cast_n: 0,
-        lambda_n: 0,
-        fn_name: name.to_string(),
-    };
-    let inner = gen.flow_body(name, body, params)?;
-    let _ = writeln!(out, "function {}({})", name, params.join(", "));
-    out.push_str(&inner);
-    let _ = writeln!(out, "end");
-    out.push('\n');
-    regs.append(&mut gen.regs);
+/// Per-named-fn counters for stable `name:cN` / `name:lN` hop ids.
+struct Counters {
+    fn_name: String,
+    cast_n: u32,
+    lambda_n: u32,
+}
+
+/// One function body being emitted.
+struct Fb {
+    name: String,
+    scope: Vec<(String, u16)>,
+    n_locals: u16,
+    n_caps: u8,
+    n_params: u8,
+    code: Vec<Instr>,
+}
+
+impl Fb {
+    fn new(name: &str) -> Fb {
+        Fb {
+            name: name.to_string(),
+            scope: Vec::new(),
+            n_locals: 0,
+            n_caps: 0,
+            n_params: 0,
+            code: Vec::new(),
+        }
+    }
+
+    fn def_local(&mut self, name: &str) -> u16 {
+        let slot = self.n_locals;
+        self.n_locals += 1;
+        self.scope.push((name.to_string(), slot));
+        slot
+    }
+
+    fn hidden_local(&mut self) -> u16 {
+        let slot = self.n_locals;
+        self.n_locals += 1;
+        slot
+    }
+
+    fn lookup(&self, name: &str) -> Option<u16> {
+        self.scope.iter().rev().find(|(n, _)| n == name).map(|(_, s)| *s)
+    }
+
+    fn scope_names(&self) -> Vec<String> {
+        self.scope.iter().map(|(n, _)| n.clone()).collect()
+    }
+
+    fn emit(&mut self, i: Instr) {
+        self.code.push(i);
+    }
+
+    /// Emit a jump placeholder; returns its index for patching.
+    fn jump_placeholder(&mut self, f: fn(i32) -> Instr) -> usize {
+        self.code.push(f(0));
+        self.code.len() - 1
+    }
+
+    /// Patch a placeholder to jump to the current end of code.
+    fn patch_to_here(&mut self, at: usize) {
+        let d = self.code.len() as i32 - (at as i32 + 1);
+        self.code[at] = match self.code[at] {
+            Instr::Jump(_) => Instr::Jump(d),
+            Instr::JumpIfFalse(_) => Instr::JumpIfFalse(d),
+            Instr::IterNext(_) => Instr::IterNext(d),
+            _ => unreachable!("not a jump"),
+        };
+    }
+
+    fn into_function(self) -> Function {
+        Function {
+            name: self.name,
+            n_caps: self.n_caps,
+            n_params: self.n_params,
+            n_locals: self.n_locals.max((self.n_caps as u16) + (self.n_params as u16)),
+            code: self.code,
+        }
+    }
+}
+
+fn emit_expr(cg: &mut Cg, fb: &mut Fb, ctr: &mut Counters, e: &Expr) -> Result<(), String> {
+    match e {
+        Expr::Num(n) => {
+            if n.contains('.') {
+                let f: f64 = n.parse().map_err(|_| format!("bad number: {n}"))?;
+                let k = cg.k_float(f);
+                fb.emit(Instr::Const(k));
+            } else {
+                let i: i64 = n.parse().map_err(|_| format!("bad number: {n}"))?;
+                let k = cg.k_int(i);
+                fb.emit(Instr::Const(k));
+            }
+        }
+        Expr::Str(s) => {
+            let k = cg.k_str(s);
+            fb.emit(Instr::Const(k));
+        }
+        Expr::Bool(true) => fb.emit(Instr::True),
+        Expr::Bool(false) => fb.emit(Instr::False),
+        Expr::Nil => fb.emit(Instr::Nil),
+        Expr::Ident(n) => match fb.lookup(n) {
+            Some(slot) => fb.emit(Instr::LoadLocal(slot)),
+            None => {
+                let k = cg.k_str(n);
+                fb.emit(Instr::LoadGlobal(k));
+            }
+        },
+        Expr::Field(b, f) => {
+            emit_expr(cg, fb, ctr, b)?;
+            let k = cg.k_str(f);
+            fb.emit(Instr::GetField(k));
+        }
+        Expr::Index(a, b) => {
+            emit_expr(cg, fb, ctr, a)?;
+            emit_expr(cg, fb, ctr, b)?;
+            fb.emit(Instr::GetIndex);
+        }
+        Expr::Call(f, args) => {
+            // session() is the runtime's identity primitive
+            if matches!(f.as_ref(), Expr::Ident(n) if n == "session") && args.is_empty() {
+                fb.emit(Instr::Session);
+                return Ok(());
+            }
+            emit_expr(cg, fb, ctr, f)?;
+            for a in args {
+                emit_expr(cg, fb, ctr, a)?;
+            }
+            fb.emit(Instr::Call(args.len() as u8));
+        }
+        Expr::Unary(op, a) => {
+            emit_expr(cg, fb, ctr, a)?;
+            fb.emit(Instr::UnOp(match *op {
+                "not" => UnOp::Not,
+                _ => UnOp::Neg,
+            }));
+        }
+        Expr::Binary("and", a, b) => {
+            emit_expr(cg, fb, ctr, a)?;
+            fb.emit(Instr::Dup);
+            let j = fb.jump_placeholder(Instr::JumpIfFalse);
+            fb.emit(Instr::Pop);
+            emit_expr(cg, fb, ctr, b)?;
+            fb.patch_to_here(j);
+        }
+        Expr::Binary("or", a, b) => {
+            emit_expr(cg, fb, ctr, a)?;
+            fb.emit(Instr::Dup);
+            fb.emit(Instr::UnOp(UnOp::Not));
+            let j = fb.jump_placeholder(Instr::JumpIfFalse);
+            fb.emit(Instr::Pop);
+            emit_expr(cg, fb, ctr, b)?;
+            fb.patch_to_here(j);
+        }
+        Expr::Binary(op, a, b) => {
+            emit_expr(cg, fb, ctr, a)?;
+            emit_expr(cg, fb, ctr, b)?;
+            fb.emit(Instr::BinOp(match *op {
+                "+" => BinOp::Add,
+                "-" => BinOp::Sub,
+                "*" => BinOp::Mul,
+                "/" => BinOp::Div,
+                "%" => BinOp::Mod,
+                ".." => BinOp::Concat,
+                "==" => BinOp::Eq,
+                "!=" => BinOp::Ne,
+                "<" => BinOp::Lt,
+                "<=" => BinOp::Le,
+                ">" => BinOp::Gt,
+                ">=" => BinOp::Ge,
+                other => return Err(format!("unknown operator {other}")),
+            }));
+        }
+        Expr::Table(fs) => {
+            for (k, v) in fs {
+                let kk = cg.k_str(k);
+                fb.emit(Instr::Const(kk));
+                emit_expr(cg, fb, ctr, v)?;
+            }
+            fb.emit(Instr::MakeMap(fs.len() as u16));
+        }
+        Expr::Array(items) => {
+            for v in items {
+                emit_expr(cg, fb, ctr, v)?;
+            }
+            fb.emit(Instr::MakeArray(items.len() as u16));
+        }
+        Expr::Fn(params, body) => emit_lambda(cg, fb, ctr, params, body)?,
+    }
     Ok(())
 }
 
-/// Compile `.hop` source to a Lua chunk targeting the hoprt runtime.
-pub fn compile(src: &str) -> Result<String, String> {
+/// A lambda's segment 0 becomes a closure; its captures are the outer
+/// locals its body references, copied by value at the `Closure`
+/// instruction. The marked remainder ships under `enclosing:lN:i` hop
+/// ids like any other segments.
+fn emit_lambda(
+    cg: &mut Cg,
+    outer: &mut Fb,
+    ctr: &mut Counters,
+    params: &[String],
+    body: &[Stmt],
+) -> Result<(), String> {
+    ctr.lambda_n += 1;
+    let prefix = format!("{}:l{}", ctr.fn_name, ctr.lambda_n);
+
+    // captures: referenced by the body, bound in the outer frame, not
+    // shadowed by a parameter
+    let mut refs = BTreeSet::new();
+    refs_stmts(body, &mut refs);
+    let caps: Vec<String> = refs
+        .into_iter()
+        .filter(|n| !params.contains(n) && outer.lookup(n).is_some())
+        .collect();
+
+    let mut fb = Fb::new(&prefix);
+    fb.n_caps = caps.len() as u8;
+    fb.n_params = params.len() as u8;
+    for c in &caps {
+        fb.def_local(c);
+    }
+    for p in params {
+        fb.def_local(p);
+    }
+    emit_flow_body(cg, &mut fb, ctr, &prefix, body)?;
+    let fn_idx = cg.add_fn(fb.into_function());
+
+    for c in &caps {
+        let slot = outer.lookup(c).unwrap();
+        outer.emit(Instr::LoadLocal(slot));
+    }
+    outer.emit(Instr::Closure(fn_idx as u32, caps.len() as u8));
+    Ok(())
+}
+
+/// Emit the target of a hop: the server, or the flow's origin session.
+fn emit_hop_target(cg: &mut Cg, fb: &mut Fb, side: Side) {
+    match side {
+        Side::Server => {
+            let k = cg.k_str("server");
+            fb.emit(Instr::Const(k));
+        }
+        Side::Browser => fb.emit(Instr::Session),
+    }
+}
+
+/// Build the vars map `{ name = name, ... }` from locals currently in scope.
+fn emit_vars_map(cg: &mut Cg, fb: &mut Fb, names: &BTreeSet<String>) -> Result<(), String> {
+    for n in names {
+        let k = cg.k_str(n);
+        fb.emit(Instr::Const(k));
+        match fb.lookup(n) {
+            Some(slot) => fb.emit(Instr::LoadLocal(slot)),
+            None => return Err(format!("{}: shipped var {n} is not in scope", fb.name)),
+        }
+    }
+    fb.emit(Instr::MakeMap(names.len() as u16));
+    Ok(())
+}
+
+/// Compile a segment (a hop-reachable function): one `__vars` parameter,
+/// destructured in the prologue.
+fn compile_segment(
+    cg: &mut Cg,
+    ctr: &mut Counters,
+    id: &str,
+    ship: &BTreeSet<String>,
+    body: &[Stmt],
+    chain: Option<(Side, String, BTreeSet<String>)>,
+) -> Result<(), String> {
+    let mut fb = Fb::new(id);
+    fb.n_params = 1;
+    let vars_slot = fb.def_local("__vars");
+    for v in ship {
+        fb.emit(Instr::LoadLocal(vars_slot));
+        let k = cg.k_str(v);
+        fb.emit(Instr::GetField(k));
+        let slot = fb.def_local(v);
+        fb.emit(Instr::StoreLocal(slot));
+    }
+    emit_stmts(cg, &mut fb, ctr, body)?;
+    if let Some((side, next_id, next_ship)) = chain {
+        emit_hop_target(cg, &mut fb, side);
+        emit_vars_map(cg, &mut fb, &next_ship)?;
+        let k = cg.k_str(&next_id);
+        fb.emit(Instr::At(k));
+        fb.emit(Instr::Return);
+    }
+    let fn_idx = cg.add_fn(fb.into_function());
+    cg.hops.insert(id.to_string(), fn_idx);
+    Ok(())
+}
+
+/// Emit a flow body into `fb` (a named fn or a lambda's segment 0): the
+/// segment-0 code plus the chain into segment 1 when marks are present.
+/// Later segments are compiled as separate hop functions.
+fn emit_flow_body(
+    cg: &mut Cg,
+    fb: &mut Fb,
+    ctr: &mut Counters,
+    prefix: &str,
+    body: &[Stmt],
+) -> Result<(), String> {
+    check_no_nested_marks(body)?;
+    let segs = split_segments(body, prefix)?;
+    let n = segs.len();
+
+    if n == 1 {
+        return emit_stmts(cg, fb, ctr, &segs[0].1);
+    }
+
+    // ship set for each hop i (into segment i):
+    //   refs(segments i..end) ∩ scope at the end of segment i-1
+    let base_scope = fb.scope_names();
+    let mut ship: Vec<BTreeSet<String>> = vec![BTreeSet::new(); n];
+    let mut scope_end: Vec<Vec<String>> = vec![Vec::new(); n];
+    scope_end[0] = base_scope;
+    scope_end[0].extend(toplevel_lets(&segs[0].1));
+    for i in 1..n {
+        let mut refs = BTreeSet::new();
+        for (_, seg) in &segs[i..] {
+            refs_stmts(seg, &mut refs);
+        }
+        ship[i] = refs.into_iter().filter(|r| scope_end[i - 1].contains(r)).collect();
+        scope_end[i] = ship[i].iter().cloned().collect();
+        scope_end[i].extend(toplevel_lets(&segs[i].1));
+    }
+
+    // segment 0 plus the chain into segment 1
+    emit_stmts(cg, fb, ctr, &segs[0].1)?;
+    emit_hop_target(cg, fb, segs[1].0);
+    emit_vars_map(cg, fb, &ship[1])?;
+    let k = cg.k_str(&format!("{prefix}:1"));
+    fb.emit(Instr::At(k));
+    fb.emit(Instr::Return);
+
+    // segments 1..n-1 as hop functions
+    for i in 1..n {
+        let chain = if i + 1 < n {
+            Some((segs[i + 1].0, format!("{prefix}:{}", i + 1), ship[i + 1].clone()))
+        } else {
+            None
+        };
+        compile_segment(cg, ctr, &format!("{prefix}:{i}"), &ship[i], &segs[i].1, chain)?;
+    }
+    Ok(())
+}
+
+fn emit_stmts(cg: &mut Cg, fb: &mut Fb, ctr: &mut Counters, ss: &[Stmt]) -> Result<(), String> {
+    for s in ss {
+        match s {
+            Stmt::Let(n, e) => {
+                emit_expr(cg, fb, ctr, e)?;
+                let slot = fb.def_local(n);
+                fb.emit(Instr::StoreLocal(slot));
+            }
+            Stmt::Assign(l, r) => match l {
+                Expr::Ident(n) => {
+                    emit_expr(cg, fb, ctr, r)?;
+                    match fb.lookup(n) {
+                        Some(slot) => fb.emit(Instr::StoreLocal(slot)),
+                        None => {
+                            let k = cg.k_str(n);
+                            fb.emit(Instr::StoreGlobal(k));
+                        }
+                    }
+                }
+                Expr::Field(b, f) => {
+                    emit_expr(cg, fb, ctr, b)?;
+                    emit_expr(cg, fb, ctr, r)?;
+                    let k = cg.k_str(f);
+                    fb.emit(Instr::SetField(k));
+                }
+                Expr::Index(a, i) => {
+                    emit_expr(cg, fb, ctr, a)?;
+                    emit_expr(cg, fb, ctr, i)?;
+                    emit_expr(cg, fb, ctr, r)?;
+                    fb.emit(Instr::SetIndex);
+                }
+                _ => return Err("invalid assignment target".into()),
+            },
+            Stmt::Return(e) => {
+                match e {
+                    Some(e) => emit_expr(cg, fb, ctr, e)?,
+                    None => fb.emit(Instr::Nil),
+                }
+                fb.emit(Instr::Return);
+            }
+            Stmt::If(c, t, els) => {
+                emit_expr(cg, fb, ctr, c)?;
+                let j_else = fb.jump_placeholder(Instr::JumpIfFalse);
+                let mark = fb.scope.len();
+                emit_stmts(cg, fb, ctr, t)?;
+                fb.scope.truncate(mark);
+                match els {
+                    Some(els) => {
+                        let j_end = fb.jump_placeholder(Instr::Jump);
+                        fb.patch_to_here(j_else);
+                        let mark = fb.scope.len();
+                        emit_stmts(cg, fb, ctr, els)?;
+                        fb.scope.truncate(mark);
+                        fb.patch_to_here(j_end);
+                    }
+                    None => fb.patch_to_here(j_else),
+                }
+            }
+            Stmt::For(k, v, e, body) => {
+                emit_expr(cg, fb, ctr, e)?;
+                fb.emit(Instr::IterNew);
+                let iter_slot = fb.hidden_local();
+                fb.emit(Instr::StoreLocal(iter_slot));
+                let zero = cg.k_int(0);
+                fb.emit(Instr::Const(zero));
+                let idx_slot = fb.hidden_local();
+                fb.emit(Instr::StoreLocal(idx_slot));
+
+                let mark = fb.scope.len();
+                let k_slot = fb.def_local(k);
+                let v_slot = fb.def_local(v);
+
+                let loop_start = fb.code.len();
+                fb.emit(Instr::LoadLocal(iter_slot));
+                fb.emit(Instr::LoadLocal(idx_slot));
+                let j_end = fb.jump_placeholder(Instr::IterNext);
+                // stack after IterNext: iter idx' k v
+                fb.emit(Instr::StoreLocal(v_slot));
+                fb.emit(Instr::StoreLocal(k_slot));
+                fb.emit(Instr::StoreLocal(idx_slot));
+                fb.emit(Instr::StoreLocal(iter_slot));
+                emit_stmts(cg, fb, ctr, body)?;
+                fb.scope.truncate(mark + 2); // keep k, v for next round
+                let d = loop_start as i32 - (fb.code.len() as i32 + 1);
+                fb.emit(Instr::Jump(d));
+                fb.patch_to_here(j_end);
+                fb.scope.truncate(mark);
+            }
+            Stmt::Mark(_) => {
+                unreachable!("marks are split before emission; nested marks are rejected")
+            }
+            Stmt::Cast(target, body) => {
+                ctr.cast_n += 1;
+                let id = format!("{}:c{}", ctr.fn_name, ctr.cast_n);
+                // captured = referenced by body ∩ in scope here
+                let mut refs = BTreeSet::new();
+                refs_stmts(body, &mut refs);
+                let captured: BTreeSet<String> = refs
+                    .into_iter()
+                    .filter(|n| fb.lookup(n).is_some())
+                    .collect();
+                compile_segment(cg, ctr, &id, &captured, body, None)?;
+                // the send site
+                match target {
+                    CastTarget::Browsers => {
+                        let k = cg.k_str("browsers");
+                        fb.emit(Instr::Const(k));
+                    }
+                    CastTarget::Server => {
+                        let k = cg.k_str("server");
+                        fb.emit(Instr::Const(k));
+                    }
+                    CastTarget::Session(e) => emit_expr(cg, fb, ctr, e)?,
+                }
+                emit_vars_map(cg, fb, &captured)?;
+                let k = cg.k_str(&id);
+                fb.emit(Instr::Cast(k));
+            }
+            Stmt::Spawn(e) => {
+                let Expr::Call(f, args) = e else {
+                    return Err("spawn expects a function call".into());
+                };
+                emit_expr(cg, fb, ctr, f)?;
+                for a in args {
+                    emit_expr(cg, fb, ctr, a)?;
+                }
+                fb.emit(Instr::MakeArray(args.len() as u16));
+                fb.emit(Instr::Spawn);
+            }
+            Stmt::Expr(e) => {
+                emit_expr(cg, fb, ctr, e)?;
+                fb.emit(Instr::Pop);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Compile `.hop` source to a Hop IR program.
+pub fn compile(src: &str) -> Result<Program, String> {
     let toks = lex(src)?;
     let mut parser = Parser { toks, pos: 0 };
     let items = parser.items()?;
 
-    let mut out = String::from(
-        "-- generated by hopc; do not edit.\n-- segments registered below correspond to placement marks in the source.\n\n",
-    );
-    let mut regs: Vec<String> = Vec::new();
+    let mut cg = Cg::default();
 
     for item in &items {
         match item {
             Item::ServerLet(name, e) => {
-                let mut gen = Gen {
-                    regs: Vec::new(),
+                let mut ctr = Counters {
+                    fn_name: format!("let:{name}"),
                     cast_n: 0,
                     lambda_n: 0,
-                    fn_name: name.to_string(),
                 };
-                let rhs = gen.emit_expr(e, &[])?;
-                if !gen.regs.is_empty() {
-                    return Err(format!("server let {name}: marked lambdas not allowed here"));
-                }
-                let _ = writeln!(out, "if SIDE == \"server\" then\n  {name} = {rhs}\nend\n");
+                let mut fb = Fb::new(&format!("let:{name}"));
+                emit_expr(&mut cg, &mut fb, &mut ctr, e)?;
+                fb.emit(Instr::Return);
+                let fn_idx = cg.add_fn(fb.into_function());
+                cg.server_lets.push((name.clone(), fn_idx));
             }
-            Item::Fn(name, params, body) => emit_fn(name, params, body, &mut out, &mut regs)?,
+            Item::Fn(name, params, body) => {
+                let mut ctr = Counters {
+                    fn_name: name.clone(),
+                    cast_n: 0,
+                    lambda_n: 0,
+                };
+                let mut fb = Fb::new(name);
+                fb.n_params = params.len() as u8;
+                for p in params {
+                    fb.def_local(p);
+                }
+                emit_flow_body(&mut cg, &mut fb, &mut ctr, name, body)?;
+                let fn_idx = cg.add_fn(fb.into_function());
+                cg.named.insert(name.clone(), fn_idx);
+            }
         }
     }
 
-    if !regs.is_empty() {
-        out.push_str("-- hop segments (same table on every VM; the wire carries ids + vars)\n");
-        for r in regs {
-            out.push_str(&r);
-        }
-    }
-    Ok(out)
+    Ok(Program {
+        consts: cg.consts,
+        fns: cg.fns,
+        hops: cg.hops,
+        named: cg.named,
+        server_lets: cg.server_lets,
+    })
 }

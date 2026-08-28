@@ -236,7 +236,8 @@ cargo run -p durable --example runtime
 
 ## Hop apps
 
-[`hoprt/`](../hoprt/) is the Lua/browser runtime: placement marks hop a
+[`hoprt/`](../hoprt/) is the Hop runtime (a native Rust IR
+interpreter): placement marks hop a
 function body between a browser tab and the server. When a `.hop` file
 declares `schema` and `fn reduce`, the server VM opens this crate's
 `Runtime` — JSONL log, typed-path projection, `store.append` from server
