@@ -14,16 +14,17 @@ server let schema = store.record([
 ]);
 
 fn reduce(event) {
-  if event.type == "vote" {
-    let key = event.winner .. ">" .. event.loser;
-    store(["scopes", event.scope, "edges", key, store.add(1)]);
-    store(["scopes", event.scope, "votes", store.add(1)]);
-  } else {
-    if event.type == "decay" {
-      let edges = store(["scopes", event.scope, "edges"]);
+  match event {
+    vote { scope, winner, loser } => {
+      let key = winner .. ">" .. loser;
+      store(["scopes", scope, "edges", key, store.add(1)]);
+      store(["scopes", scope, "votes", store.add(1)]);
+    }
+    decay { scope } => {
+      let edges = store(["scopes", scope, "edges"]);
       if edges {
         for k, w in edges {
-          store(["scopes", event.scope, "edges", k, store.set(w * 0.9)]);
+          store(["scopes", scope, "edges", k, store.set(w * 0.9)]);
         }
       }
     }

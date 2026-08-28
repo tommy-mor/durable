@@ -13,9 +13,12 @@
 //!        | "spawn" call ";"                        start a flow (an "event")
 //!        | "return" expr? ";"
 //!        | "if" expr block ("else" (block|if))?
+//!        | "match" expr "{" arm* "}"               dispatch on expr.type
 //!        | "for" k "," v "in" expr block           k = index (0-based) / key
 //!        | lvalue "=" expr ";"                     assignment
 //!        | expr ";"
+//! arm   := name ("{" field ("," field)* ","? "}")? "=>" block
+//!        | "else" "=>" block                       optional, must be last
 //! expr  := ... | ":name"                           keyword → string literal
 //!        | "fn" "(" params ")" block               lambda; may contain marks
 //! ```
@@ -65,6 +68,7 @@ enum Tok {
     Dot,
     DotDot,
     Assign,
+    FatArrow,
     Eq,
     Ne,
     Lt,
@@ -110,6 +114,7 @@ fn lex(src: &str) -> Result<Vec<Tok>, String> {
             '.' if two('.') => { out.push(Tok::DotDot); i += 2 }
             '.' => { out.push(Tok::Dot); i += 1 }
             '=' if two('=') => { out.push(Tok::Eq); i += 2 }
+            '=' if two('>') => { out.push(Tok::FatArrow); i += 2 }
             '=' => { out.push(Tok::Assign); i += 1 }
             '!' if two('=') => { out.push(Tok::Ne); i += 2 }
             '!' => { out.push(Tok::Bang); i += 1 }
@@ -211,12 +216,23 @@ enum CastTarget {
     Session(Expr),
 }
 
+/// One `match` arm: `tag { field, ... } => block`. `tag == None` is the
+/// `else` arm (no fields, always matches).
+#[derive(Debug, Clone)]
+struct MatchArm {
+    tag: Option<String>,
+    fields: Vec<String>,
+    body: Vec<Stmt>,
+}
+
 #[derive(Debug, Clone)]
 enum Stmt {
     Let(String, Expr),
     Assign(Expr, Expr),
     Return(Option<Expr>),
     If(Expr, Vec<Stmt>, Option<Vec<Stmt>>),
+    /// `match expr { arm* }` — dispatch on `expr.type`; first match wins.
+    Match(Expr, Vec<MatchArm>),
     /// `for k, v in expr { ... }` — arrays yield (0-based index, element),
     /// maps yield (key, value) in key order.
     For(String, String, Expr, Vec<Stmt>),
@@ -365,6 +381,9 @@ impl Parser {
         if self.at_kw("if") {
             return self.if_stmt();
         }
+        if self.at_kw("match") {
+            return self.match_stmt();
+        }
         if self.at_kw("for") {
             self.eat_kw("for")?;
             let k = self.ident()?;
@@ -436,6 +455,44 @@ impl Parser {
             None
         };
         Ok(Stmt::If(cond, then, els))
+    }
+
+    fn match_stmt(&mut self) -> Result<Stmt, String> {
+        self.eat_kw("match")?;
+        let subject = self.expr()?;
+        self.expect(Tok::LBrace)?;
+        let mut arms = Vec::new();
+        let mut saw_else = false;
+        while !matches!(self.peek(), Some(Tok::RBrace)) {
+            if saw_else {
+                return Err("match: `else` must be the last arm".into());
+            }
+            if self.at_kw("else") {
+                self.eat_kw("else")?;
+                self.expect(Tok::FatArrow)?;
+                let body = self.block()?;
+                arms.push(MatchArm { tag: None, fields: Vec::new(), body });
+                saw_else = true;
+            } else {
+                let tag = self.ident()?;
+                let mut fields = Vec::new();
+                if matches!(self.peek(), Some(Tok::LBrace)) {
+                    self.pos += 1;
+                    while !matches!(self.peek(), Some(Tok::RBrace)) {
+                        fields.push(self.ident()?);
+                        if matches!(self.peek(), Some(Tok::Comma)) {
+                            self.pos += 1;
+                        }
+                    }
+                    self.expect(Tok::RBrace)?;
+                }
+                self.expect(Tok::FatArrow)?;
+                let body = self.block()?;
+                arms.push(MatchArm { tag: Some(tag), fields, body });
+            }
+        }
+        self.expect(Tok::RBrace)?;
+        Ok(Stmt::Match(subject, arms))
     }
 
     // precedence: || < && < cmp < .. < +- < */% < unary < postfix
@@ -677,6 +734,12 @@ fn refs_stmts(ss: &[Stmt], out: &mut BTreeSet<String>) {
                     refs_stmts(e, out);
                 }
             }
+            Stmt::Match(subject, arms) => {
+                refs_expr(subject, out);
+                for arm in arms {
+                    refs_stmts(&arm.body, out);
+                }
+            }
             Stmt::For(_, _, e, body) => {
                 refs_expr(e, out);
                 refs_stmts(body, out);
@@ -721,6 +784,11 @@ fn check_no_nested_marks(ss: &[Stmt]) -> Result<(), String> {
                 reject(t, "branches; marks must be at the top level of a function body")?;
                 if let Some(e) = e {
                     reject(e, "branches; marks must be at the top level of a function body")?;
+                }
+            }
+            Stmt::Match(_, arms) => {
+                for arm in arms {
+                    reject(&arm.body, "match arms; marks must be at the top level of a function body")?;
                 }
             }
             Stmt::For(_, _, _, body) => {
@@ -1216,6 +1284,55 @@ fn emit_stmts(cg: &mut Cg, fb: &mut Fb, ctr: &mut Counters, ss: &[Stmt]) -> Resu
                         fb.patch_to_here(j_end);
                     }
                     None => fb.patch_to_here(j_else),
+                }
+            }
+            // Lowered to the plain if-chain it replaces: the subject and its
+            // `.type` are evaluated once into hidden locals, each arm is an
+            // Eq against the tag string + JumpIfFalse to the next arm, and a
+            // matching arm loads its destructured fields into fresh locals
+            // (scoped to the arm) before its body runs. First match wins;
+            // no match and no `else` falls through.
+            Stmt::Match(subject, arms) => {
+                emit_expr(cg, fb, ctr, subject)?;
+                let subj_slot = fb.hidden_local();
+                fb.emit(Instr::StoreLocal(subj_slot));
+                let type_k = cg.k_str("type");
+                fb.emit(Instr::LoadLocal(subj_slot));
+                fb.emit(Instr::GetField(type_k));
+                let tag_slot = fb.hidden_local();
+                fb.emit(Instr::StoreLocal(tag_slot));
+                let mut end_jumps = Vec::new();
+                for arm in arms {
+                    match &arm.tag {
+                        Some(tag) => {
+                            fb.emit(Instr::LoadLocal(tag_slot));
+                            let k = cg.k_str(tag);
+                            fb.emit(Instr::Const(k));
+                            fb.emit(Instr::BinOp(BinOp::Eq));
+                            let j_next = fb.jump_placeholder(Instr::JumpIfFalse);
+                            let mark = fb.scope.len();
+                            for f in &arm.fields {
+                                fb.emit(Instr::LoadLocal(subj_slot));
+                                let fk = cg.k_str(f);
+                                fb.emit(Instr::GetField(fk));
+                                let slot = fb.def_local(f);
+                                fb.emit(Instr::StoreLocal(slot));
+                            }
+                            emit_stmts(cg, fb, ctr, &arm.body)?;
+                            fb.scope.truncate(mark);
+                            end_jumps.push(fb.jump_placeholder(Instr::Jump));
+                            fb.patch_to_here(j_next);
+                        }
+                        // `else` (parser guarantees it is last): always runs
+                        None => {
+                            let mark = fb.scope.len();
+                            emit_stmts(cg, fb, ctr, &arm.body)?;
+                            fb.scope.truncate(mark);
+                        }
+                    }
+                }
+                for j in end_jumps {
+                    fb.patch_to_here(j);
                 }
             }
             Stmt::For(k, v, e, body) => {

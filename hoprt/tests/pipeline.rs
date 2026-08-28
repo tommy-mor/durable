@@ -164,3 +164,73 @@ fn marks_rejected_inside_branches() {
     };
     assert!(err.contains("top level"), "{err}");
 }
+
+#[test]
+fn match_dispatches_on_type_and_destructures() {
+    let src = r#"
+        fn handle(event) {
+          match event {
+            add { text, n } => {
+              print("add " .. text .. " x" .. n);
+            }
+            toggle { id } => {
+              // the subject stays in scope alongside the destructured fields
+              print("toggle " .. id .. " (" .. event.type .. ")");
+            }
+          }
+        }
+        fn go() {
+          handle({ type = "add", text = "milk", n = 2 });
+          handle({ type = "toggle", id = 7 });
+        }
+    "#;
+    let mut host = Cluster::new(&["A"], src, false).expect("cluster");
+    host.fire("A", "go");
+    host.pump();
+    host.assert_quiescent();
+    let all = host.log().join("\n");
+    assert!(all.contains("add milk x2"), "{all}");
+    assert!(all.contains("toggle 7 (toggle)"), "{all}");
+}
+
+#[test]
+fn match_else_arm_and_no_match_fall_through() {
+    let src = r#"
+        fn classify(event) {
+          match event {
+            known => { print("known"); }
+            else => { print("other " .. event.type); }
+          }
+          // no matching arm and no else: the whole match is a no-op
+          match event {
+            never => { print("never"); }
+          }
+          print("after " .. event.type);
+        }
+        fn go() {
+          classify({ type = "known" });
+          classify({ type = "mystery" });
+        }
+    "#;
+    let mut host = Cluster::new(&["A"], src, false).expect("cluster");
+    host.fire("A", "go");
+    host.pump();
+    host.assert_quiescent();
+    let all = host.log().join("\n");
+    assert!(all.contains("known"), "{all}");
+    assert!(all.contains("other mystery"), "{all}");
+    assert!(all.contains("after known"), "{all}");
+    assert!(all.contains("after mystery"), "{all}");
+    assert!(!all.contains("never"), "unmatched arm ran:\n{all}");
+}
+
+#[test]
+fn marks_rejected_inside_match_arms() {
+    let src = "fn f(e) { match e { go => { server!(); } } }";
+    let err = match hoprt::compiler::compile(src) {
+        Err(e) => e,
+        Ok(_) => panic!("mark inside match arm compiled"),
+    };
+    assert!(err.contains("match arms"), "{err}");
+    assert!(err.contains("top level"), "{err}");
+}

@@ -90,6 +90,45 @@ iteration is key-ordered and deterministic. The store is one callable —
 `store(path)`, where collecting and terminal navigators in the path decide
 query vs mutation — specified in [hop-store.md](hop-store.md).
 
+## match
+
+Events are maps with a `type` discriminant, and every reducer used to be
+a ladder of `event.type == "..."` chains. `match` is the statement form
+of that ladder:
+
+```text
+match event {
+  add { text, seq } => { store(["todos", seq, store.set({ text = text, done = false })]); }
+  toggle { id }     => { ... }
+  enter             => { enter_player(event); }   // no destructure
+  else              => { ... }                    // optional, must be last
+}
+```
+
+Grammar (statement position):
+
+```text
+stmt := "match" expr "{" arm* "}"
+arm  := name ("{" field ("," field)* ","? "}")? "=>" block
+      | "else" "=>" block
+```
+
+Semantics: an arm matches when `<expr>.type == "<name>"` (the arm name is
+an identifier taken as a string literal); first match wins; `else` always
+matches and must be last; no match and no `else` is a no-op. The brace
+list after an arm name binds those fields of the *subject* as fresh
+locals scoped to the arm's block (`add { text } => …` is
+`let text = event.text;`); the subject stays in scope, so `event.foo`
+still works inside arms.
+
+Lowering adds **no new IR**: the subject and its `.type` are evaluated
+once into hidden locals, then each arm compiles to the if-chain it
+replaces — `LoadLocal tag; Const "name"; BinOp Eq; JumpIfFalse next`,
+field binds as `LoadLocal subj; GetField f; StoreLocal fresh`, and a
+`Jump end` after the arm body. Placement marks (`server!()` /
+`browser!()`) are rejected inside match arms with a compile error, the
+same rule as `if` branches and loop bodies; casts are fine.
+
 ## What stays true across the rewrite
 
 - Hop ids and packet shapes (kind/flow/to/hop/vars/origin/reply_to) —

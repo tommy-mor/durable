@@ -21,22 +21,21 @@ server let schema = store.record([
 ]);
 
 fn reduce(event) {
-  if event.type == "join" {
-    store(["users", event.sid, "name", store.set(event.name)]);
-  } else {
-    if event.type == "follow" {
-      store(["followers", event.who, store.push(event.sid)]);
-    } else {
-      if event.type == "post" {
-        let id = event.seq;
-        store(["posts", id, store.set({ author = event.sid, text = event.text })]);
-        store(["post_count", store.add(1)]);
-        store(["timelines", event.sid, store.push(id)]);
-        let fans = store(["followers", event.sid]);
-        if fans {
-          for i, fan in fans {
-            store(["timelines", fan, store.push(id)]);
-          }
+  match event {
+    join { sid, name } => {
+      store(["users", sid, "name", store.set(name)]);
+    }
+    follow { who, sid } => {
+      store(["followers", who, store.push(sid)]);
+    }
+    post { seq, sid, text } => {
+      store(["posts", seq, store.set({ author = sid, text = text })]);
+      store(["post_count", store.add(1)]);
+      store(["timelines", sid, store.push(seq)]);
+      let fans = store(["followers", sid]);
+      if fans {
+        for i, fan in fans {
+          store(["timelines", fan, store.push(seq)]);
         }
       }
     }

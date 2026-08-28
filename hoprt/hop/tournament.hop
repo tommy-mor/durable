@@ -45,27 +45,26 @@ server let schema = store.record([
 // ── reducer ─────────────────────────────────────────────────────────────
 
 fn reduce(event) {
-  if event.type == "create" {
-    store(["tournaments", event.seq, "name", store.set(event.name)]);
-    store(["tournaments", event.seq, "format", store.set(event.format || "single")]);
-    store(["tournaments", event.seq, "status", store.set("signup")]);
-  } else if event.type == "enter" {
-    enter_player(event);
-  } else if event.type == "move" {
-    move_player(event);
-  } else if event.type == "drop" {
-    drop_player(event);
-  } else if event.type == "start" {
-    let st = store(["tournaments", event.tid, "status"]);
-    if st == "signup" {
-      start_bracket(event.tid);
+  match event {
+    create { seq, name, format } => {
+      store(["tournaments", seq, "name", store.set(name)]);
+      store(["tournaments", seq, "format", store.set(format || "single")]);
+      store(["tournaments", seq, "status", store.set("signup")]);
     }
-  } else if event.type == "report" {
-    report_result(event);
-  } else if event.type == "unreport" {
-    unreport_match(event.tid, event.mid);
-  } else if event.type == "delete" {
-    store(["tournaments", event.tid, store.del]);
+    enter => { enter_player(event); }
+    move => { move_player(event); }
+    drop => { drop_player(event); }
+    start { tid } => {
+      let st = store(["tournaments", tid, "status"]);
+      if st == "signup" {
+        start_bracket(tid);
+      }
+    }
+    report => { report_result(event); }
+    unreport { tid, mid } => { unreport_match(tid, mid); }
+    delete { tid } => {
+      store(["tournaments", tid, store.del]);
+    }
   }
 }
 

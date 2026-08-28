@@ -17,13 +17,14 @@ server let schema = store.record([
 ]);
 
 fn reduce(event) {
-  if event.type == "add" {
-    store(["todos", event.seq, store.set({ text = event.text, done = false })]);
-    store(["stats", "created", store.add(1)]);
-  } else {
-    if event.type == "toggle" {
-      let done = store(["todos", event.id, "done"]);
-      store(["todos", event.id, "done", store.set(!done)]);
+  match event {
+    add { seq, text } => {
+      store(["todos", seq, store.set({ text = text, done = false })]);
+      store(["stats", "created", store.add(1)]);
+    }
+    toggle { id } => {
+      let done = store(["todos", id, "done"]);
+      store(["todos", id, "done", store.set(!done)]);
       if done {
         store(["stats", "completed", store.add(-1)]);
       } else {

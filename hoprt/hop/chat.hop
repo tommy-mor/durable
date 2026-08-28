@@ -12,11 +12,13 @@ server let schema = store.record([
 ]);
 
 fn reduce(event) {
-  if event.type == "say" {
-    store(["rooms", event.room, "messages", store.push({
-      who = event.sid,
-      text = event.text
-    })]);
+  match event {
+    say { room, sid, text } => {
+      store(["rooms", room, "messages", store.push({
+        who = sid,
+        text = text
+      })]);
+    }
   }
 }
 
