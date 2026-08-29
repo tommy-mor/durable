@@ -15,6 +15,7 @@
 //!        | "if" expr block ("else" (block|if))?
 //!        | "match" expr "{" arm* "}"               dispatch on expr.type
 //!        | "for" k "," v "in" expr block           k = index (0-based) / key
+//!        | "while" expr block
 //!        | lvalue "=" expr ";"                     assignment
 //!        | expr ";"
 //! arm   := name ("{" field ("," field)* ","? "}")? "=>" block
@@ -38,7 +39,7 @@
 //! attributes like `onclick = fn(e) { server!(); ... }` work.
 //!
 //! v0 restrictions (deliberate): marks only at the top level of a function
-//! or lambda body; flows originate on the browser; no while loops; no
+//! or lambda body; flows originate on the browser; no
 //! try/catch (errors still propagate — they surface at the flow origin).
 
 use std::collections::{BTreeSet, HashMap};
@@ -236,6 +237,8 @@ enum Stmt {
     /// `for k, v in expr { ... }` — arrays yield (0-based index, element),
     /// maps yield (key, value) in key order.
     For(String, String, Expr, Vec<Stmt>),
+    /// `while expr { ... }` — condition re-evaluated each iteration.
+    While(Expr, Vec<Stmt>),
     Mark(Side),
     Cast(CastTarget, Vec<Stmt>),
     Spawn(Expr),
@@ -393,6 +396,12 @@ impl Parser {
             let e = self.expr()?;
             let body = self.block()?;
             return Ok(Stmt::For(k, v, e, body));
+        }
+        if self.at_kw("while") {
+            self.eat_kw("while")?;
+            let c = self.expr()?;
+            let body = self.block()?;
+            return Ok(Stmt::While(c, body));
         }
         if self.at_kw("cast") {
             self.eat_kw("cast")?;
@@ -744,6 +753,10 @@ fn refs_stmts(ss: &[Stmt], out: &mut BTreeSet<String>) {
                 refs_expr(e, out);
                 refs_stmts(body, out);
             }
+            Stmt::While(c, body) => {
+                refs_expr(c, out);
+                refs_stmts(body, out);
+            }
             Stmt::Mark(_) => {}
             Stmt::Cast(t, body) => {
                 if let CastTarget::Session(e) = t {
@@ -791,7 +804,7 @@ fn check_no_nested_marks(ss: &[Stmt]) -> Result<(), String> {
                     reject(&arm.body, "match arms; marks must be at the top level of a function body")?;
                 }
             }
-            Stmt::For(_, _, _, body) => {
+            Stmt::For(_, _, _, body) | Stmt::While(_, body) => {
                 reject(body, "loop bodies; marks must be at the top level of a function body")?
             }
             Stmt::Cast(_, body) => reject(body, "cast bodies")?,
@@ -1364,6 +1377,17 @@ fn emit_stmts(cg: &mut Cg, fb: &mut Fb, ctr: &mut Counters, ss: &[Stmt]) -> Resu
                 fb.emit(Instr::Jump(d));
                 fb.patch_to_here(j_end);
                 fb.scope.truncate(mark);
+            }
+            Stmt::While(c, body) => {
+                let loop_start = fb.code.len();
+                emit_expr(cg, fb, ctr, c)?;
+                let j_end = fb.jump_placeholder(Instr::JumpIfFalse);
+                let mark = fb.scope.len();
+                emit_stmts(cg, fb, ctr, body)?;
+                fb.scope.truncate(mark);
+                let d = loop_start as i32 - (fb.code.len() as i32 + 1);
+                fb.emit(Instr::Jump(d));
+                fb.patch_to_here(j_end);
             }
             Stmt::Mark(_) => {
                 unreachable!("marks are split before emission; nested marks are rejected")

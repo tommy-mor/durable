@@ -23,6 +23,9 @@ pub enum NativeId {
     Len,
     SortBy,
     Floor,
+    TypeOf,
+    JsonEncode,
+    JsonDecode,
     // pure: schema shape constructors (store.map(of), store.record(fields), …)
     ShapeMap,
     ShapeList,
@@ -49,6 +52,15 @@ pub enum NativeId {
     DomClear,
     DomFocus,
     HuiRender,
+    // effects: long-running calls that suspend the flow (server flows
+    // only). The VM parks the exec and sends a call packet to "@effects";
+    // the platform runs the effect off-thread and replies. Results are
+    // data (`{ ok = false, ... }`), not errors — a failed command is an
+    // observation, not an exception.
+    Bash,
+    LlmCall,
+    LlmStream,
+    LlmNext,
 }
 
 #[derive(Clone)]

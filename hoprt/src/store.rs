@@ -18,7 +18,7 @@ use std::rc::Rc;
 
 use durable::{dynpath, Query, Runtime, Shape, Tx};
 
-use crate::interp::{self, Exec, Globals, Host, Outcome};
+use crate::interp::{self, Exec, Globals, Host, NativeOut, Outcome};
 use crate::ir::Program;
 use crate::rt::Vm;
 use crate::value::{from_cbor, from_json, to_cbor, to_json, NativeId, Value};
@@ -262,8 +262,19 @@ impl Host for ReduceHost<'_> {
         Err("session() is not allowed in a reducer".into())
     }
 
-    fn native(&mut self, id: NativeId, args: Vec<Value>) -> Result<Value, String> {
+    fn native(&mut self, id: NativeId, args: Vec<Value>) -> Result<NativeOut, String> {
+        self.native_value(id, args).map(NativeOut::Val)
+    }
+}
+
+impl ReduceHost<'_> {
+    fn native_value(&mut self, id: NativeId, args: Vec<Value>) -> Result<Value, String> {
         match id {
+            // Effects would make replay nondeterministic; the reducer is
+            // a function of (committed state, event) and nothing else.
+            NativeId::Bash | NativeId::LlmCall | NativeId::LlmStream | NativeId::LlmNext => {
+                Err("effects are not allowed in a reducer".into())
+            }
             // the same one function. Here a terminal navigator is legal:
             // it reifies as a Write against committed state.
             NativeId::StoreCall => {

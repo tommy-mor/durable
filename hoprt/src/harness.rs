@@ -131,6 +131,41 @@ pub struct Cluster {
     shared: Shared,
     data_dir: PathBuf,
     _keep: Option<tempfile::TempDir>,
+    /// Fake llm streams: handle → (chunks still to deliver, full text).
+    fx_streams: HashMap<String, (VecDeque<String>, String)>,
+    fx_next: u64,
+}
+
+/// The harness's deterministic fake model: a user message "RUN: <cmd>"
+/// yields a bash tool call; anything else echoes. Enough to exercise an
+/// agent's whole loop — stream, parse, approve, tool, resume — offline.
+fn fake_llm_text(req: &Value) -> String {
+    let msgs = req.get_field("messages");
+    let last = match &msgs {
+        Value::Array(a) => a.borrow().last().cloned().unwrap_or(Value::Nil),
+        _ => Value::Nil,
+    };
+    let content = crate::value::coerce_str(&last.get_field("content"));
+    match content.strip_prefix("RUN:") {
+        Some(cmd) => format!(
+            "{{\"tool\":\"bash\",\"cmd\":\"{}\"}}",
+            cmd.trim().replace('\\', "\\\\").replace('"', "\\\"")
+        ),
+        None => format!("echo: {content}"),
+    }
+}
+
+/// Split into two chunks so streaming loops see more than one delta.
+fn fake_chunks(text: &str) -> VecDeque<String> {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() < 2 {
+        return VecDeque::from([text.to_string()]);
+    }
+    let mid = chars.len() / 2;
+    VecDeque::from([
+        chars[..mid].iter().collect::<String>(),
+        chars[mid..].iter().collect::<String>(),
+    ])
 }
 
 impl Cluster {
@@ -190,7 +225,103 @@ impl Cluster {
             browsers.push((s.to_string(), vm));
         }
 
-        Ok(Self { server, store, browsers, shared, data_dir, _keep: keep })
+        Ok(Self {
+            server,
+            store,
+            browsers,
+            shared,
+            data_dir,
+            _keep: keep,
+            fx_streams: HashMap::new(),
+            fx_next: 0,
+        })
+    }
+
+    /// Effects, synchronously: real bash (tests use `echo`), fake llm.
+    /// Same reply shapes as hopd's off-thread executor.
+    fn handle_effect(&mut self, pkt: &Value) -> Value {
+        let flow = crate::value::coerce_str(&pkt.get_field("flow"));
+        let vars = pkt.get_field("vars");
+        let reply = |value: Value| {
+            Value::map(
+                [
+                    (Value::str("kind"), Value::str("reply")),
+                    (Value::str("flow"), Value::str(flow.as_str())),
+                    (Value::str("to"), Value::str("server")),
+                    (Value::str("value"), value),
+                ]
+                .into_iter()
+                .collect(),
+            )
+        };
+        let result = |entries: Vec<(&str, Value)>| {
+            Value::map(entries.into_iter().map(|(k, v)| (Value::str(k), v)).collect())
+        };
+        match pkt.get_field("hop").as_str().unwrap_or("") {
+            "bash" => {
+                let cmd = crate::value::coerce_str(&vars.get_field("cmd"));
+                let value = match std::process::Command::new("bash").arg("-c").arg(&cmd).output() {
+                    Ok(o) => result(vec![
+                        ("ok", Value::Bool(o.status.success())),
+                        ("status", Value::Int(o.status.code().unwrap_or(-1) as i64)),
+                        ("stdout", Value::str(String::from_utf8_lossy(&o.stdout).into_owned())),
+                        ("stderr", Value::str(String::from_utf8_lossy(&o.stderr).into_owned())),
+                    ]),
+                    Err(e) => result(vec![
+                        ("ok", Value::Bool(false)),
+                        ("error", Value::str(e.to_string())),
+                    ]),
+                };
+                reply(value)
+            }
+            "llm" => {
+                let text = fake_llm_text(&vars.get_field("req"));
+                reply(result(vec![("ok", Value::Bool(true)), ("text", Value::str(text))]))
+            }
+            "llm_start" => {
+                self.fx_next += 1;
+                let h = format!("llm:{}", self.fx_next);
+                let text = fake_llm_text(&vars.get_field("req"));
+                self.fx_streams.insert(h.clone(), (fake_chunks(&text), text));
+                reply(Value::str(h))
+            }
+            "llm_next" => {
+                let h = crate::value::coerce_str(&vars.get_field("h"));
+                let Some((chunks, full)) = self.fx_streams.get_mut(&h) else {
+                    return Value::map(
+                        [
+                            (Value::str("kind"), Value::str("error")),
+                            (Value::str("flow"), Value::str(flow.as_str())),
+                            (Value::str("to"), Value::str("server")),
+                            (Value::str("err"), Value::str(format!("unknown stream {h}"))),
+                        ]
+                        .into_iter()
+                        .collect(),
+                    );
+                };
+                match chunks.pop_front() {
+                    Some(delta) => reply(result(vec![("delta", Value::str(delta))])),
+                    None => {
+                        let full = full.clone();
+                        self.fx_streams.remove(&h);
+                        reply(result(vec![
+                            ("done", Value::Bool(true)),
+                            ("text", Value::str(full)),
+                        ]))
+                    }
+                }
+            }
+            other => Value::map(
+                [
+                    (Value::str("kind"), Value::str("error")),
+                    (Value::str("flow"), Value::str(flow.as_str())),
+                    (Value::str("to"), Value::str("server")),
+                    (Value::str("err"), Value::str(format!("unknown effect {other}"))),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+        }
     }
 
     pub fn data_dir(&self) -> &Path {
@@ -271,6 +402,18 @@ impl Cluster {
             let to = pkt.get_field("to");
             let to = crate::value::coerce_str(&to);
             match to.as_str() {
+                "@effects" => {
+                    let reply = self.handle_effect(&pkt);
+                    let line = format!(
+                        "        ~ wire @effects -> server   reply value={}",
+                        reply.get_field("value")
+                    );
+                    self.shared.emit(line);
+                    match encode(&reply) {
+                        Ok(bytes) => self.shared.queue.push_back(bytes),
+                        Err(e) => self.shared.emit(format!("!! unencodable effect reply: {e}")),
+                    }
+                }
                 "server" => {
                     let mut platform = SimPlatform {
                         label: "server".into(),

@@ -166,6 +166,61 @@ fn marks_rejected_inside_branches() {
 }
 
 #[test]
+fn marks_rejected_inside_while() {
+    let src = "fn f(x) { while x { server!(); } }";
+    let err = match hoprt::compiler::compile(src) {
+        Err(e) => e,
+        Ok(_) => panic!("mark in while compiled"),
+    };
+    assert!(err.contains("top level"), "{err}");
+}
+
+#[test]
+fn while_loops_run() {
+    let src = r#"
+        fn go() {
+          let n = 3;
+          let acc = "";
+          while n > 0 {
+            acc = acc .. n;
+            n = n - 1;
+          }
+          print("acc " .. acc);
+          while false {
+            print("never");
+          }
+        }
+    "#;
+    let mut host = Cluster::new(&["A"], src, false).expect("cluster");
+    host.fire("A", "go");
+    host.pump();
+    let all = host.log().join("\n");
+    assert!(all.contains("acc 321"), "{all}");
+    assert!(!all.contains("never"), "{all}");
+}
+
+#[test]
+fn json_and_type_natives() {
+    let src = r#"
+        fn go() {
+          let v = json.decode("{\"a\":1,\"b\":[true,null]}");
+          print(type(v) .. " a=" .. v.a);
+          print(json.encode(v));
+          print("bad=" .. type(json.decode("not json")));
+          print("scalar=" .. type(json.decode("42")));
+        }
+    "#;
+    let mut host = Cluster::new(&["A"], src, false).expect("cluster");
+    host.fire("A", "go");
+    host.pump();
+    let all = host.log().join("\n");
+    assert!(all.contains("map a=1"), "{all}");
+    assert!(all.contains(r#"{"a":1,"b":[true,null]}"#), "{all}");
+    assert!(all.contains("bad=nil"), "{all}");
+    assert!(all.contains("scalar=int"), "{all}");
+}
+
+#[test]
 fn match_dispatches_on_type_and_destructures() {
     let src = r#"
         fn handle(event) {

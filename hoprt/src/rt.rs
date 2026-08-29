@@ -22,9 +22,13 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use crate::interp::{self, Exec, Globals, Host, Outcome};
+use crate::interp::{self, Exec, Globals, Host, NativeOut, Outcome};
 use crate::ir::Program;
 use crate::value::{NativeId, Value};
+
+/// The pseudo-address effect calls are sent to. Not a VM: the platform
+/// runs the effect off-thread and sends the reply itself.
+pub const EFFECTS_ADDR: &str = "@effects";
 
 /// What the embedder provides: transport, transcript, DOM (browser), and
 /// the durable store (server). See harness.rs and serve.rs.
@@ -119,9 +123,24 @@ impl Vm {
             ("len", NativeId::Len),
             ("sort_by", NativeId::SortBy),
             ("floor", NativeId::Floor),
+            ("type", NativeId::TypeOf),
+            ("bash", NativeId::Bash),
         ] {
             globals.set(name, Value::Native(id));
         }
+        // llm is a callable (full completion) whose fields are the
+        // streaming surface: llm.stream(req) → handle, llm.next(h) → chunk
+        globals.set("llm", Value::Native(NativeId::LlmCall));
+        let json_mod = Value::map(
+            [
+                ("encode", Value::Native(NativeId::JsonEncode)),
+                ("decode", Value::Native(NativeId::JsonDecode)),
+            ]
+            .into_iter()
+            .map(|(k, v)| (Value::str(k), v))
+            .collect(),
+        );
+        globals.set("json", json_mod);
 
         // the store is one callable: store(path). Its module surface —
         // shape constructors, the tape, navigators — is field access on
@@ -414,6 +433,17 @@ enum RunResult {
     Failed(String),
 }
 
+/// Wire name of an effect (the `hop` field of its call packet).
+pub fn effect_hop(id: NativeId) -> &'static str {
+    match id {
+        NativeId::Bash => "bash",
+        NativeId::LlmCall => "llm",
+        NativeId::LlmStream => "llm_start",
+        NativeId::LlmNext => "llm_next",
+        _ => "?",
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The per-step Host: bridges interpreter needs to VM state + platform
 // ---------------------------------------------------------------------------
@@ -459,30 +489,30 @@ impl Host for StepHost<'_> {
         }
     }
 
-    fn native(&mut self, id: NativeId, args: Vec<Value>) -> Result<Value, String> {
+    fn native(&mut self, id: NativeId, args: Vec<Value>) -> Result<NativeOut, String> {
         match id {
             NativeId::DomGet => {
                 let sel = args
                     .first()
                     .and_then(Value::as_str)
                     .ok_or("dom.get(selector)")?;
-                Ok(Value::str(self.platform.dom_get(sel)))
+                Ok(NativeOut::Val(Value::str(self.platform.dom_get(sel))))
             }
             NativeId::DomSet => {
                 let sel = args.first().and_then(Value::as_str).ok_or("dom.set(selector, html)")?;
                 let html = args.get(1).map(crate::value::coerce_str).unwrap_or_default();
                 self.platform.dom_set(sel, &html);
-                Ok(Value::Nil)
+                Ok(NativeOut::Val(Value::Nil))
             }
             NativeId::DomClear => {
                 let sel = args.first().and_then(Value::as_str).ok_or("dom.clear(selector)")?;
                 self.platform.dom_clear(sel);
-                Ok(Value::Nil)
+                Ok(NativeOut::Val(Value::Nil))
             }
             NativeId::DomFocus => {
                 let sel = args.first().and_then(Value::as_str).ok_or("dom.focus(selector)")?;
                 self.platform.dom_focus(sel);
-                Ok(Value::Nil)
+                Ok(NativeOut::Val(Value::Nil))
             }
             NativeId::HuiRender => {
                 let sel = args
@@ -493,12 +523,49 @@ impl Host for StepHost<'_> {
                 let node = args.get(1).cloned().unwrap_or(Value::Nil);
                 let html = crate::builtins::hui_render(self.hui, &sel, &node)?;
                 self.platform.dom_set(&sel, &html);
-                Ok(Value::Nil)
+                Ok(NativeOut::Val(Value::Nil))
+            }
+            // Effects suspend the flow and run on the platform: the tab
+            // never gets these capabilities (and hopd's VM ignores hop
+            // ids it didn't mint, so a forged packet can't reach them).
+            NativeId::Bash | NativeId::LlmCall | NativeId::LlmStream | NativeId::LlmNext => {
+                if !matches!(self.side, SideId::Server) {
+                    return Err(format!("{} is server-side only", effect_hop(id)));
+                }
+                let vars = match id {
+                    NativeId::Bash => {
+                        let cmd = args
+                            .first()
+                            .and_then(Value::as_str)
+                            .ok_or("bash(cmd) expects a command string")?;
+                        mk_map(vec![("cmd", Value::str(cmd))])
+                    }
+                    NativeId::LlmCall | NativeId::LlmStream => {
+                        let req = args.first().cloned().unwrap_or(Value::Nil);
+                        if !matches!(req, Value::Map(_)) {
+                            return Err("llm expects a request map ({ messages = [...] })".into());
+                        }
+                        mk_map(vec![("req", req)])
+                    }
+                    NativeId::LlmNext => {
+                        let h = args
+                            .first()
+                            .and_then(Value::as_str)
+                            .ok_or("llm.next(handle) expects a stream handle")?;
+                        mk_map(vec![("h", Value::str(h))])
+                    }
+                    _ => unreachable!(),
+                };
+                Ok(NativeOut::Suspend {
+                    target: Value::str(EFFECTS_ADDR),
+                    hop: effect_hop(id).to_string(),
+                    vars,
+                })
             }
             // store natives are the platform's (server has one; a browser
             // platform answers None and this errors cleanly)
             other => match self.platform.store_native(other, args, self.prog) {
-                Some(r) => r,
+                Some(r) => r.map(NativeOut::Val),
                 None => Err(format!("{other:?} is not available on this side")),
             },
         }

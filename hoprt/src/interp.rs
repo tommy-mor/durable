@@ -32,6 +32,15 @@ pub enum Outcome {
     Error(String),
 }
 
+/// What a host native produces: a value, or a suspension. A suspending
+/// native parks the exec exactly like `At` — the reply value resumes the
+/// call site as the native's return value. This is how long-running
+/// effects (bash, llm) run without blocking the VM.
+pub enum NativeOut {
+    Val(Value),
+    Suspend { target: Value, hop: String, vars: Value },
+}
+
 /// Per-VM shared bindings: named fns, natives, module tables, server lets.
 /// Shared by every execution on the VM; the runtime seeds them.
 #[derive(Default, Clone)]
@@ -58,7 +67,7 @@ pub trait Host {
     /// the spawn site.
     fn spawn(&mut self, callee: Value, args: Vec<Value>) -> Result<(), String>;
     fn session(&mut self) -> Result<Value, String>;
-    fn native(&mut self, id: NativeId, args: Vec<Value>) -> Result<Value, String>;
+    fn native(&mut self, id: NativeId, args: Vec<Value>) -> Result<NativeOut, String>;
 }
 
 fn new_frame(f: &Function, fn_idx: usize, caps: &[Value], args: Vec<Value>) -> Frame {
@@ -259,6 +268,11 @@ pub fn run(
                             None => err!("store has no field .{}", name),
                         }
                     }
+                    Value::Native(NativeId::LlmCall) => match name {
+                        "stream" => push!(Value::Native(NativeId::LlmStream)),
+                        "next" => push!(Value::Native(NativeId::LlmNext)),
+                        _ => err!("llm has no field .{}", name),
+                    },
                     Value::Nil => err!("field .{} of nil", name),
                     o => err!("field .{} of {}", name, o.kind()),
                 }
@@ -330,7 +344,10 @@ pub fn run(
                         exec.frames.push(new);
                     }
                     Value::Native(id) => match call_native(id, args, host) {
-                        Ok(v) => push!(v),
+                        Ok(NativeOut::Val(v)) => push!(v),
+                        Ok(NativeOut::Suspend { target, hop, vars }) => {
+                            return Outcome::Suspend { target, hop, vars }
+                        }
                         Err(e) => err!("{e}"),
                     },
                     Value::Nil => err!("calling nil (unknown function?)"),
@@ -542,8 +559,8 @@ fn arith(op: BinOp, a: Value, b: Value) -> Result<Value, String> {
 // Pure natives (contextual ones go to the Host)
 // ---------------------------------------------------------------------------
 
-fn call_native(id: NativeId, mut args: Vec<Value>, host: &mut dyn Host) -> Result<Value, String> {
-    match id {
+fn call_native(id: NativeId, mut args: Vec<Value>, host: &mut dyn Host) -> Result<NativeOut, String> {
+    let r: Result<Value, String> = match id {
         NativeId::Print => {
             let line = args.iter().map(coerce_str).collect::<Vec<_>>().join(" ");
             host.print(line);
@@ -631,6 +648,25 @@ fn call_native(id: NativeId, mut args: Vec<Value>, host: &mut dyn Host) -> Resul
             Some(Value::Float(f)) => Ok(Value::Int(f.floor() as i64)),
             _ => Err("floor expects a number".into()),
         },
+        // type(v) → the kind name ("nil", "int", "map", …) — the guard
+        // for data of unknown shape (e.g. whatever json.decode returned).
+        NativeId::TypeOf => Ok(Value::str(
+            args.first().map(Value::kind).unwrap_or("nil"),
+        )),
+        // json.encode(v) → string; json.decode(s) → value, nil if unparsable
+        // (absence = nil, per the value model — parse failure is data).
+        NativeId::JsonEncode => {
+            let v = args.first().cloned().unwrap_or(Value::Nil);
+            let j = crate::value::to_json(&v)?;
+            serde_json::to_string(&j).map(Value::str).map_err(|e| e.to_string())
+        }
+        NativeId::JsonDecode => match args.first().and_then(Value::as_str) {
+            Some(s) => Ok(match serde_json::from_str::<serde_json::Value>(s) {
+                Ok(j) => crate::value::from_json(&j),
+                Err(_) => Value::Nil,
+            }),
+            None => Err("json.decode expects a string".into()),
+        },
         // schema shape constructors are pure data builders
         NativeId::ShapeMap | NativeId::ShapeList | NativeId::ShapeDeque => {
             let of = args.first().cloned().unwrap_or(Value::Nil);
@@ -693,6 +729,7 @@ fn call_native(id: NativeId, mut args: Vec<Value>, host: &mut dyn Host) -> Resul
             let v = args.first().cloned().unwrap_or(Value::Nil);
             Ok(Value::tagged("term", Value::array(vec![Value::str(op), v])))
         }
-        other => host.native(other, args),
-    }
+        other => return host.native(other, args),
+    };
+    r.map(NativeOut::Val)
 }

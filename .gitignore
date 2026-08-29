@@ -37,4 +37,7 @@ target/
 # hopd default data dir
 hop-data/
 
+# secrets (hopd loads this at startup)
+.env
+
 repomix-output.xml

@@ -1,0 +1,182 @@
+// agent.hop — a coding agent in one file: chat UI, streamed LLM turns,
+// an approval-gated bash tool, and a transcript that survives restarts
+// because it lives on the tape.
+//
+//   export OPENAI_API_KEY=...           (and optionally OPENAI_BASE_URL)
+//   export HOP_LLM_MODEL=gpt-4o-mini    (or pass model in the request)
+//   cargo run -p hoprt --bin hopd -- hoprt/hop/agent.hop
+//   open http://localhost:9000 — ask something, approve a command.
+//   restart hopd mid-conversation: the transcript is still there.
+//
+// The shape of the thing: the model loop lives on the server as events on
+// the tape (user / assistant / tool_request / tool_result), placement
+// marks appear only at the human gates (send, approve, deny), and the
+// long calls — llm.stream, llm.next, bash — suspend the flow while the VM
+// keeps serving every connected tab. The browser can append events and
+// render; it never sees the API key and cannot reach bash.
+
+server let schema = store.record([
+  ["msgs", store.list(store.leaf)],   // { role, text } — the transcript
+  ["pending", store.leaf],            // command string awaiting approval
+  ["busy", store.leaf]                // a turn is in flight
+]);
+
+fn reduce(event) {
+  match event {
+    user { text } => {
+      store(["msgs", store.push({ role = "user", text = text })]);
+      store(["busy", store.set(true)]);
+    }
+    assistant { text } => {
+      store(["msgs", store.push({ role = "assistant", text = text })]);
+      store(["busy", store.set(false)]);
+    }
+    tool_request { cmd } => {
+      store(["msgs", store.push({ role = "tool_request", text = cmd })]);
+      store(["pending", store.set(cmd)]);
+      store(["busy", store.set(false)]);
+    }
+    tool_result { output } => {
+      store(["msgs", store.push({ role = "tool", text = output })]);
+      store(["pending", store.del]);
+      store(["busy", store.set(true)]);
+    }
+    tool_denied => {
+      store(["msgs", store.push({ role = "tool", text = "(user declined to run the command)" })]);
+      store(["pending", store.del]);
+      store(["busy", store.set(true)]);
+    }
+  }
+}
+
+// ── the turn: stream, parse, either answer or ask to run a tool ─────────
+
+fn llm_messages() {
+  let sys = "You are a coding agent running in the user's project directory. To run a shell command, reply with ONLY a JSON object {\"tool\":\"bash\",\"cmd\":\"...\"} and nothing else. Otherwise answer in plain text.";
+  let out = [{ role = "system", content = sys }];
+  let msgs = store(["msgs"]);
+  if msgs {
+    for i, m in msgs {
+      if m.role == "user" {
+        push(out, { role = "user", content = m.text });
+      } else if m.role == "tool" {
+        push(out, { role = "user", content = "tool output:\n" .. m.text });
+      } else {
+        // assistant text and the model's own tool_request JSON
+        push(out, { role = "assistant", content = m.text });
+      }
+    }
+  }
+  return out;
+}
+
+fn run_turn() {
+  let h = llm.stream({ messages = llm_messages() });
+  let acc = "";
+  let out = llm.next(h);
+  while out.delta {
+    acc = acc .. out.delta;
+    cast browsers { hui.render("#stream", "assistant: " .. acc); }
+    out = llm.next(h);
+  }
+  if out.error {
+    store.append({ type = "assistant", text = "[llm error] " .. out.error });
+    paint_all();
+    return;
+  }
+  let text = out.text;
+  let call = json.decode(text);
+  if type(call) == "map" && call.tool == "bash" && type(call.cmd) == "string" {
+    store.append({ type = "tool_request", cmd = call.cmd });
+  } else {
+    store.append({ type = "assistant", text = text });
+  }
+  paint_all();
+}
+
+// ── human gates: the only marked functions in the file ──────────────────
+
+fn send() {
+  let text = dom.get("#draft");
+  if text == "" {
+    return;
+  }
+  dom.clear("#draft");
+  server!();
+  store.append({ type = "user", text = text });
+  paint_all();
+  spawn run_turn();
+}
+
+fn approve() {
+  server!();
+  let cmd = store(["pending"]);
+  if !cmd {
+    return;
+  }
+  let r = bash(cmd);
+  let output = "";
+  if r.ok {
+    output = r.stdout;
+  } else if r.error {
+    output = "error: " .. r.error;
+  } else {
+    output = "exit " .. r.status .. "\n" .. r.stderr .. r.stdout;
+  }
+  store.append({ type = "tool_result", cmd = cmd, output = output });
+  paint_all();
+  spawn run_turn();
+}
+
+fn deny() {
+  server!();
+  store.append({ type = "tool_denied" });
+  paint_all();
+  spawn run_turn();
+}
+
+// ── view ─────────────────────────────────────────────────────────────────
+
+fn agent_app(msgs, pending, busy) {
+  let rows = [];
+  if msgs {
+    for i, m in msgs {
+      push(rows, [:li, { class = m.role },
+        [:span, { class = "meta" }, m.role .. ": "],
+        m.text
+      ]);
+    }
+  }
+  let gate = [];
+  if pending {
+    gate = [:div, { class = "row", id = "approval" },
+      [:span, {}, "run `" .. pending .. "` ? "],
+      [:button, { id = "approve", onclick = fn(e) { approve(); } }, "run it"],
+      [:button, { id = "deny", onclick = fn(e) { deny(); } }, "no"]
+    ];
+  }
+  return [:div, {},
+    [:h1, {}, "agent"],
+    [:ul, { id = "transcript" }, rows],
+    [:p, { class = "meta", id = "stream" }],
+    gate,
+    [:div, { class = "row" },
+      [:input, { id = "draft", placeholder = busy && "thinking..." || "ask, or try: RUN: echo hi" }],
+      [:button, { id = "send", onclick = fn(e) { send(); } }, "send"]
+    ]
+  ];
+}
+
+fn paint_all() {
+  let msgs = store(["msgs"]);
+  let pending = store(["pending"]);
+  let busy = store(["busy"]);
+  cast browsers { hui.render("#app", agent_app(msgs, pending, busy)); }
+}
+
+fn on_connect(sid) {
+  let msgs = store(["msgs"]);
+  let pending = store(["pending"]);
+  let busy = store(["busy"]);
+  cast session(sid) { hui.render("#app", agent_app(msgs, pending, busy)); }
+}

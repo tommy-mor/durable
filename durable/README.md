@@ -247,3 +247,9 @@ segments only. The multiplayer todo app is the full loop:
 cargo run -p hoprt --bin hopd -- hoprt/hop/todo.hop
 # open http://localhost:9000 — restart hopd; the board is still there
 ```
+
+`hoprt/hop/agent.hop` is a coding agent in one file: streamed LLM turns
+(suspending `llm.stream`/`llm.next` natives), an approval-gated `bash`
+tool, and a transcript on the tape — restart hopd mid-conversation and
+the session replays. `OPENAI_API_KEY` + `HOP_LLM_MODEL` configure the
+model; the test harness fakes it so the loop is asserted offline.

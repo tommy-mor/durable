@@ -26,7 +26,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tungstenite::Message;
 
 use crate::ir::Program;
-use crate::rt::{Platform, SideId, Vm};
+use crate::rt::{Platform, SideId, Vm, EFFECTS_ADDR};
 use crate::store::{self, StoreBinding};
 use crate::value::{decode, encode, NativeId, Value};
 
@@ -42,6 +42,13 @@ enum Ev {
     /// GET /reset — the app's `on_reset` hook decides what reset means
     /// (typically: append a reset event to the log, re-render browsers).
     Reset,
+    /// An effect reply (encoded packet) minted by the effects executor —
+    /// delivered straight to the server VM, never identity-stamped.
+    Effect(Vec<u8>),
+    /// One streamed LLM delta for a stream handle.
+    LlmChunk(String, String),
+    /// Stream finished: full accumulated text, or the error.
+    LlmDone(String, Result<String, String>),
 }
 
 fn session_name(n: usize) -> String {
@@ -252,6 +259,308 @@ impl Platform for ServePlatform<'_> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Effects: bash + llm run off-thread; the flow stays suspended, the VM
+// stays live. A call packet addressed to "@effects" comes only from the
+// server VM's own outbox — a socket packet is delivered to the VM (which
+// ignores hop ids it didn't mint), so tabs cannot reach these.
+// ---------------------------------------------------------------------------
+
+/// Env-configured LLM endpoint (OpenAI-compatible chat completions).
+#[derive(Clone)]
+struct LlmCfg {
+    key: Option<String>,
+    base: String,
+    model: Option<String>,
+}
+
+impl LlmCfg {
+    fn from_env() -> LlmCfg {
+        LlmCfg {
+            key: std::env::var("OPENAI_API_KEY").ok(),
+            base: std::env::var("OPENAI_BASE_URL")
+                .unwrap_or_else(|_| "https://api.openai.com/v1".into()),
+            model: std::env::var("HOP_LLM_MODEL").ok(),
+        }
+    }
+}
+
+struct LlmStream {
+    buf: VecDeque<String>,
+    done: Option<Result<String, String>>,
+    /// A parked llm.next waiting for the next chunk: its flow id.
+    pending: Option<String>,
+}
+
+#[derive(Default)]
+struct Effects {
+    streams: HashMap<String, LlmStream>,
+    next_id: u64,
+}
+
+/// `{ kind:"reply", flow, to:"server", value }` — resumes the parked flow.
+fn effect_reply(flow: &str, value: Value) -> Vec<u8> {
+    let pkt = Value::map(
+        [
+            (Value::str("kind"), Value::str("reply")),
+            (Value::str("flow"), Value::str(flow)),
+            (Value::str("to"), Value::str("server")),
+            (Value::str("value"), value),
+        ]
+        .into_iter()
+        .collect(),
+    );
+    encode(&pkt).expect("effect reply encodes")
+}
+
+fn effect_error(flow: &str, err: &str) -> Vec<u8> {
+    let pkt = Value::map(
+        [
+            (Value::str("kind"), Value::str("error")),
+            (Value::str("flow"), Value::str(flow)),
+            (Value::str("to"), Value::str("server")),
+            (Value::str("err"), Value::str(err)),
+        ]
+        .into_iter()
+        .collect(),
+    );
+    encode(&pkt).expect("effect error encodes")
+}
+
+fn result_map(entries: Vec<(&str, Value)>) -> Value {
+    Value::map(
+        entries
+            .into_iter()
+            .filter(|(_, v)| !matches!(v, Value::Nil))
+            .map(|(k, v)| (Value::str(k), v))
+            .collect(),
+    )
+}
+
+/// Build the chat-completions request body from the hop request map.
+/// `stream` is forced; `model` defaults from the env when absent.
+fn llm_body(req: &Value, cfg: &LlmCfg, stream: bool) -> Result<String, String> {
+    let mut body = crate::value::to_json(req)?;
+    let obj = body.as_object_mut().ok_or("llm request must be a map")?;
+    if !obj.contains_key("model") {
+        match &cfg.model {
+            Some(m) => {
+                obj.insert("model".into(), serde_json::Value::String(m.clone()));
+            }
+            None => return Err("no model: pass req.model or set HOP_LLM_MODEL".into()),
+        }
+    }
+    obj.insert("stream".into(), serde_json::Value::Bool(stream));
+    serde_json::to_string(&body).map_err(|e| e.to_string())
+}
+
+/// POST the request. Returns the response reader, or a printable error
+/// (HTTP status errors include the body — that's where the API explains).
+fn llm_post(cfg: &LlmCfg, body: &str) -> Result<Box<dyn std::io::Read + Send + Sync>, String> {
+    let key = cfg.key.as_deref().ok_or("OPENAI_API_KEY is not set")?;
+    let url = format!("{}/chat/completions", cfg.base.trim_end_matches('/'));
+    let req = ureq::post(&url)
+        .set("Authorization", &format!("Bearer {key}"))
+        .set("Content-Type", "application/json");
+    match req.send_string(body) {
+        Ok(resp) => Ok(resp.into_reader()),
+        Err(ureq::Error::Status(code, resp)) => {
+            let detail = resp.into_string().unwrap_or_default();
+            Err(format!("HTTP {code}: {}", detail.chars().take(400).collect::<String>()))
+        }
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Read an SSE chat-completions stream, calling `on_delta` per content
+/// delta. Returns the accumulated text.
+fn llm_read_stream(
+    reader: Box<dyn std::io::Read + Send + Sync>,
+    mut on_delta: impl FnMut(&str),
+) -> Result<String, String> {
+    use std::io::BufRead;
+    let mut acc = String::new();
+    for line in std::io::BufReader::new(reader).lines() {
+        let line = line.map_err(|e| e.to_string())?;
+        let Some(data) = line.strip_prefix("data:") else { continue };
+        let data = data.trim();
+        if data == "[DONE]" {
+            break;
+        }
+        let j: serde_json::Value = match serde_json::from_str(data) {
+            Ok(j) => j,
+            Err(_) => continue,
+        };
+        if let Some(err) = j.get("error") {
+            return Err(err
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("llm stream error")
+                .to_string());
+        }
+        if let Some(delta) = j["choices"][0]["delta"]["content"].as_str() {
+            if !delta.is_empty() {
+                acc.push_str(delta);
+                on_delta(delta);
+            }
+        }
+    }
+    Ok(acc)
+}
+
+impl Effects {
+    /// Handle a call packet addressed to "@effects": spawn the work,
+    /// reply through the Ev channel. Never blocks the VM thread.
+    fn handle(&mut self, pkt: &Value, tx: &mpsc::Sender<Ev>, cfg: &LlmCfg) {
+        let flow = crate::value::coerce_str(&pkt.get_field("flow"));
+        let hop = pkt.get_field("hop");
+        let vars = pkt.get_field("vars");
+        match hop.as_str().unwrap_or("") {
+            "bash" => {
+                let cmd = crate::value::coerce_str(&vars.get_field("cmd"));
+                let tx = tx.clone();
+                thread::spawn(move || {
+                    let out = std::process::Command::new("bash").arg("-c").arg(&cmd).output();
+                    let value = match out {
+                        Ok(o) => result_map(vec![
+                            ("ok", Value::Bool(o.status.success())),
+                            ("status", Value::Int(o.status.code().unwrap_or(-1) as i64)),
+                            ("stdout", Value::str(String::from_utf8_lossy(&o.stdout).into_owned())),
+                            ("stderr", Value::str(String::from_utf8_lossy(&o.stderr).into_owned())),
+                        ]),
+                        Err(e) => result_map(vec![
+                            ("ok", Value::Bool(false)),
+                            ("error", Value::str(e.to_string())),
+                        ]),
+                    };
+                    let _ = tx.send(Ev::Effect(effect_reply(&flow, value)));
+                });
+            }
+            "llm" => {
+                // one-shot completion: the whole turn in one reply
+                let body = llm_body(&vars.get_field("req"), cfg, false);
+                let cfg = cfg.clone();
+                let tx = tx.clone();
+                thread::spawn(move || {
+                    let run = || -> Result<String, String> {
+                        let mut reader = llm_post(&cfg, &body?)?;
+                        let mut s = String::new();
+                        std::io::Read::read_to_string(&mut reader, &mut s)
+                            .map_err(|e| e.to_string())?;
+                        let j: serde_json::Value =
+                            serde_json::from_str(&s).map_err(|e| e.to_string())?;
+                        j["choices"][0]["message"]["content"]
+                            .as_str()
+                            .map(str::to_string)
+                            .ok_or_else(|| format!("no content in response: {s}"))
+                    };
+                    let value = match run() {
+                        Ok(text) => result_map(vec![
+                            ("ok", Value::Bool(true)),
+                            ("text", Value::str(text)),
+                        ]),
+                        Err(e) => result_map(vec![
+                            ("ok", Value::Bool(false)),
+                            ("error", Value::str(e)),
+                        ]),
+                    };
+                    let _ = tx.send(Ev::Effect(effect_reply(&flow, value)));
+                });
+            }
+            "llm_start" => {
+                self.next_id += 1;
+                let h = format!("llm:{}", self.next_id);
+                self.streams.insert(
+                    h.clone(),
+                    LlmStream { buf: VecDeque::new(), done: None, pending: None },
+                );
+                let body = llm_body(&vars.get_field("req"), cfg, true);
+                let cfg = cfg.clone();
+                let tx_stream = tx.clone();
+                let handle = h.clone();
+                thread::spawn(move || {
+                    let res = body.and_then(|b| llm_post(&cfg, &b)).and_then(|reader| {
+                        llm_read_stream(reader, |delta| {
+                            let _ = tx_stream
+                                .send(Ev::LlmChunk(handle.clone(), delta.to_string()));
+                        })
+                    });
+                    let _ = tx_stream.send(Ev::LlmDone(handle, res));
+                });
+                let _ = tx.send(Ev::Effect(effect_reply(&flow, Value::str(h))));
+            }
+            "llm_next" => {
+                let h = crate::value::coerce_str(&vars.get_field("h"));
+                let Some(stream) = self.streams.get_mut(&h) else {
+                    let _ = tx.send(Ev::Effect(effect_error(&flow, &format!("unknown stream {h}"))));
+                    return;
+                };
+                match Self::next_value(stream) {
+                    Some(v) => {
+                        let finished = stream.buf.is_empty() && stream.done.is_some();
+                        let _ = tx.send(Ev::Effect(effect_reply(&flow, v)));
+                        if finished {
+                            self.streams.remove(&h);
+                        }
+                    }
+                    None => stream.pending = Some(flow),
+                }
+            }
+            other => {
+                let _ = tx.send(Ev::Effect(effect_error(&flow, &format!("unknown effect {other}"))));
+            }
+        }
+    }
+
+    /// The next llm.next reply for a stream, if one is ready: a buffered
+    /// `{delta}`, else the `{done, text}` / `{error}` end marker.
+    fn next_value(stream: &mut LlmStream) -> Option<Value> {
+        if let Some(delta) = stream.buf.pop_front() {
+            return Some(result_map(vec![("delta", Value::str(delta))]));
+        }
+        match &stream.done {
+            Some(Ok(text)) => Some(result_map(vec![
+                ("done", Value::Bool(true)),
+                ("text", Value::str(text.as_str())),
+            ])),
+            Some(Err(e)) => Some(result_map(vec![("error", Value::str(e.as_str()))])),
+            None => None,
+        }
+    }
+
+    /// A delta arrived from the stream thread; wake a parked llm.next.
+    fn on_chunk(&mut self, h: &str, delta: String, tx: &mpsc::Sender<Ev>) {
+        let Some(stream) = self.streams.get_mut(h) else { return };
+        stream.buf.push_back(delta);
+        if Self::wake(stream, tx) {
+            self.streams.remove(h);
+        }
+    }
+
+    fn on_done(&mut self, h: &str, res: Result<String, String>, tx: &mpsc::Sender<Ev>) {
+        let Some(stream) = self.streams.get_mut(h) else { return };
+        stream.done = Some(res);
+        if Self::wake(stream, tx) {
+            self.streams.remove(h);
+        }
+    }
+
+    /// Deliver a reply to a parked llm.next if one is ready. True when
+    /// the final marker went out — the stream record is spent.
+    fn wake(stream: &mut LlmStream, tx: &mpsc::Sender<Ev>) -> bool {
+        if stream.pending.is_none() {
+            return false;
+        }
+        let is_final = stream.buf.is_empty() && stream.done.is_some();
+        if let Some(v) = Self::next_value(stream) {
+            let flow = stream.pending.take().unwrap();
+            let _ = tx.send(Ev::Effect(effect_reply(&flow, v)));
+            return is_final;
+        }
+        false
+    }
+}
+
 /// Run the hop server forever. `app_src` is the .hop source, served to
 /// browsers (they compile it with the same compiler, in wasm). `pkg_dir`
 /// is the hop-web wasm-pack output. `data_dir` holds the JSONL log and
@@ -305,6 +614,8 @@ pub fn serve(
     }
 
     let mut sessions: HashMap<String, mpsc::Sender<Vec<u8>>> = HashMap::new();
+    let mut effects = Effects::default();
+    let llm_cfg = LlmCfg::from_env();
     println!("[hopd] serving http://localhost:{http_port}  (ws on :{ws_port}, CBOR binary)");
 
     for ev in rx {
@@ -371,6 +682,25 @@ pub fn serve(
                     vm.fire(&mut platform, "on_reset", Vec::new());
                 }
             }
+            Ev::Effect(bytes) => {
+                let pkt = match decode(&bytes) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("[hopd] undecodable effect reply: {e}");
+                        continue;
+                    }
+                };
+                if log_packets {
+                    println!("        ~ wire @effects -> server   {pkt}");
+                }
+                let mut platform = ServePlatform {
+                    outbox: &mut outbox,
+                    store: binding.as_mut(),
+                };
+                vm.receive(&mut platform, pkt);
+            }
+            Ev::LlmChunk(h, delta) => effects.on_chunk(&h, delta, &tx),
+            Ev::LlmDone(h, res) => effects.on_done(&h, res, &tx),
         }
         // drain everything the VM emitted in response
         while let Some(pkt) = outbox.pop_front() {
@@ -384,7 +714,11 @@ pub fn serve(
                     crate::value::coerce_str(&pkt.get_field("hop")),
                 );
             }
-            route(&sessions, &pkt);
+            if pkt.get_field("to").as_str() == Some(EFFECTS_ADDR) {
+                effects.handle(&pkt, &tx, &llm_cfg);
+            } else {
+                route(&sessions, &pkt);
+            }
         }
     }
     Ok(())

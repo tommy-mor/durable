@@ -14,7 +14,25 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::rc::Rc;
 
+/// Load `.env` from the working directory: `KEY=VALUE` lines, `#`
+/// comments. Real environment variables win over the file.
+fn load_dotenv() {
+    let Ok(text) = std::fs::read_to_string(".env") else { return };
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else { continue };
+        let (k, v) = (k.trim(), v.trim());
+        if !k.is_empty() && std::env::var_os(k).is_none() {
+            std::env::set_var(k, v);
+        }
+    }
+}
+
 fn main() -> ExitCode {
+    load_dotenv();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut input = None;
     let mut ports: Vec<u16> = Vec::new();

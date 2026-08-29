@@ -83,12 +83,32 @@ asserted by the same transcript tests).
 ## Surface-language stdlib (the Lua names die with Lua)
 
 Ported apps use a flat, small stdlib: `push(xs, v)`, `len(x)`,
-`sort(xs, cmp?)`, `floor(n)`, `tostring(v)`, `tonumber(v)`, `print(...)`,
-plus `session()` and the `store.*` / `hui.*` / `dom.*` modules. Arrays
-are 0-based (hop-values.md); `for i, v in xs` runs 0..len-1; map
-iteration is key-ordered and deterministic. The store is one callable —
-`store(path)`, where collecting and terminal navigators in the path decide
-query vs mutation — specified in [hop-store.md](hop-store.md).
+`sort(xs, cmp?)`, `floor(n)`, `type(v)`, `tostring(v)`, `tonumber(v)`,
+`print(...)`, `json.encode(v)` / `json.decode(s)` (decode of unparsable
+input is `nil` — parse failure is data), plus `session()` and the
+`store.*` / `hui.*` / `dom.*` modules. Arrays are 0-based
+(hop-values.md); `for i, v in xs` runs 0..len-1; `while cond { ... }`
+loops; map iteration is key-ordered and deterministic. The store is one
+callable — `store(path)`, where collecting and terminal navigators in the
+path decide query vs mutation — specified in [hop-store.md](hop-store.md).
+
+## Effects — suspending natives
+
+`bash(cmd)`, `llm(req)`, and the streaming pair `llm.stream(req)` →
+handle / `llm.next(h)` → `{delta}` … `{done, text}` are server-side
+natives that park the flow exactly like `At`: the interpreter returns a
+suspension targeted at the pseudo-address `@effects`, hopd runs the work
+off-thread, and the reply resumes the call site — the VM keeps serving
+every tab while a command or a model turn is in flight. Results are data
+(`{ ok = false, stderr = ... }`, `{ error = ... }`), never exceptions: a
+failed command is an observation. Effect calls are minted only by the
+server VM's own outbox — a tab cannot reach them, and a reducer rejects
+them (replay must stay deterministic). The llm endpoint is any
+OpenAI-compatible chat-completions API (`OPENAI_API_KEY`,
+`OPENAI_BASE_URL`, `HOP_LLM_MODEL`); the harness substitutes a
+deterministic fake so app tests run offline. `hop/agent.hop` is the
+demonstration: a coding agent in one file — the turn loop lives on the
+tape, placement marks appear only at the human approval gate.
 
 ## match
 
