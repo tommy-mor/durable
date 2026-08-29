@@ -116,3 +116,36 @@ fn agent_chat_tool_loop_and_replay() {
     // the tape is the session: incremental execution == replay from zero
     host.verify().unwrap();
 }
+
+#[test]
+fn agent_auto_approve_runs_tools_without_the_gate() {
+    let mut host =
+        Cluster::new(&["A"], include_str!("../hop/agent.hop"), false).expect("cluster");
+    host.fire("A", "toggle_auto");
+    host.pump();
+    assert_eq!(host.store_get(arr(vec![s("auto")])).unwrap(), Value::Bool(true));
+    assert!(host.dom("A", "#app").contains("auto-approve: on"), "toggle rendered");
+
+    host.set_dom("A", "#draft", "RUN: echo auto_ok");
+    host.fire("A", "send");
+    host.pump();
+    host.assert_quiescent();
+
+    // no gate: the whole turn ran — request, result, model follow-up
+    assert_eq!(host.store_get(arr(vec![s("pending")])).unwrap(), Value::Nil);
+    // msgs: 0 user, 1 tool_request, 2 tool, 3 assistant
+    let m2 = host.store_get(arr(vec![s("msgs"), Value::Int(2)])).unwrap();
+    assert_eq!(m2.get_field("role"), s("tool"));
+    assert!(
+        hoprt::value::coerce_str(&m2.get_field("text")).contains("auto_ok"),
+        "tool ran ungated: {m2}"
+    );
+    let m3 = host.store_get(arr(vec![s("msgs"), Value::Int(3)])).unwrap();
+    assert_eq!(m3.get_field("role"), s("assistant"));
+
+    // toggling back re-arms the gate
+    host.fire("A", "toggle_auto");
+    host.pump();
+    assert_eq!(host.store_get(arr(vec![s("auto")])).unwrap(), Value::Bool(false));
+    host.verify().unwrap();
+}

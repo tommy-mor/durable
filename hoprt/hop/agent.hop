@@ -18,7 +18,8 @@
 server let schema = store.record([
   ["msgs", store.list(store.leaf)],   // { role, text } — the transcript
   ["pending", store.leaf],            // command string awaiting approval
-  ["busy", store.leaf]                // a turn is in flight
+  ["busy", store.leaf],               // a turn is in flight
+  ["auto", store.leaf]                // auto-approve: tools run ungated
 ]);
 
 fn reduce(event) {
@@ -45,6 +46,9 @@ fn reduce(event) {
       store(["msgs", store.push({ role = "tool", text = "(user declined to run the command)" })]);
       store(["pending", store.del]);
       store(["busy", store.set(true)]);
+    }
+    set_auto { on } => {
+      store(["auto", store.set(on)]);
     }
   }
 }
@@ -88,10 +92,32 @@ fn run_turn() {
   let call = json.decode(text);
   if type(call) == "map" && call.tool == "bash" && type(call.cmd) == "string" {
     store.append({ type = "tool_request", cmd = call.cmd });
+    paint_all();
+    if store(["auto"]) {
+      run_tool(call.cmd);
+    }
   } else {
     store.append({ type = "assistant", text = text });
+    paint_all();
   }
+}
+
+// Run one approved (or auto-approved) command and resume the turn.
+// Server-side, unmarked: called from approve's server segment and from
+// run_turn; bash suspends the flow, never the VM.
+fn run_tool(cmd) {
+  let r = bash(cmd);
+  let output = "";
+  if r.ok {
+    output = r.stdout;
+  } else if r.error {
+    output = "error: " .. r.error;
+  } else {
+    output = "exit " .. r.status .. "\n" .. r.stderr .. r.stdout;
+  }
+  store.append({ type = "tool_result", cmd = cmd, output = output });
   paint_all();
+  spawn run_turn();
 }
 
 // ── human gates: the only marked functions in the file ──────────────────
@@ -114,18 +140,14 @@ fn approve() {
   if !cmd {
     return;
   }
-  let r = bash(cmd);
-  let output = "";
-  if r.ok {
-    output = r.stdout;
-  } else if r.error {
-    output = "error: " .. r.error;
-  } else {
-    output = "exit " .. r.status .. "\n" .. r.stderr .. r.stdout;
-  }
-  store.append({ type = "tool_result", cmd = cmd, output = output });
+  run_tool(cmd);
+}
+
+fn toggle_auto() {
+  server!();
+  let auto = store(["auto"]);
+  store.append({ type = "set_auto", on = !auto });
   paint_all();
-  spawn run_turn();
 }
 
 fn deny() {
@@ -137,7 +159,7 @@ fn deny() {
 
 // ── view ─────────────────────────────────────────────────────────────────
 
-fn agent_app(msgs, pending, busy) {
+fn agent_app(msgs, pending, busy, auto) {
   let rows = [];
   if msgs {
     for i, m in msgs {
@@ -161,8 +183,14 @@ fn agent_app(msgs, pending, busy) {
     [:p, { class = "meta", id = "stream" }],
     gate,
     [:div, { class = "row" },
-      [:input, { id = "draft", placeholder = busy && "thinking..." || "ask, or try: RUN: echo hi" }],
-      [:button, { id = "send", onclick = fn(e) { send(); } }, "send"]
+      [:input, {
+        id = "draft",
+        placeholder = busy && "thinking..." || "ask, or try: RUN: echo hi",
+        onkeydown = fn(e) { if e.key == "Enter" { send(); } }
+      }],
+      [:button, { id = "send", onclick = fn(e) { send(); } }, "send"],
+      [:button, { id = "auto", class = "meta", onclick = fn(e) { toggle_auto(); } },
+        auto && "auto-approve: on" || "auto-approve: off"]
     ]
   ];
 }
@@ -171,12 +199,14 @@ fn paint_all() {
   let msgs = store(["msgs"]);
   let pending = store(["pending"]);
   let busy = store(["busy"]);
-  cast browsers { hui.render("#app", agent_app(msgs, pending, busy)); }
+  let auto = store(["auto"]);
+  cast browsers { hui.render("#app", agent_app(msgs, pending, busy, auto)); }
 }
 
 fn on_connect(sid) {
   let msgs = store(["msgs"]);
   let pending = store(["pending"]);
   let busy = store(["busy"]);
-  cast session(sid) { hui.render("#app", agent_app(msgs, pending, busy)); }
+  let auto = store(["auto"]);
+  cast session(sid) { hui.render("#app", agent_app(msgs, pending, busy, auto)); }
 }
