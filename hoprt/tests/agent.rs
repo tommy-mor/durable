@@ -87,8 +87,9 @@ fn agent_chat_tool_loop_and_replay() {
     assert_eq!(title, s("hello agent"));
 
     // streaming painted partials into #stream before the turn committed
+    // (as markdown now, so the partial arrives wrapped in the .md div)
     let streamed = host.dom("A", "#stream");
-    assert!(streamed.starts_with("assistant: "), "{streamed}");
+    assert!(streamed.contains("assistant: "), "{streamed}");
 
     // a tool turn: fake model answers with a bash tool call → approval gate
     host.set_dom("A", "#draft", "RUN: echo hop_tool_ok");

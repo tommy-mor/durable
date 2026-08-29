@@ -609,6 +609,13 @@ fn call_native(id: NativeId, mut args: Vec<Value>, host: &mut dyn Host) -> Resul
                 o => Err(format!("push into {}", o.kind())),
             }
         }
+        // markdown(s) → a hiccup tree; render it like any other node.
+        // Text stays text all the way down: hui escapes it, so model
+        // output cannot inject markup.
+        NativeId::Markdown => match args.first().and_then(Value::as_str) {
+            Some(s) => Ok(crate::builtins::markdown_hiccup(s)),
+            None => Err("markdown(text) expects a string".into()),
+        },
         NativeId::Len => match args.first() {
             Some(Value::Array(a)) => Ok(Value::Int(a.borrow().len() as i64)),
             Some(Value::Map(m)) => Ok(Value::Int(m.borrow().len() as i64)),

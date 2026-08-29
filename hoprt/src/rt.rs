@@ -124,6 +124,7 @@ impl Vm {
             ("sort_by", NativeId::SortBy),
             ("floor", NativeId::Floor),
             ("type", NativeId::TypeOf),
+            ("markdown", NativeId::Markdown),
             ("bash", NativeId::Bash),
         ] {
             globals.set(name, Value::Native(id));

@@ -63,6 +63,7 @@ pub enum NativeId {
     LlmStream,
     LlmNext,
     LlmModels,
+    Markdown,
 }
 
 #[derive(Clone)]

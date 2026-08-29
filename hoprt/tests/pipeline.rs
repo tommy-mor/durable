@@ -239,6 +239,27 @@ fn json_and_type_natives() {
 }
 
 #[test]
+fn markdown_renders_hiccup_with_escaping() {
+    let src = r##"
+        fn go() {
+          hui.render("#x", markdown("# Title\n\nsome *em* and `code`\n\n- a\n- b\n\n```sh\nls -la\n```\n\n<script>alert(1)</script>"));
+        }
+    "##;
+    let mut host = Cluster::new(&["A"], src, false).expect("cluster");
+    host.fire("A", "go");
+    host.pump();
+    let html = host.dom("A", "#x");
+    assert!(html.contains("<h1>Title</h1>"), "{html}");
+    assert!(html.contains("<em>em</em>"), "{html}");
+    assert!(html.contains("<code>code</code>"), "{html}");
+    assert!(html.contains("<ul><li>a</li><li>b</li></ul>"), "{html}");
+    assert!(html.contains(r#"<pre class="lang-sh">ls -la"#), "{html}");
+    // raw HTML from the model is text, never markup
+    assert!(!html.contains("<script>"), "{html}");
+    assert!(html.contains("&lt;script&gt;"), "{html}");
+}
+
+#[test]
 fn match_dispatches_on_type_and_destructures() {
     let src = r#"
         fn handle(event) {

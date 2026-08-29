@@ -24,6 +24,21 @@
     @media (max-width: 640px) { .cols { grid-template-columns: 1fr; } }
     #status { color: #999; font-size: 0.85rem; margin-top: 24px; }
     .settings input { font-size: 0.85rem; color: #555; }
+    .md { display: inline-block; vertical-align: top; max-width: 100%; }
+    .md p { margin: 4px 0; }
+    .md h1, .md h2, .md h3, .md h4 { font-size: 1rem; margin: 8px 0 4px; }
+    .md pre { background: #f6f6f6; border-radius: 6px; padding: 8px; margin: 4px 0;
+              font-size: 0.8rem; white-space: pre-wrap; word-break: break-word;
+              max-height: 320px; overflow-y: auto; }
+    .md code { background: #f2f2f2; border-radius: 3px; padding: 0 3px;
+               font-size: 0.85em; }
+    .md pre code { background: none; padding: 0; }
+    .md blockquote { border-left: 3px solid #ddd; margin: 4px 0; padding-left: 10px;
+                     color: #666; }
+    .md ul, .md ol { margin: 4px 0; padding-left: 22px; }
+    .md ul li, .md ol li { list-style: revert; border-bottom: none; padding: 2px 0; }
+    .md table { border-collapse: collapse; margin: 4px 0; }
+    .md td { border: 1px solid #ddd; padding: 4px 8px; }
     .tabs { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 12px; }
     .tabs .tab { padding: 4px 10px; font-size: 0.85rem; border: 1px solid #ddd;
                  border-radius: 14px; background: #fff; max-width: 180px;

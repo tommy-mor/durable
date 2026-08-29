@@ -284,6 +284,11 @@ fn agent_app(sid, tid, threads, msgs, pending, busy, auto, model, models, home) 
         ]);
       } else if m.role == "tool" {
         push(rows, [:li, { class = "tool" }, [:pre, {}, m.text]]);
+      } else if m.role == "assistant" {
+        push(rows, [:li, { class = "assistant" },
+          [:span, { class = "meta" }, "assistant: "],
+          markdown(m.text)
+        ]);
       } else {
         push(rows, [:li, { class = m.role },
           [:span, { class = "meta" }, m.role .. ": "],
@@ -382,7 +387,7 @@ fn paint_stream(tid, text) {
   if sids {
     for i, sid in sids {
       if store(["views", sid]) == tid {
-        cast session(sid) { hui.render("#stream", text); }
+        cast session(sid) { hui.render("#stream", markdown(text)); }
       }
     }
   }
