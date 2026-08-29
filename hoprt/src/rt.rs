@@ -441,6 +441,7 @@ pub fn effect_hop(id: NativeId) -> &'static str {
         NativeId::LlmCall => "llm",
         NativeId::LlmStream => "llm_start",
         NativeId::LlmNext => "llm_next",
+        NativeId::LlmModels => "llm_models",
         _ => "?",
     }
 }
@@ -529,7 +530,11 @@ impl Host for StepHost<'_> {
             // Effects suspend the flow and run on the platform: the tab
             // never gets these capabilities (and hopd's VM ignores hop
             // ids it didn't mint, so a forged packet can't reach them).
-            NativeId::Bash | NativeId::LlmCall | NativeId::LlmStream | NativeId::LlmNext => {
+            NativeId::Bash
+            | NativeId::LlmCall
+            | NativeId::LlmStream
+            | NativeId::LlmNext
+            | NativeId::LlmModels => {
                 if !matches!(self.side, SideId::Server) {
                     return Err(format!("{} is server-side only", effect_hop(id)));
                 }
@@ -539,7 +544,14 @@ impl Host for StepHost<'_> {
                             .first()
                             .and_then(Value::as_str)
                             .ok_or("bash(cmd) expects a command string")?;
-                        mk_map(vec![("cmd", Value::str(cmd))])
+                        // optional second arg: the working directory
+                        let mut fields = vec![("cmd", Value::str(cmd))];
+                        if let Some(dir) = args.get(1).and_then(Value::as_str) {
+                            if !dir.is_empty() {
+                                fields.push(("dir", Value::str(dir)));
+                            }
+                        }
+                        mk_map(fields)
                     }
                     NativeId::LlmCall | NativeId::LlmStream => {
                         let req = args.first().cloned().unwrap_or(Value::Nil);
@@ -555,6 +567,7 @@ impl Host for StepHost<'_> {
                             .ok_or("llm.next(handle) expects a stream handle")?;
                         mk_map(vec![("h", Value::str(h))])
                     }
+                    NativeId::LlmModels => mk_map(vec![]),
                     _ => unreachable!(),
                 };
                 Ok(NativeOut::Suspend {

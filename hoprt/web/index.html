@@ -23,6 +23,18 @@
     .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
     @media (max-width: 640px) { .cols { grid-template-columns: 1fr; } }
     #status { color: #999; font-size: 0.85rem; margin-top: 24px; }
+    .settings input { font-size: 0.85rem; color: #555; }
+    .tabs { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 12px; }
+    .tabs .tab { padding: 4px 10px; font-size: 0.85rem; border: 1px solid #ddd;
+                 border-radius: 14px; background: #fff; max-width: 180px;
+                 white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .tabs .tab.current { background: #222; color: #fff; border-color: #222; }
+    li.user { background: #f4f8ff; }
+    li.tool_request code { font-family: ui-monospace, Menlo, monospace; font-size: 0.9rem; }
+    li.tool { padding: 4px 8px; }
+    li.tool pre { background: #f6f6f6; border-radius: 6px; padding: 8px; margin: 0;
+                  font-size: 0.8rem; white-space: pre-wrap; word-break: break-word;
+                  max-height: 240px; overflow-y: auto; }
   </style>
 </head>
 <body>

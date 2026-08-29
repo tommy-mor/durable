@@ -418,9 +418,16 @@ impl Effects {
         match hop.as_str().unwrap_or("") {
             "bash" => {
                 let cmd = crate::value::coerce_str(&vars.get_field("cmd"));
+                let dir = vars.get_field("dir");
+                let dir = dir.as_str().unwrap_or("").to_string();
                 let tx = tx.clone();
                 thread::spawn(move || {
-                    let out = std::process::Command::new("bash").arg("-c").arg(&cmd).output();
+                    let mut c = std::process::Command::new("bash");
+                    c.arg("-c").arg(&cmd);
+                    if !dir.is_empty() {
+                        c.current_dir(&dir);
+                    }
+                    let out = c.output();
                     let value = match out {
                         Ok(o) => result_map(vec![
                             ("ok", Value::Bool(o.status.success())),
@@ -489,17 +496,59 @@ impl Effects {
                 });
                 let _ = tx.send(Ev::Effect(effect_reply(&flow, Value::str(h))));
             }
+            "llm_models" => {
+                // GET {base}/models — OpenRouter and OpenAI-compatible
+                // servers both answer { data: [{ id, ... }] }
+                let cfg = cfg.clone();
+                let tx = tx.clone();
+                thread::spawn(move || {
+                    let run = || -> Result<Vec<String>, String> {
+                        let url = format!("{}/models", cfg.base.trim_end_matches('/'));
+                        let mut req = ureq::get(&url);
+                        if let Some(key) = &cfg.key {
+                            req = req.set("Authorization", &format!("Bearer {key}"));
+                        }
+                        let s = req
+                            .call()
+                            .map_err(|e| e.to_string())?
+                            .into_string()
+                            .map_err(|e| e.to_string())?;
+                        let j: serde_json::Value =
+                            serde_json::from_str(&s).map_err(|e| e.to_string())?;
+                        let list = j["data"].as_array().ok_or("no data[] in response")?;
+                        Ok(list
+                            .iter()
+                            .filter_map(|m| m["id"].as_str().map(str::to_string))
+                            .collect())
+                    };
+                    let value = match run() {
+                        Ok(ids) => result_map(vec![
+                            ("ok", Value::Bool(true)),
+                            ("models", Value::array(ids.into_iter().map(Value::str).collect())),
+                        ]),
+                        Err(e) => result_map(vec![
+                            ("ok", Value::Bool(false)),
+                            ("error", Value::str(e)),
+                        ]),
+                    };
+                    let _ = tx.send(Ev::Effect(effect_reply(&flow, value)));
+                });
+            }
             "llm_next" => {
                 let h = crate::value::coerce_str(&vars.get_field("h"));
                 let Some(stream) = self.streams.get_mut(&h) else {
                     let _ = tx.send(Ev::Effect(effect_error(&flow, &format!("unknown stream {h}"))));
                     return;
                 };
+                // final = the value about to go out is the done/error
+                // marker — decided *before* next_value pops a delta, or a
+                // last-buffered-delta-with-done-set removes the stream one
+                // reply too early and the flow's next llm.next explodes.
+                let is_final = stream.buf.is_empty() && stream.done.is_some();
                 match Self::next_value(stream) {
                     Some(v) => {
-                        let finished = stream.buf.is_empty() && stream.done.is_some();
                         let _ = tx.send(Ev::Effect(effect_reply(&flow, v)));
-                        if finished {
+                        if is_final {
                             self.streams.remove(&h);
                         }
                     }
@@ -558,6 +607,173 @@ impl Effects {
             return is_final;
         }
         false
+    }
+}
+
+#[cfg(test)]
+mod effects_tests {
+    use super::*;
+
+    fn llm_next_pkt(flow: &str, h: &str) -> Value {
+        Value::map(
+            [
+                (Value::str("kind"), Value::str("call")),
+                (Value::str("flow"), Value::str(flow)),
+                (Value::str("to"), Value::str(EFFECTS_ADDR)),
+                (Value::str("hop"), Value::str("llm_next")),
+                (
+                    Value::str("vars"),
+                    Value::map([(Value::str("h"), Value::str(h))].into_iter().collect()),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        )
+    }
+
+    fn recv_reply(rx: &mpsc::Receiver<Ev>) -> Value {
+        match rx.try_recv().expect("a reply should be queued") {
+            Ev::Effect(bytes) => decode(&bytes).unwrap().get_field("value"),
+            _ => panic!("expected Ev::Effect"),
+        }
+    }
+
+    /// The race from the field: done arrives while the flow is mid-paint,
+    /// so the last delta is popped with done already set. The stream must
+    /// survive until the final marker itself has been delivered.
+    #[test]
+    fn last_delta_with_done_set_does_not_kill_the_stream() {
+        let (tx, rx) = mpsc::channel::<Ev>();
+        let mut fx = Effects::default();
+        fx.streams.insert(
+            "llm:1".into(),
+            LlmStream {
+                buf: VecDeque::from(["tail".to_string()]),
+                done: Some(Ok("full text".into())),
+                pending: None,
+            },
+        );
+
+        fx.handle(&llm_next_pkt("f#1", "llm:1"), &tx, &LlmCfg {
+            key: None,
+            base: String::new(),
+            model: None,
+        });
+        let v = recv_reply(&rx);
+        assert_eq!(v.get_field("delta"), Value::str("tail"));
+        assert!(fx.streams.contains_key("llm:1"), "stream survives the last delta");
+
+        fx.handle(&llm_next_pkt("f#1", "llm:1"), &tx, &LlmCfg {
+            key: None,
+            base: String::new(),
+            model: None,
+        });
+        let v = recv_reply(&rx);
+        assert_eq!(v.get_field("done"), Value::Bool(true));
+        assert_eq!(v.get_field("text"), Value::str("full text"));
+        assert!(!fx.streams.contains_key("llm:1"), "stream removed after the final marker");
+    }
+
+    /// A chunk waking a parked llm.next must not finalize either.
+    #[test]
+    fn wake_on_chunk_keeps_the_stream_until_done_is_delivered() {
+        let (tx, rx) = mpsc::channel::<Ev>();
+        let mut fx = Effects::default();
+        fx.streams.insert(
+            "llm:1".into(),
+            LlmStream { buf: VecDeque::new(), done: None, pending: Some("f#1".into()) },
+        );
+
+        fx.on_chunk("llm:1", "d1".into(), &tx);
+        assert_eq!(recv_reply(&rx).get_field("delta"), Value::str("d1"));
+        assert!(fx.streams.contains_key("llm:1"));
+
+        fx.streams.get_mut("llm:1").unwrap().pending = Some("f#1".into());
+        fx.on_done("llm:1", Ok("d1".into()), &tx);
+        let v = recv_reply(&rx);
+        assert_eq!(v.get_field("done"), Value::Bool(true));
+        assert!(!fx.streams.contains_key("llm:1"), "final via wake removes the stream");
+    }
+
+    /// Model check: for every interleaving of producer events (chunks,
+    /// then done) against a consumer that pipelines llm.next like
+    /// run_turn does, the consumer must see every delta in order and then
+    /// exactly one final marker — never "unknown stream".
+    #[test]
+    fn every_interleaving_delivers_all_deltas_then_one_final() {
+        let cfg = LlmCfg { key: None, base: String::new(), model: None };
+        for n_deltas in 0usize..4 {
+            let n_producer = n_deltas + 1; // chunks + done
+            // schedule bits: at each step, true = producer moves next
+            for sched in 0u32..(1 << (2 * n_producer + n_deltas + 2)) {
+                let (tx, rx) = mpsc::channel::<Ev>();
+                let mut fx = Effects::default();
+                fx.streams.insert(
+                    "llm:1".into(),
+                    LlmStream { buf: VecDeque::new(), done: None, pending: None },
+                );
+
+                let mut produced = 0; // producer events already delivered
+                let mut want_next = true; // consumer owes an llm.next
+                let mut in_flight = false; // an llm.next awaits its reply
+                let mut got: Vec<String> = Vec::new();
+                let mut finished = false;
+                let mut bit = 0;
+
+                while !finished {
+                    let producer_turn = (sched >> bit) & 1 == 1;
+                    bit += 1;
+                    if producer_turn && produced < n_producer {
+                        if produced < n_deltas {
+                            fx.on_chunk("llm:1", format!("d{produced}"), &tx);
+                        } else {
+                            fx.on_done("llm:1", Ok("all".into()), &tx);
+                        }
+                        produced += 1;
+                    } else if want_next && !in_flight {
+                        fx.handle(&llm_next_pkt("f#1", "llm:1"), &tx, &cfg);
+                        want_next = false;
+                        in_flight = true;
+                    } else if produced < n_producer {
+                        // scheduler picked a side with nothing to do; let
+                        // the producer move so every schedule terminates
+                        if produced < n_deltas {
+                            fx.on_chunk("llm:1", format!("d{produced}"), &tx);
+                        } else {
+                            fx.on_done("llm:1", Ok("all".into()), &tx);
+                        }
+                        produced += 1;
+                    }
+                    // consumer drains replies as the VM thread would
+                    while let Ok(ev) = rx.try_recv() {
+                        let Ev::Effect(bytes) = ev else { panic!("expected Ev::Effect") };
+                        let pkt = decode(&bytes).unwrap();
+                        assert_ne!(
+                            pkt.get_field("kind"),
+                            Value::str("error"),
+                            "n={n_deltas} sched={sched:b}: flow got an error: {}",
+                            pkt.get_field("err")
+                        );
+                        in_flight = false;
+                        let v = pkt.get_field("value");
+                        if let Value::Str(d) = v.get_field("delta") {
+                            got.push(d.to_string());
+                            want_next = true; // run_turn loops on deltas
+                        } else {
+                            assert_eq!(v.get_field("done"), Value::Bool(true));
+                            finished = true;
+                        }
+                    }
+                }
+
+                let want: Vec<String> = (0..n_deltas).map(|i| format!("d{i}")).collect();
+                assert_eq!(got, want, "n={n_deltas} sched={sched:b}: deltas in order");
+                assert!(
+                    !fx.streams.contains_key("llm:1"),
+                    "n={n_deltas} sched={sched:b}: stream reaped after final"
+                );
+            }
+        }
     }
 }
 

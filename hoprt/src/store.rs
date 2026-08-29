@@ -272,9 +272,11 @@ impl ReduceHost<'_> {
         match id {
             // Effects would make replay nondeterministic; the reducer is
             // a function of (committed state, event) and nothing else.
-            NativeId::Bash | NativeId::LlmCall | NativeId::LlmStream | NativeId::LlmNext => {
-                Err("effects are not allowed in a reducer".into())
-            }
+            NativeId::Bash
+            | NativeId::LlmCall
+            | NativeId::LlmStream
+            | NativeId::LlmNext
+            | NativeId::LlmModels => Err("effects are not allowed in a reducer".into()),
             // the same one function. Here a terminal navigator is legal:
             // it reifies as a Write against committed state.
             NativeId::StoreCall => {

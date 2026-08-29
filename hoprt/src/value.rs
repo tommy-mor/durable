@@ -62,6 +62,7 @@ pub enum NativeId {
     LlmCall,
     LlmStream,
     LlmNext,
+    LlmModels,
 }
 
 #[derive(Clone)]

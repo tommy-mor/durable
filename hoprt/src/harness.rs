@@ -260,7 +260,14 @@ impl Cluster {
         match pkt.get_field("hop").as_str().unwrap_or("") {
             "bash" => {
                 let cmd = crate::value::coerce_str(&vars.get_field("cmd"));
-                let value = match std::process::Command::new("bash").arg("-c").arg(&cmd).output() {
+                let dir = vars.get_field("dir");
+                let dir = dir.as_str().unwrap_or("");
+                let mut c = std::process::Command::new("bash");
+                c.arg("-c").arg(&cmd);
+                if !dir.is_empty() {
+                    c.current_dir(&dir);
+                }
+                let value = match c.output() {
                     Ok(o) => result(vec![
                         ("ok", Value::Bool(o.status.success())),
                         ("status", Value::Int(o.status.code().unwrap_or(-1) as i64)),
@@ -278,6 +285,13 @@ impl Cluster {
                 let text = fake_llm_text(&vars.get_field("req"));
                 reply(result(vec![("ok", Value::Bool(true)), ("text", Value::str(text))]))
             }
+            "llm_models" => reply(result(vec![
+                ("ok", Value::Bool(true)),
+                (
+                    "models",
+                    Value::array(vec![Value::str("fake/alpha"), Value::str("fake/beta")]),
+                ),
+            ])),
             "llm_start" => {
                 self.fx_next += 1;
                 let h = format!("llm:{}", self.fx_next);

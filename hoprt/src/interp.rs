@@ -271,6 +271,7 @@ pub fn run(
                     Value::Native(NativeId::LlmCall) => match name {
                         "stream" => push!(Value::Native(NativeId::LlmStream)),
                         "next" => push!(Value::Native(NativeId::LlmNext)),
+                        "models" => push!(Value::Native(NativeId::LlmModels)),
                         _ => err!("llm has no field .{}", name),
                     },
                     Value::Nil => err!("field .{} of nil", name),
