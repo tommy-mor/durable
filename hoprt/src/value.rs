@@ -26,6 +26,7 @@ pub enum NativeId {
     TypeOf,
     JsonEncode,
     JsonDecode,
+    JsonFirst,
     // pure: schema shape constructors (store.map(of), store.record(fields), …)
     ShapeMap,
     ShapeList,

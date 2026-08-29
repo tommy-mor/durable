@@ -667,6 +667,28 @@ fn call_native(id: NativeId, mut args: Vec<Value>, host: &mut dyn Host) -> Resul
             }),
             None => Err("json.decode expects a string".into()),
         },
+        // json.first(s) → the first JSON object embedded anywhere in s
+        // (prose, code fences, and trailing objects are ignored), or nil.
+        // The forgiving side of the decode family: made for fishing a
+        // tool call out of a model's reply.
+        NativeId::JsonFirst => match args.first().and_then(Value::as_str) {
+            Some(s) => {
+                let mut found = Value::Nil;
+                for (i, c) in s.char_indices() {
+                    if c != '{' {
+                        continue;
+                    }
+                    let mut it = serde_json::Deserializer::from_str(&s[i..])
+                        .into_iter::<serde_json::Value>();
+                    if let Some(Ok(j)) = it.next() {
+                        found = crate::value::from_json(&j);
+                        break;
+                    }
+                }
+                Ok(found)
+            }
+            None => Err("json.first expects a string".into()),
+        },
         // schema shape constructors are pure data builders
         NativeId::ShapeMap | NativeId::ShapeList | NativeId::ShapeDeque => {
             let of = args.first().cloned().unwrap_or(Value::Nil);

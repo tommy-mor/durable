@@ -135,6 +135,7 @@ impl Vm {
             [
                 ("encode", Value::Native(NativeId::JsonEncode)),
                 ("decode", Value::Native(NativeId::JsonDecode)),
+                ("first", Value::Native(NativeId::JsonFirst)),
             ]
             .into_iter()
             .map(|(k, v)| (Value::str(k), v))

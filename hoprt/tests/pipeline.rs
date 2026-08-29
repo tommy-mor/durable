@@ -200,6 +200,24 @@ fn while_loops_run() {
 }
 
 #[test]
+fn json_first_fishes_a_tool_call_out_of_prose() {
+    let src = r#"
+        fn go() {
+          let messy = "Sure! ```json\n{\"tool\":\"bash\",\"cmd\":\"ls\"}\n``` and also {\"tool\":\"bash\",\"cmd\":\"pwd\"} trailing prose";
+          let call = json.first(messy);
+          print("tool=" .. call.tool .. " cmd=" .. call.cmd);
+          print("none=" .. type(json.first("no json here { not json either")));
+        }
+    "#;
+    let mut host = Cluster::new(&["A"], src, false).expect("cluster");
+    host.fire("A", "go");
+    host.pump();
+    let all = host.log().join("\n");
+    assert!(all.contains("tool=bash cmd=ls"), "{all}");
+    assert!(all.contains("none=nil"), "{all}");
+}
+
+#[test]
 fn json_and_type_natives() {
     let src = r#"
         fn go() {

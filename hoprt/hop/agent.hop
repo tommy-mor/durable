@@ -56,7 +56,7 @@ fn reduce(event) {
 // ── the turn: stream, parse, either answer or ask to run a tool ─────────
 
 fn llm_messages() {
-  let sys = "You are a coding agent running in the user's project directory. To run a shell command, reply with ONLY a JSON object {\"tool\":\"bash\",\"cmd\":\"...\"} and nothing else. Otherwise answer in plain text.";
+  let sys = "You are a coding agent running in the user's project directory. To run a shell command, reply with a single JSON object {\"tool\":\"bash\",\"cmd\":\"...\"} — exactly one command per message, no prose around it, no code fences. You will receive the command's output, and can then issue the next command. When you are done (or need nothing), answer the user in plain text containing no JSON object.";
   let out = [{ role = "system", content = sys }];
   let msgs = store(["msgs"]);
   if msgs {
@@ -89,7 +89,9 @@ fn run_turn() {
     return;
   }
   let text = out.text;
-  let call = json.decode(text);
+  // fish the first JSON object out of the reply — models wrap tool calls
+  // in prose, fences, or emit several; we run one and return its output
+  let call = json.first(text);
   if type(call) == "map" && call.tool == "bash" && type(call.cmd) == "string" {
     store.append({ type = "tool_request", cmd = call.cmd });
     paint_all();
