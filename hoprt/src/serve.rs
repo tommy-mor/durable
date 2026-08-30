@@ -32,6 +32,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tungstenite::Message;
 
+use crate::auth::{self, AuthUser, DiscordCfg};
 use crate::ir::Program;
 use crate::rt::{Platform, SideId, Vm, EFFECTS_ADDR};
 use crate::store::{self, StoreBinding};
@@ -42,8 +43,8 @@ const GLUE_JS: &str = include_str!("../web/glue.js");
 const IDIOMORPH_JS: &str = include_str!("../web/idiomorph.esm.js");
 
 enum Ev {
-    /// (session id, user id, outbound frame queue)
-    Conn(String, String, mpsc::Sender<Vec<u8>>),
+    /// (session id, user id, authenticated profile, outbound frame queue)
+    Conn(String, String, Option<AuthUser>, mpsc::Sender<Vec<u8>>),
     /// Raw frame bytes — Values are Rc-based and thread-local, so decoding
     /// happens on the VM thread.
     Pkt(String, Vec<u8>),
@@ -117,12 +118,119 @@ fn mint_user() -> String {
     format!("u{a:016x}{b:016x}")
 }
 
-/// The `hop_user` value out of a Cookie header, if present.
-fn hop_user_cookie(cookie_header: &str) -> Option<String> {
+/// A named cookie's value out of a Cookie header, if present.
+fn cookie_value(cookie_header: &str, name: &str) -> Option<String> {
     cookie_header.split(';').find_map(|kv| {
         let (k, v) = kv.trim().split_once('=')?;
-        (k == "hop_user" && !v.is_empty()).then(|| v.to_string())
+        (k == name && !v.is_empty()).then(|| v.to_string())
     })
+}
+
+/// What the HTTP and WS threads need to authenticate a request: the
+/// cookie-signing key and the OAuth app (when configured).
+struct AuthCtx {
+    secret: Vec<u8>,
+    discord: Option<DiscordCfg>,
+}
+
+fn redirect(to: &str, set_cookie: Option<String>) -> tiny_http::Response<std::io::Empty> {
+    let mut resp = tiny_http::Response::empty(302).with_header(
+        tiny_http::Header::from_bytes(&b"Location"[..], to.as_bytes()).unwrap(),
+    );
+    if let Some(c) = set_cookie {
+        resp.add_header(
+            tiny_http::Header::from_bytes(&b"Set-Cookie"[..], c.as_bytes()).unwrap(),
+        );
+    }
+    resp
+}
+
+fn parse_query(q: &str) -> HashMap<String, String> {
+    q.split('&')
+        .filter_map(|kv| {
+            let (k, v) = kv.split_once('=')?;
+            Some((k.to_string(), urldec(v)))
+        })
+        .collect()
+}
+
+fn urldec(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' => {
+                let hexpair = s.get(i + 1..i + 3);
+                match hexpair.and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                    Some(b) => {
+                        out.push(b);
+                        i += 3;
+                    }
+                    None => {
+                        out.push(b'%');
+                        i += 1;
+                    }
+                }
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// The /auth/* routes: the Discord login redirect, its callback (token
+/// exchange → signed hop_auth cookie), and logout. None: not an auth URL.
+fn auth_response(url: &str, authx: &AuthCtx) -> Option<tiny_http::Response<std::io::Empty>> {
+    let (path, query) = url.split_once('?').unwrap_or((url, ""));
+    match path {
+        "/auth/discord" => {
+            let Some(d) = &authx.discord else {
+                eprintln!("[hopd] /auth/discord hit but DISCORD_CLIENT_ID/SECRET are not set");
+                return Some(redirect("/", None));
+            };
+            let state = auth::mint_state(&authx.secret);
+            Some(redirect(&d.authorize_redirect(&state), None))
+        }
+        "/auth/discord/callback" => {
+            let Some(d) = &authx.discord else { return Some(redirect("/", None)) };
+            let params = parse_query(query);
+            let state_ok = params
+                .get("state")
+                .map(|s| auth::check_state(&authx.secret, s))
+                .unwrap_or(false);
+            if !state_ok {
+                eprintln!("[hopd] discord callback with bad state — ignored");
+                return Some(redirect("/", None));
+            }
+            match params.get("code").map(|c| d.exchange(c)) {
+                Some(Ok(user)) => {
+                    println!("[hopd] discord login: {} ({})", user.name, user.uid);
+                    let cookie = auth::sign_auth(&authx.secret, &user);
+                    Some(redirect(
+                        "/",
+                        Some(format!(
+                            "hop_auth={cookie}; Path=/; Max-Age=31536000; SameSite=Lax; HttpOnly"
+                        )),
+                    ))
+                }
+                Some(Err(e)) => {
+                    eprintln!("[hopd] discord exchange failed: {e}");
+                    Some(redirect("/", None))
+                }
+                None => Some(redirect("/", None)),
+            }
+        }
+        "/auth/logout" => Some(redirect("/", Some("hop_auth=; Path=/; Max-Age=0".to_string()))),
+        _ => None,
+    }
 }
 
 fn now_millis() -> u64 {
@@ -150,20 +258,32 @@ fn http_thread(
     pkg_dir: PathBuf,
     tx: mpsc::Sender<Ev>,
     boot: Arc<AtomicU64>,
+    authx: Arc<AuthCtx>,
 ) {
     let server = tiny_http::Server::http(("0.0.0.0", port)).expect("bind http");
     let config = format!(r#"{{"wsPort":{ws_port}}}"#);
     for req in server.incoming_requests() {
-        let (tx, boot, config, app_src, pkg_dir) =
-            (tx.clone(), boot.clone(), config.clone(), app_src.clone(), pkg_dir.clone());
+        let (tx, boot, config, app_src, pkg_dir, authx) = (
+            tx.clone(),
+            boot.clone(),
+            config.clone(),
+            app_src.clone(),
+            pkg_dir.clone(),
+            authx.clone(),
+        );
         thread::spawn(move || {
+            // login, callback, logout — redirects, handled before the assets
+            if let Some(resp) = auth_response(req.url(), &authx) {
+                let _ = req.respond(resp);
+                return;
+            }
             // the shell page mints the durable user identity: a cookie the
             // ws handshake reads back (host-scoped, so the ws port sees it)
             let has_user = req
                 .headers()
                 .iter()
                 .find(|h| h.field.equiv("Cookie"))
-                .and_then(|h| hop_user_cookie(h.value.as_str()))
+                .and_then(|h| cookie_value(h.value.as_str(), "hop_user"))
                 .is_some();
             let set_cookie = match req.url() {
                 "/" | "/index.html" if !has_user => Some(mint_user()),
@@ -234,7 +354,7 @@ fn http_thread(
     }
 }
 
-fn accept_thread(port: u16, tx: mpsc::Sender<Ev>) {
+fn accept_thread(port: u16, tx: mpsc::Sender<Ev>, authx: Arc<AuthCtx>) {
     let listener = TcpListener::bind(("0.0.0.0", port)).expect("bind ws");
     let mut n = 0usize;
     for stream in listener.incoming() {
@@ -242,29 +362,33 @@ fn accept_thread(port: u16, tx: mpsc::Sender<Ev>) {
         let sid = session_name(n);
         n += 1;
         let tx = tx.clone();
-        thread::spawn(move || conn_thread(stream, sid, tx));
+        let authx = authx.clone();
+        thread::spawn(move || conn_thread(stream, sid, tx, authx));
     }
 }
 
-fn conn_thread(stream: TcpStream, sid: String, tx: mpsc::Sender<Ev>) {
+fn conn_thread(stream: TcpStream, sid: String, tx: mpsc::Sender<Ev>, authx: Arc<AuthCtx>) {
     // the handshake request carries the browser's cookies; that is where
-    // the durable user identity enters the runtime
+    // identity enters the runtime. A valid hop_auth signature outranks
+    // the anonymous hop_user token.
     let mut user = String::new();
+    let mut authed: Option<AuthUser> = None;
     let mut ws = match tungstenite::accept_hdr(stream, |req: &tungstenite::handshake::server::Request, resp| {
-        if let Some(u) = req
-            .headers()
-            .get("Cookie")
-            .and_then(|v| v.to_str().ok())
-            .and_then(hop_user_cookie)
-        {
-            user = u;
+        if let Some(cookies) = req.headers().get("Cookie").and_then(|v| v.to_str().ok()) {
+            authed = cookie_value(cookies, "hop_auth")
+                .and_then(|c| auth::verify_auth(&authx.secret, &c));
+            if let Some(u) = cookie_value(cookies, "hop_user") {
+                user = u;
+            }
         }
         Ok(resp)
     }) {
         Ok(ws) => ws,
         Err(_) => return,
     };
-    if user.is_empty() {
+    if let Some(a) = &authed {
+        user = a.uid.clone();
+    } else if user.is_empty() {
         // cookieless client (curl, tests): identity lives one connection
         user = mint_user();
     }
@@ -274,7 +398,7 @@ fn conn_thread(stream: TcpStream, sid: String, tx: mpsc::Sender<Ev>) {
         .ok();
 
     let (out_tx, out_rx) = mpsc::channel::<Vec<u8>>();
-    if tx.send(Ev::Conn(sid.clone(), user, out_tx)).is_err() {
+    if tx.send(Ev::Conn(sid.clone(), user, authed, out_tx)).is_err() {
         return;
     }
     loop {
@@ -691,6 +815,27 @@ impl Effects {
                     let _ = tx.send(Ev::Effect(effect_reply(&flow, value)));
                 });
             }
+            "rand" => {
+                // entropy is platform work: reuse the token minter's mixing
+                let n = match vars.get_field("n") {
+                    Value::Int(n) if n > 0 => n as u64,
+                    _ => {
+                        let _ = tx.send(Ev::Effect(effect_error(&flow, "rand(n) needs n > 0")));
+                        return;
+                    }
+                };
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+                    .hash(&mut h);
+                self.next_id += 1;
+                self.next_id.hash(&mut h);
+                let v = Value::Int((h.finish() % n) as i64);
+                let _ = tx.send(Ev::Effect(effect_reply(&flow, v)));
+            }
             "llm_next" => {
                 let h = crate::value::coerce_str(&vars.get_field("h"));
                 let Some(stream) = self.streams.get_mut(&h) else {
@@ -994,14 +1139,28 @@ pub fn serve(
     // millis of the latest session connect (hello + first cast sent) —
     // the /boot.css barrier waits on this
     let boot = Arc::new(AtomicU64::new(0));
+    let discord = DiscordCfg::from_env(http_port);
+    match &discord {
+        Some(d) => println!("[hopd] discord login on (redirect {})", d.redirect_uri),
+        None => println!("[hopd] discord login off (no DISCORD_CLIENT_ID/SECRET)"),
+    }
+    let admins = auth::admin_uids();
+    match &admins {
+        Some(ids) => println!("[hopd] admin allowlist: {} discord id(s)", ids.len()),
+        None => println!("[hopd] no HOP_ADMIN_DISCORD_IDS — every connection is an admin"),
+    }
+    let authx =
+        Arc::new(AuthCtx { secret: auth::session_secret(data_dir.as_ref()), discord });
     {
         let tx = tx.clone();
         let boot = boot.clone();
-        thread::spawn(move || http_thread(http_port, ws_port, app_src, pkg_dir, tx, boot));
+        let authx = authx.clone();
+        thread::spawn(move || http_thread(http_port, ws_port, app_src, pkg_dir, tx, boot, authx));
     }
     {
         let tx = tx.clone();
-        thread::spawn(move || accept_thread(ws_port, tx));
+        let authx = authx.clone();
+        thread::spawn(move || accept_thread(ws_port, tx, authx));
     }
 
     // the server VM lives on this thread
@@ -1028,7 +1187,7 @@ pub fn serve(
 
     for ev in rx {
         match ev {
-            Ev::Conn(sid, user, out) => {
+            Ev::Conn(sid, user, authed, out) => {
                 let hello = Value::map(
                     [
                         (Value::str("kind"), Value::str("hello")),
@@ -1041,11 +1200,25 @@ pub fn serve(
                 let _ = out.send(encode(&hello).expect("hello encodes"));
                 sessions.insert(sid.clone(), Sess { out, user: user.clone() });
                 println!("[hopd] session {sid} connected (user {user})");
+                // the platform stamps what it knows about the user: name
+                // and avatar from the signed cookie, the admin bit from
+                // the allowlist (open when none is configured)
+                let mut fields = vec![(
+                    Value::str("admin"),
+                    Value::Bool(auth::is_admin(&admins, &user)),
+                )];
+                if let Some(a) = &authed {
+                    fields.push((Value::str("name"), Value::str(a.name.as_str())));
+                    if !a.avatar.is_empty() {
+                        fields.push((Value::str("avatar"), Value::str(a.avatar.as_str())));
+                    }
+                }
+                let profile = Value::map(fields.into_iter().collect());
                 let mut platform = ServePlatform {
                     outbox: &mut outbox,
                     store: binding.as_mut(),
                 };
-                vm.session_connect(&mut platform, &sid, &user);
+                vm.session_connect(&mut platform, &sid, &user, profile);
                 boot.store(now_millis(), Ordering::SeqCst);
             }
             Ev::Pkt(sid, bytes) => {

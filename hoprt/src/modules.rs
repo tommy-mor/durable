@@ -48,7 +48,7 @@ pub struct Module {
 
 /// The compiled-in battery set.
 fn builtin_modules() -> Vec<Module> {
-    vec![json_module(), markdown_module(), bash_module(), llm_module()]
+    vec![json_module(), markdown_module(), str_module(), rand_module(), bash_module(), llm_module()]
 }
 
 /// Name → kind, for call dispatch. Built once per process; identical in
@@ -165,6 +165,65 @@ fn markdown(args: Vec<Value>) -> Result<Value, String> {
         Some(s) => Ok(crate::builtins::markdown_hiccup(s)),
         None => Err("markdown(text) expects a string".into()),
     }
+}
+
+// ---------------------------------------------------------------------------
+// str — the string batteries views keep needing
+// ---------------------------------------------------------------------------
+
+fn str_module() -> Module {
+    Module {
+        name: "str",
+        natives: vec![
+            NativeDef { name: "str.split", kind: NativeKind::Pure(str_split) },
+            NativeDef { name: "str.trim", kind: NativeKind::Pure(str_trim) },
+        ],
+    }
+}
+
+/// str.split(s, sep) → array of pieces (sep is a literal, not a regex).
+fn str_split(args: Vec<Value>) -> Result<Value, String> {
+    let s = args.first().and_then(Value::as_str).ok_or("str.split(s, sep) expects strings")?;
+    let sep = args.get(1).and_then(Value::as_str).ok_or("str.split(s, sep) expects strings")?;
+    if sep.is_empty() {
+        return Err("str.split separator must be non-empty".into());
+    }
+    Ok(Value::array(s.split(sep).map(Value::str).collect()))
+}
+
+/// str.trim(s) → s without leading/trailing whitespace.
+fn str_trim(args: Vec<Value>) -> Result<Value, String> {
+    match args.first().and_then(Value::as_str) {
+        Some(s) => Ok(Value::str(s.trim())),
+        None => Err("str.trim expects a string".into()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// rand — entropy is an effect: the platform rolls the die, so reducers
+// stay deterministic and the harness can fake it
+// ---------------------------------------------------------------------------
+
+fn rand_module() -> Module {
+    Module {
+        name: "rand",
+        natives: vec![NativeDef {
+            name: "rand",
+            kind: NativeKind::Effect { hop: "rand", vars: rand_vars },
+        }],
+    }
+}
+
+/// rand(n) → an int in [0, n). The bound travels in the packet; the
+/// platform picks the number.
+fn rand_vars(args: Vec<Value>) -> Result<Value, String> {
+    let n = match args.first() {
+        Some(Value::Int(n)) if *n > 0 => *n,
+        _ => return Err("rand(n) expects a positive int bound".into()),
+    };
+    let mut m = BTreeMap::new();
+    m.insert(Value::str("n"), Value::Int(n));
+    Ok(Value::map(m))
 }
 
 // ---------------------------------------------------------------------------

@@ -8,6 +8,8 @@
 //! JSONL/RocksDB store to the server VM; `serve` is hopd, speaking CBOR
 //! binary over WebSockets.
 
+#[cfg(feature = "server")]
+pub mod auth;
 pub mod builtins;
 pub mod compiler;
 #[cfg(feature = "server")]
