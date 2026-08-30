@@ -84,8 +84,11 @@ asserted by the same transcript tests).
 
 Ported apps use a flat, small stdlib: `push(xs, v)`, `len(x)`,
 `sort(xs, cmp?)`, `floor(n)`, `type(v)`, `tostring(v)`, `tonumber(v)`,
-`print(...)`, plus `session()` and the `store.*` / `hui.*` / `dom.*`
-modules. Everything beyond that core is a **module** (`hoprt/src/modules.rs`):
+`print(...)`, plus the identity pair `session()` / `user()` (one tab; the
+durable cookie-minted identity behind it — see hop-semantics.md) and the
+`store.*` / `hui.*` / `dom.*` modules. In the browser, `hui.render` and
+`dom.set` morph new markup into the live tree (idiomorph): focus, scroll,
+and half-typed input survive a re-render. Everything beyond that core is a **module** (`hoprt/src/modules.rs`):
 a Rust-side bag of named natives — pure functions or effect declarations —
 that mounts into every VM's globals by name (`bash` as a global,
 `json.first` as a field on the `json` map). The kind carries the policy:

@@ -8,8 +8,8 @@
 //! now Value maps encoded as CBOR by the transport:
 //!
 //! ```text
-//! { kind:"call",  flow, to, hop, vars, origin, reply_to }
-//! { kind:"cast",  flow, to, hop, vars, origin }
+//! { kind:"call",  flow, to, hop, vars, origin, user, reply_to }
+//! { kind:"cast",  flow, to, hop, vars, origin, user }
 //! { kind:"reply", flow, to, value }
 //! { kind:"error", flow, to, err }
 //! ```
@@ -69,6 +69,9 @@ struct FlowCtx {
     flow: String,
     /// origin session (Str) or Nil for server-origin flows
     origin: Value,
+    /// the origin session's user (Str) or Nil. Stamped by hopd at the
+    /// socket, propagated on every hop of the flow — never client-claimed.
+    user: Value,
 }
 
 enum Complete {
@@ -94,6 +97,9 @@ pub struct Vm {
     pub prog: Rc<Program>,
     pub globals: Globals,
     pub side: SideId,
+    /// Browser VMs: this tab's user identity (from the hello packet).
+    /// Server VMs: Nil — a server flow's user is its origin's.
+    pub user: Value,
     hui: HuiState,
     stacks: HashMap<String, Vec<Parked>>,
     next_flow: u64,
@@ -170,6 +176,7 @@ impl Vm {
             prog,
             globals,
             side,
+            user: Value::Nil,
             hui: HuiState::default(),
             stacks: HashMap::new(),
             next_flow: 0,
@@ -180,7 +187,8 @@ impl Vm {
             let lets: Vec<(String, usize)> = vm.prog.server_lets.clone();
             for (name, fn_idx) in lets {
                 let exec = Exec::call(&vm.prog, fn_idx, Vec::new());
-                let ctx = FlowCtx { flow: format!("init:{name}"), origin: Value::Nil };
+                let ctx =
+                    FlowCtx { flow: format!("init:{name}"), origin: Value::Nil, user: Value::Nil };
                 match vm.run_exec(platform, exec, &ctx) {
                     RunResult::Done(v) => vm.globals.set(name, v),
                     RunResult::Suspended(..) => {
@@ -214,9 +222,18 @@ impl Vm {
     }
 
     /// hopd calls this on the server VM when a session connects.
-    pub fn session_connect(&mut self, platform: &mut dyn Platform, sid: &str) {
+    pub fn session_connect(&mut self, platform: &mut dyn Platform, sid: &str, user: &str) {
         if !matches!(self.globals.get("on_connect"), Value::Nil) {
-            self.fire(platform, "on_connect", vec![Value::str(sid)]);
+            self.fire(platform, "on_connect", vec![Value::str(sid), Value::str(user)]);
+        }
+    }
+
+    /// hopd calls this on the server VM when a session goes away. The
+    /// hook is best-effort presence, not a transaction: a crashed hopd
+    /// never fires it.
+    pub fn session_disconnect(&mut self, platform: &mut dyn Platform, sid: &str, user: &str) {
+        if !matches!(self.globals.get("on_disconnect"), Value::Nil) {
+            self.fire(platform, "on_disconnect", vec![Value::str(sid), Value::str(user)]);
         }
     }
 
@@ -227,7 +244,7 @@ impl Vm {
             SideId::Browser(s) => Value::str(s.as_str()),
             SideId::Server => Value::Nil,
         };
-        let ctx = FlowCtx { flow, origin };
+        let ctx = FlowCtx { flow, origin, user: self.user.clone() };
         let exec = match Exec::call_value(&self.prog, &callee, args) {
             Ok(e) => e,
             Err(e) => {
@@ -253,6 +270,7 @@ impl Vm {
         let ctx = FlowCtx {
             flow: format!("{}#sync{}", self.side.addr(), self.next_flow),
             origin: Value::Nil,
+            user: Value::Nil,
         };
         match self.run_exec(platform, exec, &ctx) {
             RunResult::Done(v) => Ok(v),
@@ -283,7 +301,11 @@ impl Vm {
                     return;
                 };
                 let exec = Exec::call(&self.prog, fn_idx, vec![pkt.get_field("vars")]);
-                let ctx = FlowCtx { flow: flow_s, origin: pkt.get_field("origin") };
+                let ctx = FlowCtx {
+                    flow: flow_s,
+                    origin: pkt.get_field("origin"),
+                    user: pkt.get_field("user"),
+                };
                 let on_complete = if kind == "call" {
                     Complete::Reply { to: pkt.get_field("reply_to") }
                 } else {
@@ -352,6 +374,7 @@ impl Vm {
                     ("hop", Value::str(hop.as_str())),
                     ("vars", vars),
                     ("origin", ctx.origin.clone()),
+                    ("user", ctx.user.clone()),
                     ("reply_to", self.my_addr()),
                 ]));
                 self.stacks
@@ -394,6 +417,7 @@ impl Vm {
             let mut host = StepHost {
                 side: &self.side,
                 ctx,
+                vm_user: &self.user,
                 hui: &mut self.hui,
                 platform,
                 spawned: &mut spawned,
@@ -428,6 +452,8 @@ enum RunResult {
 struct StepHost<'a> {
     side: &'a SideId,
     ctx: &'a FlowCtx,
+    /// The VM's own user (browser tabs); Nil on the server.
+    vm_user: &'a Value,
     hui: &'a mut HuiState,
     platform: &'a mut dyn Platform,
     spawned: &'a mut Vec<(Value, Vec<Value>)>,
@@ -447,6 +473,7 @@ impl Host for StepHost<'_> {
             ("hop", Value::str(hop)),
             ("vars", vars),
             ("origin", self.ctx.origin.clone()),
+            ("user", self.ctx.user.clone()),
         ]));
         Ok(())
     }
@@ -463,6 +490,19 @@ impl Host for StepHost<'_> {
                 Value::Nil => Err("session() in a server-origin flow with no session".into()),
                 v => Ok(v.clone()),
             },
+        }
+    }
+
+    fn user(&mut self) -> Result<Value, String> {
+        // browser: the tab's own identity; server: whatever hopd stamped
+        // on the packet that started (or continued) this flow.
+        let u = match self.side {
+            SideId::Browser(_) => self.vm_user.clone(),
+            SideId::Server => self.ctx.user.clone(),
+        };
+        match u {
+            Value::Nil => Err("user() in a flow with no user".into()),
+            v => Ok(v),
         }
     }
 

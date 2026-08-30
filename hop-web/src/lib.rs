@@ -21,9 +21,17 @@ use hoprt::value::{decode, encode, NativeId, Value};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 
+#[wasm_bindgen]
+extern "C" {
+    /// glue.js: idiomorph merge into the live tree, innerHTML fallback.
+    #[wasm_bindgen(js_name = __hopMorph)]
+    fn hop_morph(sel: &str, html: &str);
+}
+
 /// The DOM-backed platform. `dom.get` reads an input's value, `dom.set`
-/// replaces innerHTML (which is where hui renders land), `dom.clear`
-/// empties an input. There is no store on this side.
+/// morphs new markup into the element (which is where hui renders land —
+/// idiomorph keeps focus, scroll, and in-progress typing alive across
+/// re-renders), `dom.clear` empties an input. There is no store here.
 struct WebPlatform<'a> {
     send: &'a js_sys::Function,
 }
@@ -80,9 +88,7 @@ impl Platform for WebPlatform<'_> {
     }
 
     fn dom_set(&mut self, sel: &str, html: &str) {
-        if let Some(el) = query(sel) {
-            el.set_inner_html(html);
-        }
+        hop_morph(sel, html);
     }
 
     fn dom_clear(&mut self, sel: &str) {
@@ -146,7 +152,11 @@ impl BrowserVm {
             let sid = pkt.get_field("session");
             let sid = sid.as_str().unwrap_or("?").to_string();
             match Vm::new(self.prog.clone(), SideId::Browser(sid), &mut platform) {
-                Ok(vm) => self.vm = Some(vm),
+                Ok(mut vm) => {
+                    // this tab's durable identity, minted by hopd's cookie
+                    vm.user = pkt.get_field("user");
+                    self.vm = Some(vm);
+                }
                 Err(e) => web_sys::console::error_1(&format!("vm boot: {e}").into()),
             }
             return;

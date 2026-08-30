@@ -67,6 +67,11 @@ pub trait Host {
     /// the spawn site.
     fn spawn(&mut self, callee: Value, args: Vec<Value>) -> Result<(), String>;
     fn session(&mut self) -> Result<Value, String>;
+    /// The durable identity behind the session (cookie-minted by hopd).
+    /// Defaults to refusal — reducers and store hosts have no user.
+    fn user(&mut self) -> Result<Value, String> {
+        Err("user() is not available here".into())
+    }
     fn native(&mut self, id: NativeId, args: Vec<Value>) -> Result<NativeOut, String>;
     /// A module effect (modules.rs): suspend the flow toward the
     /// platform's executor. The default refusal is the policy for hosts
@@ -473,6 +478,10 @@ pub fn run(
                 }
             }
             Instr::Session => match host.session() {
+                Ok(v) => push!(v),
+                Err(e) => err!("{e}"),
+            },
+            Instr::User => match host.user() {
                 Ok(v) => push!(v),
                 Err(e) => err!("{e}"),
             },

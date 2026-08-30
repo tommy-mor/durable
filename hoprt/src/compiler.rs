@@ -9,7 +9,7 @@
 //! stmt  := "let" name "=" expr ";"
 //!        | "server" "!" "(" ")" ";"                placement mark
 //!        | "browser" "!" "(" ")" ";"               placement mark (→ origin)
-//!        | "cast" ("browsers"|"server"|"session" "(" expr ")") block
+//!        | "cast" ("browsers"|"server"|("session"|"user") "(" expr ")") block
 //!        | "spawn" call ";"                        start a flow (an "event")
 //!        | "return" expr? ";"
 //!        | "if" expr block ("else" (block|if))?
@@ -215,6 +215,8 @@ enum CastTarget {
     Browsers,
     Server,
     Session(Expr),
+    /// Every connected tab of one user (address "user:<uid>").
+    User(Expr),
 }
 
 /// One `match` arm: `tag { field, ... } => block`. `tag == None` is the
@@ -417,6 +419,12 @@ impl Parser {
                 let e = self.expr()?;
                 self.expect(Tok::RParen)?;
                 CastTarget::Session(e)
+            } else if self.at_kw("user") {
+                self.pos += 1;
+                self.expect(Tok::LParen)?;
+                let e = self.expr()?;
+                self.expect(Tok::RParen)?;
+                CastTarget::User(e)
             } else {
                 return Err(format!("expected cast target, got {:?}", self.peek()));
             };
@@ -759,7 +767,7 @@ fn refs_stmts(ss: &[Stmt], out: &mut BTreeSet<String>) {
             }
             Stmt::Mark(_) => {}
             Stmt::Cast(t, body) => {
-                if let CastTarget::Session(e) = t {
+                if let CastTarget::Session(e) | CastTarget::User(e) = t {
                     refs_expr(e, out);
                 }
                 refs_stmts(body, out);
@@ -1012,9 +1020,13 @@ fn emit_expr(cg: &mut Cg, fb: &mut Fb, ctr: &mut Counters, e: &Expr) -> Result<(
             fb.emit(Instr::GetIndex);
         }
         Expr::Call(f, args) => {
-            // session() is the runtime's identity primitive
+            // session() and user() are the runtime's identity primitives
             if matches!(f.as_ref(), Expr::Ident(n) if n == "session") && args.is_empty() {
                 fb.emit(Instr::Session);
+                return Ok(());
+            }
+            if matches!(f.as_ref(), Expr::Ident(n) if n == "user") && args.is_empty() {
+                fb.emit(Instr::User);
                 return Ok(());
             }
             emit_expr(cg, fb, ctr, f)?;
@@ -1414,6 +1426,13 @@ fn emit_stmts(cg: &mut Cg, fb: &mut Fb, ctr: &mut Counters, ss: &[Stmt]) -> Resu
                         fb.emit(Instr::Const(k));
                     }
                     CastTarget::Session(e) => emit_expr(cg, fb, ctr, e)?,
+                    CastTarget::User(e) => {
+                        // the address is "user:" .. uid — routed as a fan-out
+                        let k = cg.k_str("user:");
+                        fb.emit(Instr::Const(k));
+                        emit_expr(cg, fb, ctr, e)?;
+                        fb.emit(Instr::BinOp(crate::ir::BinOp::Concat));
+                    }
                 }
                 emit_vars_map(cg, fb, &captured)?;
                 let k = cg.k_str(&id);

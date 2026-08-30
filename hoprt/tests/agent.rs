@@ -60,16 +60,16 @@ fn effects_are_server_side_only() {
 fn agent_chat_tool_loop_and_replay() {
     let mut host =
         Cluster::new(&["A"], include_str!("../hop/agent.hop"), false).expect("cluster");
-    host.fire_args("server", "on_connect", vec![s("A")]);
+    host.connect("A");
     host.pump();
 
-    // connecting minted thread 1 and pointed this session at it
-    let view = host.store_get(arr(vec![s("views"), s("A")])).unwrap();
+    // connecting minted thread 1 and pointed this user at it
+    let view = host.store_get(arr(vec![s("views"), s("u:A")])).unwrap();
     assert_eq!(view, Value::Int(1));
 
     // a plain question: fake model streams "echo: hello agent" in chunks
     host.set_dom("A", "#draft", "hello agent");
-    host.fire_args("A", "send", vec![s("A"), Value::Int(1)]);
+    host.fire_args("A", "send", vec![Value::Int(1)]);
     host.pump();
     host.assert_quiescent();
 
@@ -93,7 +93,7 @@ fn agent_chat_tool_loop_and_replay() {
 
     // a tool turn: fake model answers with a bash tool call → approval gate
     host.set_dom("A", "#draft", "RUN: echo hop_tool_ok");
-    host.fire_args("A", "send", vec![s("A"), Value::Int(1)]);
+    host.fire_args("A", "send", vec![Value::Int(1)]);
     host.pump();
     host.assert_quiescent();
     let p = pending(&mut host, 1);
@@ -119,7 +119,7 @@ fn agent_chat_tool_loop_and_replay() {
 
     // deny path: arm the gate again, refuse it
     host.set_dom("A", "#draft", "RUN: touch /tmp/hop_denied_marker");
-    host.fire_args("A", "send", vec![s("A"), Value::Int(1)]);
+    host.fire_args("A", "send", vec![Value::Int(1)]);
     host.pump();
     host.fire_args("A", "deny", vec![Value::Int(1)]);
     host.pump();
@@ -139,24 +139,24 @@ fn agent_chat_tool_loop_and_replay() {
 }
 
 #[test]
-fn agent_threads_are_independent_and_sessions_view_their_own() {
+fn agent_threads_are_independent_and_users_view_their_own() {
     let mut host =
         Cluster::new(&["A", "B"], include_str!("../hop/agent.hop"), false).expect("cluster");
-    host.fire_args("server", "on_connect", vec![s("A")]);
-    host.fire_args("server", "on_connect", vec![s("B")]);
+    host.connect("A");
+    host.connect("B");
     host.pump();
 
-    // both tabs land on thread 1; B forks its own
-    host.fire_args("B", "new_thread", vec![s("B")]);
+    // both users land on thread 1; B forks their own
+    host.fire_args("B", "new_thread", vec![s("u:B")]);
     host.pump();
-    assert_eq!(host.store_get(arr(vec![s("views"), s("A")])).unwrap(), Value::Int(1));
-    assert_eq!(host.store_get(arr(vec![s("views"), s("B")])).unwrap(), Value::Int(2));
+    assert_eq!(host.store_get(arr(vec![s("views"), s("u:A")])).unwrap(), Value::Int(1));
+    assert_eq!(host.store_get(arr(vec![s("views"), s("u:B")])).unwrap(), Value::Int(2));
 
-    // each session talks in its own thread
+    // each user talks in their own thread
     host.set_dom("A", "#draft", "apples");
-    host.fire_args("A", "send", vec![s("A"), Value::Int(1)]);
+    host.fire_args("A", "send", vec![Value::Int(1)]);
     host.set_dom("B", "#draft", "bananas");
-    host.fire_args("B", "send", vec![s("B"), Value::Int(2)]);
+    host.fire_args("B", "send", vec![Value::Int(2)]);
     host.pump();
     host.assert_quiescent();
 
@@ -174,9 +174,9 @@ fn agent_threads_are_independent_and_sessions_view_their_own() {
     assert!(host.dom("A", "#app").contains("bananas"), "thread 2 titled in A's tab list");
 
     // A hops over to B's thread and sees it
-    host.fire_args("A", "open_thread", vec![s("A"), Value::Int(2)]);
+    host.fire_args("A", "open_thread", vec![s("u:A"), Value::Int(2)]);
     host.pump();
-    assert_eq!(host.store_get(arr(vec![s("views"), s("A")])).unwrap(), Value::Int(2));
+    assert_eq!(host.store_get(arr(vec![s("views"), s("u:A")])).unwrap(), Value::Int(2));
     assert!(host.dom("A", "#app").contains("echo: bananas"), "A now sees thread 2");
 
     host.verify().unwrap();
@@ -186,7 +186,7 @@ fn agent_threads_are_independent_and_sessions_view_their_own() {
 fn agent_native_tool_calls_round_trip_with_call_ids() {
     let mut host =
         Cluster::new(&["A"], include_str!("../hop/agent.hop"), false).expect("cluster");
-    host.fire_args("server", "on_connect", vec![s("A")]);
+    host.connect("A");
     host.pump();
     host.fire("A", "toggle_auto");
     host.pump();
@@ -194,7 +194,7 @@ fn agent_native_tool_calls_round_trip_with_call_ids() {
     // the fake's structured path: no text, a tool_calls array in the
     // final marker — as an OpenAI-family model would answer
     host.set_dom("A", "#draft", "CALL: echo native_ok");
-    host.fire_args("A", "send", vec![s("A"), Value::Int(1)]);
+    host.fire_args("A", "send", vec![Value::Int(1)]);
     host.pump();
     host.assert_quiescent();
 
@@ -220,7 +220,7 @@ fn agent_native_tool_calls_round_trip_with_call_ids() {
 fn agent_model_picker_and_home_dir() {
     let mut host =
         Cluster::new(&["A"], include_str!("../hop/agent.hop"), false).expect("cluster");
-    host.fire_args("server", "on_connect", vec![s("A")]);
+    host.connect("A");
     host.pump();
     host.assert_quiescent();
 
@@ -244,7 +244,7 @@ fn agent_model_picker_and_home_dir() {
     host.fire("A", "toggle_auto");
     host.pump();
     host.set_dom("A", "#draft", "RUN: pwd");
-    host.fire_args("A", "send", vec![s("A"), Value::Int(1)]);
+    host.fire_args("A", "send", vec![Value::Int(1)]);
     host.pump();
     host.assert_quiescent();
     // msgs: 0 user, 1 tool_request, 2 tool, 3 assistant
@@ -264,10 +264,104 @@ fn agent_model_picker_and_home_dir() {
 }
 
 #[test]
+fn user_identity_casts_and_disconnect_hooks() {
+    // A and B are two tabs of one user (alice); C is someone else. A
+    // user-targeted cast lands on both alice tabs and misses C; the
+    // hooks see (sid, user); user() answers on both sides.
+    let src = r##"
+        fn whoami() {
+          let s = session();
+          let u = user();
+          server!();
+          print("server sees " .. s .. "/" .. u .. " (session=" .. session() .. " user=" .. user() .. ")");
+          cast user(u) { dom.set("#who", "hi " .. user() .. " in " .. session()); }
+        }
+        fn on_connect(sid, uid) { print("+ " .. sid .. " " .. uid); }
+        fn on_disconnect(sid, uid) { print("- " .. sid .. " " .. uid); }
+    "##;
+    let mut host = Cluster::new(&["A", "B", "C"], src, false).expect("cluster");
+    host.set_user("A", "alice");
+    host.set_user("B", "alice");
+    host.set_user("C", "bob");
+    host.connect("A");
+    host.connect("B");
+    host.connect("C");
+
+    host.fire("A", "whoami");
+    host.pump();
+    host.assert_quiescent();
+
+    let all = host.log().join("\n");
+    assert!(all.contains("+ A alice"), "{all}");
+    assert!(all.contains("+ C bob"), "{all}");
+    assert!(
+        all.contains("server sees A/alice (session=A user=alice)"),
+        "identity crosses the hop: {all}"
+    );
+    // the cast fanned out to every alice tab, each seeing its own session
+    assert_eq!(host.dom("A", "#who"), "hi alice in A");
+    assert_eq!(host.dom("B", "#who"), "hi alice in B");
+    assert_eq!(host.dom("C", "#who"), "", "bob's tab untouched");
+
+    host.disconnect("B");
+    host.pump();
+    let all = host.log().join("\n");
+    assert!(all.contains("- B alice"), "disconnect hook fired: {all}");
+}
+
+#[test]
+fn agent_two_tabs_of_one_user_stay_in_sync() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let mut host =
+            Cluster::with_data_dir(&["A", "B"], include_str!("../hop/agent.hop"), false, dir.path())
+                .expect("cluster");
+        host.set_user("A", "alice");
+        host.set_user("B", "alice");
+        host.connect("A");
+        host.connect("B");
+        host.pump();
+
+        // one view, keyed by the user — not one per tab
+        assert_eq!(host.store_get(arr(vec![s("views"), s("alice")])).unwrap(), Value::Int(1));
+
+        // talk in tab A; both tabs render the reply (cast user fan-out)
+        host.set_dom("A", "#draft", "hello from tab A");
+        host.fire_args("A", "send", vec![Value::Int(1)]);
+        host.pump();
+        host.assert_quiescent();
+        assert!(host.dom("A", "#app").contains("echo: hello from tab A"), "tab A sees it");
+        assert!(host.dom("B", "#app").contains("echo: hello from tab A"), "tab B in sync");
+
+        host.fire_args("B", "new_thread", vec![s("alice")]);
+        host.pump();
+        assert_eq!(host.store_get(arr(vec![s("views"), s("alice")])).unwrap(), Value::Int(2));
+        host.disconnect("A");
+        host.disconnect("B");
+    }
+
+    // a "reload": a new process, a new tab, the same cookie — the user
+    // lands back in the thread they left
+    let mut host =
+        Cluster::with_data_dir(&["D"], include_str!("../hop/agent.hop"), false, dir.path())
+            .expect("reopen");
+    host.set_user("D", "alice");
+    host.connect("D");
+    host.pump();
+    assert_eq!(
+        host.store_get(arr(vec![s("views"), s("alice")])).unwrap(),
+        Value::Int(2),
+        "the returning user lands in the thread they left"
+    );
+
+    host.verify().unwrap();
+}
+
+#[test]
 fn agent_auto_approve_runs_tools_without_the_gate() {
     let mut host =
         Cluster::new(&["A"], include_str!("../hop/agent.hop"), false).expect("cluster");
-    host.fire_args("server", "on_connect", vec![s("A")]);
+    host.connect("A");
     host.pump();
     host.fire("A", "toggle_auto");
     host.pump();
@@ -275,7 +369,7 @@ fn agent_auto_approve_runs_tools_without_the_gate() {
     assert!(host.dom("A", "#app").contains("auto-approve: on"), "toggle rendered");
 
     host.set_dom("A", "#draft", "RUN: echo auto_ok");
-    host.fire_args("A", "send", vec![s("A"), Value::Int(1)]);
+    host.fire_args("A", "send", vec![Value::Int(1)]);
     host.pump();
     host.assert_quiescent();
 

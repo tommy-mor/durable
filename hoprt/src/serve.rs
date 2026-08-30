@@ -10,9 +10,16 @@
 //!   both read the socket and drain its outbound queue),
 //! - and the main thread owning the server VM and all routing.
 //!
-//! Identity rides the connection: whatever a client claims, `origin` and
-//! `reply_to` are overwritten with the session id of the socket the packet
-//! arrived on.
+//! Identity rides the connection: whatever a client claims, `origin`,
+//! `user`, and `reply_to` are overwritten at ingress with what hopd knows
+//! about the socket the packet arrived on.
+//!
+//! Two identities:
+//! - session — one tab, one WebSocket, minted per connection ("A", "B", …).
+//! - user — durable across reloads and tabs: a `hop_user` cookie minted by
+//!   the HTTP shell and read back from the WebSocket handshake (cookies are
+//!   host-scoped, not port-scoped, so the ws port sees it). A client
+//!   without the cookie gets a fresh user per connection.
 
 use std::collections::{HashMap, VecDeque};
 use std::net::{TcpListener, TcpStream};
@@ -32,9 +39,11 @@ use crate::value::{decode, encode, NativeId, Value};
 
 const INDEX_HTML: &str = include_str!("../web/index.html");
 const GLUE_JS: &str = include_str!("../web/glue.js");
+const IDIOMORPH_JS: &str = include_str!("../web/idiomorph.esm.js");
 
 enum Ev {
-    Conn(String, mpsc::Sender<Vec<u8>>),
+    /// (session id, user id, outbound frame queue)
+    Conn(String, String, mpsc::Sender<Vec<u8>>),
     /// Raw frame bytes — Values are Rc-based and thread-local, so decoding
     /// happens on the VM thread.
     Pkt(String, Vec<u8>),
@@ -83,6 +92,39 @@ fn session_name(n: usize) -> String {
     }
 }
 
+/// One connected tab.
+struct Sess {
+    out: mpsc::Sender<Vec<u8>>,
+    user: String,
+}
+
+/// Mint a user id: an unguessable-enough bearer token for a dev server
+/// (hashed clock + pid + counter — swap for a real RNG behind real auth).
+fn mint_user() -> String {
+    use std::hash::{Hash, Hasher};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+        .hash(&mut h);
+    std::process::id().hash(&mut h);
+    N.fetch_add(1, Ordering::Relaxed).hash(&mut h);
+    let a = h.finish();
+    a.wrapping_mul(0x9e37_79b9_7f4a_7c15).hash(&mut h);
+    let b = h.finish();
+    format!("u{a:016x}{b:016x}")
+}
+
+/// The `hop_user` value out of a Cookie header, if present.
+fn hop_user_cookie(cookie_header: &str) -> Option<String> {
+    cookie_header.split(';').find_map(|kv| {
+        let (k, v) = kv.trim().split_once('=')?;
+        (k == "hop_user" && !v.is_empty()).then(|| v.to_string())
+    })
+}
+
 fn now_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -115,9 +157,22 @@ fn http_thread(
         let (tx, boot, config, app_src, pkg_dir) =
             (tx.clone(), boot.clone(), config.clone(), app_src.clone(), pkg_dir.clone());
         thread::spawn(move || {
+            // the shell page mints the durable user identity: a cookie the
+            // ws handshake reads back (host-scoped, so the ws port sees it)
+            let has_user = req
+                .headers()
+                .iter()
+                .find(|h| h.field.equiv("Cookie"))
+                .and_then(|h| hop_user_cookie(h.value.as_str()))
+                .is_some();
+            let set_cookie = match req.url() {
+                "/" | "/index.html" if !has_user => Some(mint_user()),
+                _ => None,
+            };
             let (content, ctype): (Vec<u8>, &str) = match req.url() {
                 "/" | "/index.html" => (INDEX_HTML.into(), "text/html; charset=utf-8"),
                 "/glue.js" => (GLUE_JS.into(), "text/javascript"),
+                "/idiomorph.esm.js" => (IDIOMORPH_JS.into(), "text/javascript"),
                 "/config.json" => (config.into(), "application/json"),
                 "/app.hop" => (app_src.into(), "text/plain; charset=utf-8"),
                 "/reset" => {
@@ -162,9 +217,18 @@ fn http_thread(
                     }
                 }
             };
-            let resp = tiny_http::Response::from_data(content).with_header(
+            let mut resp = tiny_http::Response::from_data(content).with_header(
                 tiny_http::Header::from_bytes(&b"Content-Type"[..], ctype.as_bytes()).unwrap(),
             );
+            if let Some(u) = set_cookie {
+                resp.add_header(
+                    tiny_http::Header::from_bytes(
+                        &b"Set-Cookie"[..],
+                        format!("hop_user={u}; Path=/; Max-Age=31536000; SameSite=Lax").as_bytes(),
+                    )
+                    .unwrap(),
+                );
+            }
             let _ = req.respond(resp);
         });
     }
@@ -183,17 +247,34 @@ fn accept_thread(port: u16, tx: mpsc::Sender<Ev>) {
 }
 
 fn conn_thread(stream: TcpStream, sid: String, tx: mpsc::Sender<Ev>) {
-    let mut ws = match tungstenite::accept(stream) {
+    // the handshake request carries the browser's cookies; that is where
+    // the durable user identity enters the runtime
+    let mut user = String::new();
+    let mut ws = match tungstenite::accept_hdr(stream, |req: &tungstenite::handshake::server::Request, resp| {
+        if let Some(u) = req
+            .headers()
+            .get("Cookie")
+            .and_then(|v| v.to_str().ok())
+            .and_then(hop_user_cookie)
+        {
+            user = u;
+        }
+        Ok(resp)
+    }) {
         Ok(ws) => ws,
         Err(_) => return,
     };
+    if user.is_empty() {
+        // cookieless client (curl, tests): identity lives one connection
+        user = mint_user();
+    }
     // after the handshake, timeout reads so this thread can also write
     ws.get_mut()
         .set_read_timeout(Some(Duration::from_millis(50)))
         .ok();
 
     let (out_tx, out_rx) = mpsc::channel::<Vec<u8>>();
-    if tx.send(Ev::Conn(sid.clone(), out_tx)).is_err() {
+    if tx.send(Ev::Conn(sid.clone(), user, out_tx)).is_err() {
         return;
     }
     loop {
@@ -225,7 +306,7 @@ fn conn_thread(stream: TcpStream, sid: String, tx: mpsc::Sender<Ev>) {
     }
 }
 
-fn route(sessions: &HashMap<String, mpsc::Sender<Vec<u8>>>, pkt: &Value) {
+fn route(sessions: &HashMap<String, Sess>, pkt: &Value) {
     let Ok(bytes) = encode(pkt) else {
         eprintln!("[hopd] unencodable packet: {pkt}");
         return;
@@ -233,13 +314,18 @@ fn route(sessions: &HashMap<String, mpsc::Sender<Vec<u8>>>, pkt: &Value) {
     let to = pkt.get_field("to");
     match to.as_str() {
         Some("browsers") => {
-            for out in sessions.values() {
-                let _ = out.send(bytes.clone());
+            for s in sessions.values() {
+                let _ = s.out.send(bytes.clone());
             }
         }
         Some(addr) => {
-            if let Some(out) = sessions.get(addr) {
-                let _ = out.send(bytes);
+            if let Some(uid) = addr.strip_prefix("user:") {
+                // every tab of one user
+                for s in sessions.values().filter(|s| s.user == uid) {
+                    let _ = s.out.send(bytes.clone());
+                }
+            } else if let Some(s) = sessions.get(addr) {
+                let _ = s.out.send(bytes);
             }
             // a vanished session is a dropped packet: at-most-once, by design
         }
@@ -935,30 +1021,31 @@ pub fn serve(
         );
     }
 
-    let mut sessions: HashMap<String, mpsc::Sender<Vec<u8>>> = HashMap::new();
+    let mut sessions: HashMap<String, Sess> = HashMap::new();
     let mut effects = Effects::default();
     let llm_cfg = LlmCfg::from_env();
     println!("[hopd] serving http://localhost:{http_port}  (ws on :{ws_port}, CBOR binary)");
 
     for ev in rx {
         match ev {
-            Ev::Conn(sid, out) => {
+            Ev::Conn(sid, user, out) => {
                 let hello = Value::map(
                     [
                         (Value::str("kind"), Value::str("hello")),
                         (Value::str("session"), Value::str(sid.as_str())),
+                        (Value::str("user"), Value::str(user.as_str())),
                     ]
                     .into_iter()
                     .collect(),
                 );
                 let _ = out.send(encode(&hello).expect("hello encodes"));
-                sessions.insert(sid.clone(), out);
-                println!("[hopd] session {sid} connected");
+                sessions.insert(sid.clone(), Sess { out, user: user.clone() });
+                println!("[hopd] session {sid} connected (user {user})");
                 let mut platform = ServePlatform {
                     outbox: &mut outbox,
                     store: binding.as_mut(),
                 };
-                vm.session_connect(&mut platform, &sid);
+                vm.session_connect(&mut platform, &sid, &user);
                 boot.store(now_millis(), Ordering::SeqCst);
             }
             Ev::Pkt(sid, bytes) => {
@@ -975,6 +1062,8 @@ pub fn serve(
                     // never trust a claimed identity
                     let _ = pkt.set_field("origin", Value::str(sid.as_str()));
                     let _ = pkt.set_field("reply_to", Value::str(sid.as_str()));
+                    let user = sessions.get(&sid).map(|s| s.user.as_str()).unwrap_or("");
+                    let _ = pkt.set_field("user", Value::str(user));
                 }
                 if log_packets {
                     println!("        ~ wire {sid:>7} -> server   {pkt}");
@@ -991,8 +1080,14 @@ pub fn serve(
                 vm.receive(&mut platform, pkt);
             }
             Ev::Gone(sid) => {
-                sessions.remove(&sid);
-                println!("[hopd] session {sid} disconnected");
+                if let Some(s) = sessions.remove(&sid) {
+                    println!("[hopd] session {sid} disconnected");
+                    let mut platform = ServePlatform {
+                        outbox: &mut outbox,
+                        store: binding.as_mut(),
+                    };
+                    vm.session_disconnect(&mut platform, &sid, &s.user);
+                }
             }
             Ev::Reset => {
                 println!("[hopd] reset");

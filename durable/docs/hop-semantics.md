@@ -162,8 +162,18 @@ grows syntax.
   the socket (`serve.rs`; `ws_smoke.rs` asserts forgery fails).
 - `session()` means: own session on a browser; the flow's origin session
   in a server segment.
+- Two identities, both socket-stamped, never client-claimed. A *session*
+  is one tab (one WebSocket, minted per connection). A *user* is the
+  durable identity behind it: a `hop_user` cookie minted by hopd's HTTP
+  shell and read back from the WebSocket handshake — it survives reloads
+  and is shared by every tab of one browser profile. `user()` mirrors
+  `session()` (own user on a browser; the origin's user in a server
+  segment), and `cast user(uid)` fans out to every connected tab of that
+  user. hopd fires `on_connect(sid, user)` / `on_disconnect(sid, user)`
+  on the server VM — best-effort presence, not a transaction.
 - Delivery is FIFO per transport; `browsers` fan-out enumerates connected
-  sessions at delivery time, at-most-once, no ordering across VMs.
+  sessions at delivery time, at-most-once, no ordering across VMs; the
+  `user:` fan-out enumerates that user's tabs the same way.
 - Quiescence is observable: no suspended flows once the queue drains
   (`rt.quiescent`, asserted after every test scenario).
 

@@ -1,8 +1,10 @@
 // agent.hop — a coding agent in one file: chat UI, streamed LLM turns,
 // an approval-gated bash tool, and a transcript that survives restarts
 // because it lives on the tape. Thread-aware: the store is a map of
-// threads, every event names its thread, and each browser session views
-// (and works) its own thread — two tabs can run two turns at once.
+// threads, every event names its thread, and each *user* views (and
+// works) their own thread — a user is the durable identity behind the
+// tab (hopd's cookie), so a reload lands back in the same thread and
+// every tab of one user stays in sync via `cast user(uid)`.
 //
 //   export OPENAI_API_KEY=...           (and optionally OPENAI_BASE_URL)
 //   export HOP_LLM_MODEL=gpt-4o-mini    (or pass model in the request)
@@ -25,7 +27,7 @@ server let schema = store.record([
     ["pending", store.leaf],            // command string awaiting approval
     ["busy", store.leaf]                // a turn is in flight on this thread
   ]))],
-  ["views", store.map(store.leaf)],     // sid -> tid: what each tab is viewing
+  ["views", store.map(store.leaf)],     // uid -> tid: what each user is viewing
   ["next", store.leaf],                 // next thread id to mint
   ["auto", store.leaf],                 // auto-approve: tools run ungated
   ["model", store.leaf],                // chosen model (nil = env default)
@@ -42,8 +44,8 @@ fn reduce(event) {
     retitle { tid, title } => {
       store(["threads", tid, "title", store.set(title)]);
     }
-    open { sid, tid } => {
-      store(["views", sid, store.set(tid)]);
+    open { uid, tid } => {
+      store(["views", uid, store.set(tid)]);
     }
     user { tid, text } => {
       store(["threads", tid, "msgs", store.push({ role = "user", text = text })]);
@@ -217,7 +219,7 @@ fn run_tool(tid, cmd, call_id) {
 
 // ── human gates: the only marked functions in the file ──────────────────
 
-fn send(sid, tid) {
+fn send(tid) {
   let text = dom.get("#draft");
   if text == "" {
     return;
@@ -254,17 +256,17 @@ fn deny(tid) {
   spawn run_turn(tid);
 }
 
-fn open_thread(sid, tid) {
+fn open_thread(uid, tid) {
   server!();
-  store.append({ type = "open", sid = sid, tid = tid });
-  paint_session(sid);
+  store.append({ type = "open", uid = uid, tid = tid });
+  paint_user(uid);
 }
 
-fn new_thread(sid) {
+fn new_thread(uid) {
   server!();
   let tid = store(["next"]) || 1;
   store.append({ type = "thread", tid = tid });
-  store.append({ type = "open", sid = sid, tid = tid });
+  store.append({ type = "open", uid = uid, tid = tid });
   paint_all(); // everyone's thread list grew
 }
 
@@ -313,16 +315,16 @@ fn thread_list() {
   return out;
 }
 
-fn agent_app(sid, tid, threads, msgs, pending, busy, auto, model, models, home) {
+fn agent_app(uid, tid, threads, msgs, pending, busy, auto, model, models, home) {
   let tabs = [];
   for i, th in threads {
     push(tabs, [:button, {
       class = th.tid == tid && "tab current" || "tab",
-      onclick = fn(e) { open_thread(sid, th.tid); }
+      onclick = fn(e) { open_thread(uid, th.tid); }
     }, th.title]);
   }
   push(tabs, [:button, { class = "tab", id = "new_thread",
-    onclick = fn(e) { new_thread(sid); } }, "+ new"]);
+    onclick = fn(e) { new_thread(uid); } }, "+ new"]);
 
   let rows = [];
   if msgs {
@@ -365,9 +367,9 @@ fn agent_app(sid, tid, threads, msgs, pending, busy, auto, model, models, home) 
       [:input, {
         id = "draft",
         placeholder = busy && "thinking..." || "ask, or try: RUN: echo hi",
-        onkeydown = fn(e) { if e.key == "Enter" { send(sid, tid); } }
+        onkeydown = fn(e) { if e.key == "Enter" { send(tid); } }
       }],
-      [:button, { id = "send", onclick = fn(e) { send(sid, tid); } }, "send"],
+      [:button, { id = "send", onclick = fn(e) { send(tid); } }, "send"],
       [:button, { id = "auto", class = "meta", onclick = fn(e) { toggle_auto(); } },
         auto && "auto-approve: on" || "auto-approve: off"]
     ],
@@ -403,8 +405,9 @@ fn settings_row(model, models, home) {
   ];
 }
 
-fn paint_session(sid) {
-  let tid = store(["views", sid]);
+// Repaint every tab of one user (their view of the store).
+fn paint_user(uid) {
+  let tid = store(["views", uid]);
   if !tid {
     return;
   }
@@ -416,43 +419,47 @@ fn paint_session(sid) {
   let model = store(["model"]);
   let models = store(["models"]);
   let home = store(["home"]);
-  cast session(sid) {
-    hui.render("#app", agent_app(sid, tid, threads, msgs, pending, busy, auto, model, models, home));
+  cast user(uid) {
+    hui.render("#app", agent_app(uid, tid, threads, msgs, pending, busy, auto, model, models, home));
   }
 }
 
-// Repaint every connected tab, each through its own view of the store.
+// Repaint everyone, each user through their own view of the store.
 fn paint_all() {
-  let sids = store(["views", store.keys]);
-  if sids {
-    for i, sid in sids {
-      paint_session(sid);
+  let uids = store(["views", store.keys]);
+  if uids {
+    for i, uid in uids {
+      paint_user(uid);
     }
   }
 }
 
-// Streamed partials go only to the tabs watching this thread.
+// Streamed partials go only to the users watching this thread.
 fn paint_stream(tid, text) {
-  let sids = store(["views", store.keys]);
-  if sids {
-    for i, sid in sids {
-      if store(["views", sid]) == tid {
-        cast session(sid) { hui.render("#stream", markdown(text)); }
+  let uids = store(["views", store.keys]);
+  if uids {
+    for i, uid in uids {
+      if store(["views", uid]) == tid {
+        cast user(uid) { hui.render("#stream", markdown(text)); }
       }
     }
   }
 }
 
-fn on_connect(sid) {
-  let next = store(["next"]) || 1;
-  let tid = next - 1; // the latest thread, if any
-  if tid < 1 {
-    tid = 1;
-    store.append({ type = "thread", tid = tid });
+fn on_connect(sid, uid) {
+  // a returning user lands back in their thread; a new user gets the
+  // latest one (minting the first if the tape is empty)
+  if !store(["views", uid]) {
+    let next = store(["next"]) || 1;
+    let tid = next - 1;
+    if tid < 1 {
+      tid = 1;
+      store.append({ type = "thread", tid = tid });
+    }
+    store.append({ type = "open", uid = uid, tid = tid });
   }
-  store.append({ type = "open", sid = sid, tid = tid });
   if !store(["models"]) {
     spawn fetch_models();
   }
-  paint_session(sid);
+  paint_user(uid);
 }

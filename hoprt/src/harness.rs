@@ -248,7 +248,9 @@ impl Cluster {
                 shared: &mut shared,
                 store: None,
             };
-            let vm = Vm::new(prog.clone(), SideId::Browser(s.to_string()), &mut platform)?;
+            let mut vm = Vm::new(prog.clone(), SideId::Browser(s.to_string()), &mut platform)?;
+            // each tab defaults to its own user; set_user() groups tabs
+            vm.user = Value::str(format!("u:{s}"));
             browsers.push((s.to_string(), vm));
         }
 
@@ -379,6 +381,47 @@ impl Cluster {
         &self.data_dir
     }
 
+    /// Reassign a browser's user identity (before connecting): two tabs
+    /// with the same user are what `cast user(uid)` fans out to.
+    pub fn set_user(&mut self, addr: &str, user: &str) {
+        let (_, vm) = Self::browser(&mut self.browsers, addr);
+        vm.user = Value::str(user);
+    }
+
+    /// The user identity of a browser VM.
+    pub fn user_of(&mut self, addr: &str) -> String {
+        let (_, vm) = Self::browser(&mut self.browsers, addr);
+        crate::value::coerce_str(&vm.user)
+    }
+
+    /// What hopd does when a tab connects: fire `on_connect(sid, user)`
+    /// on the server VM.
+    pub fn connect(&mut self, addr: &str) {
+        let user = self.user_of(addr);
+        let mut platform = SimPlatform {
+            label: "server".into(),
+            is_server: true,
+            shared: &mut self.shared,
+            store: self.store.as_mut(),
+        };
+        self.server.session_connect(&mut platform, addr, &user);
+    }
+
+    /// What hopd does when a tab goes away: drop the VM and fire
+    /// `on_disconnect(sid, user)` on the server VM. Packets addressed to
+    /// the gone session drop silently, per the at-most-once contract.
+    pub fn disconnect(&mut self, addr: &str) {
+        let user = self.user_of(addr);
+        self.browsers.retain(|(a, _)| a != addr);
+        let mut platform = SimPlatform {
+            label: "server".into(),
+            is_server: true,
+            shared: &mut self.shared,
+            store: self.store.as_mut(),
+        };
+        self.server.session_disconnect(&mut platform, addr, &user);
+    }
+
     /// Simulate an event: run a global entry point as a flow on one VM.
     pub fn fire(&mut self, addr: &str, entry: &str) {
         self.fire_args(addr, entry, Vec::new());
@@ -489,14 +532,37 @@ impl Cluster {
                     }
                 }
                 addr => {
-                    let (label, vm) = Self::browser(&mut self.browsers, addr);
-                    let mut platform = SimPlatform {
-                        label,
-                        is_server: false,
-                        shared: &mut self.shared,
-                        store: None,
-                    };
-                    vm.receive(&mut platform, pkt);
+                    if let Some(uid) = addr.strip_prefix("user:") {
+                        // every tab of one user, in label order
+                        let mut order: Vec<usize> = (0..self.browsers.len())
+                            .filter(|&i| {
+                                self.browsers[i].1.user.as_str() == Some(uid)
+                            })
+                            .collect();
+                        order.sort_by(|&a, &b| self.browsers[a].0.cmp(&self.browsers[b].0));
+                        for i in order {
+                            let (label, vm) = &mut self.browsers[i];
+                            let mut platform = SimPlatform {
+                                label: label.clone(),
+                                is_server: false,
+                                shared: &mut self.shared,
+                                store: None,
+                            };
+                            vm.receive(&mut platform, pkt.clone());
+                        }
+                    } else if let Some((label, vm)) =
+                        self.browsers.iter_mut().find(|(a, _)| a == addr)
+                    {
+                        let label = label.clone();
+                        let mut platform = SimPlatform {
+                            label,
+                            is_server: false,
+                            shared: &mut self.shared,
+                            store: None,
+                        };
+                        vm.receive(&mut platform, pkt);
+                    }
+                    // a vanished session is a dropped packet: at-most-once
                 }
             }
         }

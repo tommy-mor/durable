@@ -80,6 +80,8 @@ pub enum Instr {
     Spawn,
     /// → session identity (browser: own sid; server: flow origin)
     Session,
+    /// → user identity (browser: own user; server: origin's user)
+    User,
 }
 
 #[derive(Clone, Debug)]
