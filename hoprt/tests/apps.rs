@@ -101,6 +101,19 @@ fn tget(host: &mut Cluster, tid: i64, rest: Vec<Value>) -> Value {
     host.store_get(arr(path)).unwrap()
 }
 
+/// The seed-ordered entrant names, via the app's own roster().
+fn roster_names(host: &mut Cluster, tid: i64) -> Vec<String> {
+    let rows = host.call_server("roster", vec![i(tid)]).unwrap();
+    let Value::Array(a) = rows else { panic!("roster returns an array") };
+    let a = a.borrow();
+    a.iter()
+        .map(|r| match r.get_field("name") {
+            Value::Str(s) => s.to_string(),
+            other => panic!("row name: {other}"),
+        })
+        .collect()
+}
+
 #[test]
 fn tournament_single_elim_seeding_scores_and_reopen() {
     let mut host = Cluster::new(&["A", "B"], include_str!("../hop/tournament.hop"), false).unwrap();
@@ -113,13 +126,13 @@ fn tournament_single_elim_seeding_scores_and_reopen() {
     // duplicate names are rejected; seeding is editable: promote e, drop d,
     // re-enter a … no wait, a is taken — enter "f" then drop it again
     host.append(map(&[("type", s("enter")), ("tid", i(0)), ("player", s("a"))])).unwrap();
-    assert_eq!(arr_len(&tget(&mut host, 0, vec![s("players")])), 5, "duplicate rejected");
+    assert_eq!(roster_names(&mut host, 0).len(), 5, "duplicate rejected");
     host.append(map(&[("type", s("move")), ("tid", i(0)), ("i", i(4))])).unwrap();
-    let players = tget(&mut host, 0, vec![s("players")]);
-    assert_eq!(host.store_get(arr(vec![s("tournaments"), i(0), s("players"), i(3)])).unwrap(), s("e"));
-    assert_eq!(arr_len(&players), 5);
+    let names = roster_names(&mut host, 0);
+    assert_eq!(names[3], "e");
+    assert_eq!(names.len(), 5);
     host.append(map(&[("type", s("drop")), ("tid", i(0)), ("i", i(4))])).unwrap();
-    assert_eq!(arr_len(&tget(&mut host, 0, vec![s("players")])), 4, "d dropped");
+    assert_eq!(roster_names(&mut host, 0), vec!["a", "b", "c", "e"], "d dropped");
     host.append(map(&[("type", s("enter")), ("tid", i(0)), ("player", s("d"))])).unwrap();
 
     // seeds now a b c e d. size 8, rounds 3; order 1 8 4 5 2 7 3 6 puts
@@ -135,7 +148,7 @@ fn tournament_single_elim_seeding_scores_and_reopen() {
 
     // guards: late entry, foreign winner, double report — all no-ops
     host.append(map(&[("type", s("enter")), ("tid", i(0)), ("player", s("late"))])).unwrap();
-    assert_eq!(arr_len(&tget(&mut host, 0, vec![s("players")])), 5, "signup locked");
+    assert_eq!(roster_names(&mut host, 0).len(), 5, "signup locked");
     report(&mut host, 0, "r1m2", "nobody");
     assert_eq!(tget(&mut host, 0, vec![s("matches"), s("r1m2"), s("winner")]), Value::Nil);
 
@@ -182,9 +195,11 @@ fn tournament_single_elim_seeding_scores_and_reopen() {
     let list = snap.get_field("list");
     assert_eq!(arr_len(&list), 1);
     let snap = host.call_server("snapshot", vec![i(0)]).unwrap();
-    host.call_server("render", vec![snap]).unwrap();
-    let log = host.log().join("\n");
-    assert!(log.contains("champion: b"), "{log}");
+    let view = host
+        .call_server("app_view", vec![snap, Value::Bool(true), s("to")])
+        .unwrap();
+    let html = format!("{view}");
+    assert!(html.contains("champion: b"), "{html}");
 
     host.verify().unwrap();
 }
@@ -250,16 +265,25 @@ fn tournament_round_robin_standings_decide() {
     report(&mut host, 0, "r2m1", "a");
     assert_eq!(tget(&mut host, 0, vec![s("status")]), s("live"), "one match left");
     report(&mut host, 0, "r3m1", "a");
+
+    // all results in: awaiting review, and the TO's finalize crowns from
+    // the standings (a is 2-0)
+    assert_eq!(tget(&mut host, 0, vec![s("status")]), s("review"));
+    assert_eq!(tget(&mut host, 0, vec![s("champion")]), Value::Nil, "not before finalize");
+    host.append(map(&[("type", s("finalize")), ("tid", i(0))])).unwrap();
     assert_eq!(tget(&mut host, 0, vec![s("champion")]), s("a"), "a is 2-0");
     assert_eq!(tget(&mut host, 0, vec![s("status")]), s("done"));
 
-    // flip a result into a three-way tie: done, but nobody is crowned
+    // flip a result into a three-way tie: 1-1-1, head-to-head can't break
+    // three ways, the seed does — finalize still ends the tournament
     host.append(map(&[("type", s("unreport")), ("tid", i(0)), ("mid", s("r2m1"))])).unwrap();
     assert_eq!(tget(&mut host, 0, vec![s("status")]), s("live"));
     assert_eq!(tget(&mut host, 0, vec![s("champion")]), Value::Nil);
     report(&mut host, 0, "r2m1", "c");
+    assert_eq!(tget(&mut host, 0, vec![s("status")]), s("review"));
+    host.append(map(&[("type", s("finalize")), ("tid", i(0))])).unwrap();
     assert_eq!(tget(&mut host, 0, vec![s("status")]), s("done"));
-    assert_eq!(tget(&mut host, 0, vec![s("champion")]), Value::Nil, "1-1-1 tie");
+    assert_eq!(tget(&mut host, 0, vec![s("champion")]), s("a"), "1-1-1: top seed");
 
     // deleting a tournament removes it from the lobby select
     host.append(map(&[("type", s("delete")), ("tid", i(0))])).unwrap();

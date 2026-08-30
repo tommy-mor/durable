@@ -221,10 +221,19 @@ impl Vm {
         }
     }
 
-    /// hopd calls this on the server VM when a session connects.
-    pub fn session_connect(&mut self, platform: &mut dyn Platform, sid: &str, user: &str) {
+    /// hopd calls this on the server VM when a session connects. `profile`
+    /// is what the platform knows about the user (display name, admin bit)
+    /// — a map, or Nil for an anonymous connection. Arity is tolerant, so
+    /// two-argument `on_connect(sid, uid)` hooks keep working.
+    pub fn session_connect(
+        &mut self,
+        platform: &mut dyn Platform,
+        sid: &str,
+        user: &str,
+        profile: Value,
+    ) {
         if !matches!(self.globals.get("on_connect"), Value::Nil) {
-            self.fire(platform, "on_connect", vec![Value::str(sid), Value::str(user)]);
+            self.fire(platform, "on_connect", vec![Value::str(sid), Value::str(user), profile]);
         }
     }
 

@@ -135,6 +135,8 @@ pub struct Cluster {
     /// structured tool calls for the final marker).
     fx_streams: HashMap<String, (VecDeque<String>, String, Vec<(String, String)>)>,
     fx_next: u64,
+    /// uid → profile map connect() hands to on_connect (set_profile).
+    profiles: HashMap<String, Value>,
 }
 
 /// The harness's deterministic fake model: "RUN: <cmd>" yields a bash
@@ -263,6 +265,7 @@ impl Cluster {
             _keep: keep,
             fx_streams: HashMap::new(),
             fx_next: 0,
+            profiles: HashMap::new(),
         })
     }
 
@@ -309,6 +312,20 @@ impl Cluster {
                     ]),
                 };
                 reply(value)
+            }
+            "rand" => {
+                // deterministic in the harness: a counter-seeded LCG, so
+                // shuffle-driven tests replay identically
+                let n = match vars.get_field("n") {
+                    Value::Int(n) if n > 0 => n as u64,
+                    _ => 1,
+                };
+                self.fx_next += 1;
+                let x = self
+                    .fx_next
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                reply(Value::Int(((x >> 33) % n) as i64))
             }
             "llm" => {
                 let (text, calls) = fake_llm(&vars.get_field("req"));
@@ -388,23 +405,51 @@ impl Cluster {
         vm.user = Value::str(user);
     }
 
+    /// Override the profile hopd would stamp for this browser's user
+    /// (display name, admin bit). Unset, connect() defaults to an
+    /// admin-true profile — the open dev-mode policy.
+    pub fn set_profile(&mut self, addr: &str, name: &str, admin: bool) {
+        let uid = self.user_of(addr);
+        self.profiles.insert(
+            uid,
+            Value::map(
+                [
+                    (Value::str("name"), Value::str(name)),
+                    (Value::str("admin"), Value::Bool(admin)),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+        );
+    }
+
     /// The user identity of a browser VM.
     pub fn user_of(&mut self, addr: &str) -> String {
         let (_, vm) = Self::browser(&mut self.browsers, addr);
         crate::value::coerce_str(&vm.user)
     }
 
-    /// What hopd does when a tab connects: fire `on_connect(sid, user)`
-    /// on the server VM.
+    /// What hopd does when a tab connects: fire `on_connect(sid, user,
+    /// profile)` on the server VM.
     pub fn connect(&mut self, addr: &str) {
         let user = self.user_of(addr);
+        let profile = self.profiles.get(&user).cloned().unwrap_or_else(|| {
+            Value::map(
+                [
+                    (Value::str("name"), Value::str(user.as_str())),
+                    (Value::str("admin"), Value::Bool(true)),
+                ]
+                .into_iter()
+                .collect(),
+            )
+        });
         let mut platform = SimPlatform {
             label: "server".into(),
             is_server: true,
             shared: &mut self.shared,
             store: self.store.as_mut(),
         };
-        self.server.session_connect(&mut platform, addr, &user);
+        self.server.session_connect(&mut platform, addr, &user, profile);
     }
 
     /// What hopd does when a tab goes away: drop the VM and fire

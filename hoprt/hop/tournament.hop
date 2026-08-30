@@ -1,31 +1,60 @@
-// tournament.hop — collaborative brackets on the tape (challonge parity).
+// tournament.hop — a challonge on the tape.
 //
 //   cargo run -p hoprt --bin hopd -- hoprt/hop/tournament.hop
-//   open http://localhost:9000 in several tabs: create a tournament in one
-//   of three formats, enter and seed players, start it, report scores,
-//   reopen a match (results cascade back out), crown a champion.
-//   restart hopd: the JSONL tape rebuilds every bracket.
+//   open http://localhost:9000 in several tabs.
 //
-// Eight events — create / enter / move / drop / start / report / unreport /
-// delete. Everything else is derived. The bracket is a *graph built at
-// start*: every match record carries w_to and l_to links ([mid, side] or
-// "champion"), so advancement is one generic `place` walk, double
-// elimination is just a different graph, and reopening a match is the same
-// walk in reverse. "__bye" is a real value that flows through the links,
-// which makes short brackets and losers-bracket holes uniform.
+// Five formats — single elimination (optional third-place match), double
+// elimination (with bracket reset), round robin, swiss, and two-stage
+// groups → finals. The full lifecycle: signup → optional check-in → live
+// → review → done, with reopening, forfeits, seeding tools (promote,
+// shuffle, bulk entry, rename), a match queue, standings with tiebreaks,
+// and final placements. Restart hopd: the JSONL tape rebuilds everything.
+//
+// The design carries over from the original bracket: elimination is a
+// *graph built at start* — every match carries w_to and l_to links
+// ([mid, side] or "champion"), so advancement is one generic `place`
+// walk, double elimination is just a different graph, and reopening a
+// match is the same walk in reverse. "__bye" is a real value that flows
+// through the links. Swiss has no links: each round is paired from
+// standings when the previous one completes. Groups are round robins
+// whose standings seed a second-stage elimination graph.
 //
 // A reducer reads *committed* state only — its own writes are invisible
-// until the event commits. The start builder therefore lays out the whole
-// bracket in a local map (seeding, bye resolution) and writes it once;
-// report-time advancement reads only keys committed by earlier events.
+// until the event commits. Builders therefore lay out whole rounds in a
+// local map and write once; walks that must see this event's decisions
+// thread them as parameters (see `gone1` in place, `decided` in the
+// review checks).
+//
+// Identity: users (durable, cookie- or discord-based) hold a view (which
+// tournament they are looking at) and an admin bit stamped by hopd. Every
+// mutating flow re-checks the admin bit server-side; spectators get the
+// same live paints minus the controls.
 
 server let schema = store.record([
   ["tournaments", store.map(store.record([
     ["name", store.leaf],
-    ["format", store.leaf],                 // "single" | "double" | "robin"
-    ["status", store.leaf],                 // "signup" | "live" | "done"
-    ["players", store.list(store.leaf)],
+    ["desc", store.leaf],
+    ["game", store.leaf],
+    ["format", store.leaf],                 // "single"|"double"|"robin"|"swiss"|"groups"
+    ["status", store.leaf],                 // "signup"|"checkin"|"live"|"review"|"done"
+    ["stage", store.leaf],                  // groups only: "groups"|"finals"
+    // keyed by (unique) name; `seed` orders the field. A map because the
+    // store's list ops are leaf-only — and a stable key makes rename,
+    // check-in, and forfeit one-field writes.
+    ["players", store.map(store.record([
+      ["seed", store.leaf],
+      ["ci", store.leaf],                   // checked in
+      ["st", store.leaf]                    // "active" | "out" (forfeit/DQ/no-show)
+    ]))],
+    ["settings", store.record([
+      ["third", store.leaf],                // single elim: third-place match
+      ["swiss_rounds", store.leaf],
+      ["group_size", store.leaf],
+      ["advance", store.leaf],              // top N per group reach the finals
+      ["final_format", store.leaf]          // "single" | "double"
+    ])],
     ["rounds", store.leaf],
+    ["round", store.leaf],                  // swiss: the round currently playing
     ["champion", store.leaf],
     ["matches", store.map(store.record([
       ["p1", store.leaf],
@@ -35,11 +64,19 @@ server let schema = store.record([
       ["s2", store.leaf],
       ["round", store.leaf],
       ["slot", store.leaf],
-      ["bracket", store.leaf],              // "w" | "l" | "gf" | "rr"
+      ["bracket", store.leaf],              // "w" | "l" | "gf" | "3p" | "rr" | "sw"
+      ["grp", store.leaf],                  // group number (two-stage group matches)
       ["w_to", store.leaf],                 // [mid, side] | "champion" | nil
-      ["l_to", store.leaf]
+      ["l_to", store.leaf],
+      ["num", store.leaf],                  // call order: "match #12"
+      ["ff", store.leaf]                    // decided by forfeit
     ]))]
-  ]))]
+  ]))],
+  ["users", store.map(store.record([
+    ["name", store.leaf],
+    ["admin", store.leaf]
+  ]))],
+  ["views", store.map(store.leaf)]          // uid -> "lobby" | tid
 ]);
 
 // ── reducer ─────────────────────────────────────────────────────────────
@@ -50,80 +87,252 @@ fn reduce(event) {
       store(["tournaments", seq, "name", store.set(name)]);
       store(["tournaments", seq, "format", store.set(format || "single")]);
       store(["tournaments", seq, "status", store.set("signup")]);
+      store(["tournaments", seq, "settings", store.set({
+        third = false, swiss_rounds = nil, group_size = 4,
+        advance = 2, final_format = "single"
+      })]);
     }
-    enter => { enter_player(event); }
+    config => { config_t(event); }
+    enter { tid, player } => { enter_players(tid, [player]); }
+    enter_bulk { tid, players } => { enter_players(tid, players); }
+    rename => { rename_player(event); }
     move => { move_player(event); }
+    reorder => { reorder_players(event); }
     drop => { drop_player(event); }
-    start { tid } => {
-      let st = store(["tournaments", tid, "status"]);
-      if st == "signup" {
-        start_bracket(tid);
+    checkin_open { tid } => {
+      if store(["tournaments", tid, "status"]) == "signup" {
+        store(["tournaments", tid, "status", store.set("checkin")]);
       }
     }
+    checkin { tid, i, v } => { checkin_player(tid, i, v); }
+    checkin_all { tid } => { checkin_everyone(tid); }
+    start { tid } => { start_tournament(tid); }
     report => { report_result(event); }
     unreport { tid, mid } => { unreport_match(tid, mid); }
+    next_round { tid } => { swiss_next_round(tid); }
+    start_finals { tid } => { start_finals(tid); }
+    forfeit { tid, name } => { forfeit_player(tid, name); }
+    finalize { tid } => { finalize_t(tid); }
+    reset { tid } => { reset_t(tid); }
     delete { tid } => {
       store(["tournaments", tid, store.del]);
+    }
+    seen { uid, name, admin } => {
+      store(["users", uid, "name", store.set(name)]);
+      store(["users", uid, "admin", store.set(admin)]);
+    }
+    view { uid, tid } => {
+      store(["views", uid, store.set(tid)]);
     }
   }
 }
 
-fn enter_player(event) {
-  let st = store(["tournaments", event.tid, "status"]);
-  if st != "signup" || !event.player || event.player == "" || event.player == "__bye" {
+// ── setup phase: settings and participants ──────────────────────────────
+
+// One settings event: k names the field, v the value. Format and options
+// only bend before the bracket exists.
+fn config_t(event) {
+  let tid = event.tid;
+  let st = store(["tournaments", tid, "status"]);
+  if st != "signup" && st != "checkin" {
     return;
   }
-  let players = store(["tournaments", event.tid, "players"]);
-  if players {
-    for _, p in players {
-      if p == event.player {
-        return;
-      }
+  let k = event.k;
+  if k == "name" {
+    if event.v != "" {
+      store(["tournaments", tid, "name", store.set(event.v)]);
+    }
+  } else if k == "desc" || k == "game" || k == "format" {
+    store(["tournaments", tid, k, store.set(event.v)]);
+  } else if k == "third" || k == "swiss_rounds" || k == "group_size"
+         || k == "advance" || k == "final_format" {
+    store(["tournaments", tid, "settings", k, store.set(event.v)]);
+  }
+}
+
+// The seed-ordered entrant list: [{name, seed, ci, st}, …]. The one view
+// of the players map everything else consumes — works in the reducer and
+// in flows alike (a plain committed read).
+fn roster(tid) {
+  let ps = store(["tournaments", tid, "players"]);
+  let rows = [];
+  if ps {
+    for name, p in ps {
+      push(rows, { name = name, seed = p.seed, ci = p.ci, st = p.st });
     }
   }
-  store(["tournaments", event.tid, "players", store.push(event.player)]);
+  sort_by(rows, [:seed]);
+  return rows;
+}
+
+// Enter one or many. One event's entries dedupe against committed state
+// *and* each other (a reducer cannot read its own writes).
+fn enter_players(tid, names) {
+  let st = store(["tournaments", tid, "status"]);
+  if st != "signup" && st != "checkin" {
+    return;
+  }
+  let have = {};
+  let count = 0;
+  let ps = store(["tournaments", tid, "players"]);
+  if ps {
+    for name, p in ps {
+      have[name] = true;
+      count = count + 1;
+    }
+  }
+  for _, nm in names {
+    if nm && nm != "" && nm != "__bye" && !have[nm] {
+      have[nm] = true;
+      store(["tournaments", tid, "players", nm, store.set(
+        { seed = count, ci = false, st = "active" })]);
+      count = count + 1;
+    }
+  }
+}
+
+// Rename anywhere in the lifecycle. Live, the new name chases the old one
+// through every match and the crown — brackets store names, so a rename
+// is a walk.
+fn rename_player(event) {
+  let tid = event.tid;
+  let i = event.i;
+  let name = event.name;
+  let rows = roster(tid);
+  if i < 0 || i >= len(rows) || !name || name == "" || name == "__bye" {
+    return;
+  }
+  let old = rows[i].name;
+  if old == name {
+    return;
+  }
+  for _, p in rows {
+    if p.name == name {
+      return;                                // taken
+    }
+  }
+  store(["tournaments", tid, "players", name, store.set(
+    { seed = rows[i].seed, ci = rows[i].ci, st = rows[i].st })]);
+  store(["tournaments", tid, "players", old, store.del]);
+  let st = store(["tournaments", tid, "status"]);
+  if st == "signup" || st == "checkin" {
+    return;
+  }
+  let ms = store(["tournaments", tid, "matches"]);
+  for mid, m in ms {
+    if m.p1 == old {
+      store(["tournaments", tid, "matches", mid, "p1", store.set(name)]);
+    }
+    if m.p2 == old {
+      store(["tournaments", tid, "matches", mid, "p2", store.set(name)]);
+    }
+    if m.winner == old {
+      store(["tournaments", tid, "matches", mid, "winner", store.set(name)]);
+    }
+  }
+  if store(["tournaments", tid, "champion"]) == old {
+    store(["tournaments", tid, "champion", store.set(name)]);
+  }
 }
 
 // promote entrant i one seed up (swap with i-1)
 fn move_player(event) {
   let st = store(["tournaments", event.tid, "status"]);
-  let players = store(["tournaments", event.tid, "players"]);
+  let rows = roster(event.tid);
   let i = event.i;
-  if st == "signup" && players && i >= 1 && i < len(players) {
-    store(["tournaments", event.tid, "players", i - 1, store.set(players[i])]);
-    store(["tournaments", event.tid, "players", i, store.set(players[i - 1])]);
+  if (st == "signup" || st == "checkin") && i >= 1 && i < len(rows) {
+    store(["tournaments", event.tid, "players", rows[i].name, "seed", store.set(i - 1)]);
+    store(["tournaments", event.tid, "players", rows[i - 1].name, "seed", store.set(i)]);
+  }
+}
+
+// The whole seeding at once (shuffle). The permutation rides in the event
+// — entropy happened in the flow, so replay is deterministic.
+fn reorder_players(event) {
+  let tid = event.tid;
+  let st = store(["tournaments", tid, "status"]);
+  let rows = roster(tid);
+  let order = event.order;
+  if (st != "signup" && st != "checkin") || !order || len(order) != len(rows) {
+    return;
+  }
+  for j, oi in order {
+    if oi < 0 || oi >= len(rows) {
+      return;
+    }
+  }
+  for j, oi in order {
+    store(["tournaments", tid, "players", rows[oi].name, "seed", store.set(j)]);
   }
 }
 
 fn drop_player(event) {
   let st = store(["tournaments", event.tid, "status"]);
-  let players = store(["tournaments", event.tid, "players"]);
+  let rows = roster(event.tid);
   let i = event.i;
-  if st == "signup" && players && i >= 0 && i < len(players) {
-    let n = len(players);
-    for _, j in range(i, n - 1) {
-      store(["tournaments", event.tid, "players", j, store.set(players[j + 1])]);
+  if (st == "signup" || st == "checkin") && i >= 0 && i < len(rows) {
+    store(["tournaments", event.tid, "players", rows[i].name, store.del]);
+    let n = len(rows);
+    for _, j in range(i + 1, n) {
+      store(["tournaments", event.tid, "players", rows[j].name, "seed", store.set(j - 1)]);
     }
-    store(["tournaments", event.tid, "players", n - 1, store.del]);
+  }
+}
+
+fn checkin_player(tid, i, v) {
+  let st = store(["tournaments", tid, "status"]);
+  let rows = roster(tid);
+  if st == "checkin" && i >= 0 && i < len(rows) {
+    store(["tournaments", tid, "players", rows[i].name, "ci", store.set(v == true)]);
+  }
+}
+
+fn checkin_everyone(tid) {
+  let st = store(["tournaments", tid, "status"]);
+  if st == "checkin" {
+    for _, p in roster(tid) {
+      store(["tournaments", tid, "players", p.name, "ci", store.set(true)]);
+    }
   }
 }
 
 // ── start: build the whole match graph locally, write it once ───────────
 
-fn start_bracket(tid) {
-  let players = store(["tournaments", tid, "players"]);
-  if len(players) < 2 {
+// From signup everyone active plays; from check-in only the checked-in do
+// — the rest are marked out (no-shows keep their row, greyed).
+fn start_tournament(tid) {
+  let st = store(["tournaments", tid, "status"]);
+  if st != "signup" && st != "checkin" {
+    return;
+  }
+  let names = [];
+  for _, p in roster(tid) {
+    if p.st != "out" && (st != "checkin" || p.ci == true) {
+      push(names, p.name);
+    } else if st == "checkin" && p.st != "out" {
+      store(["tournaments", tid, "players", p.name, "st", store.set("out")]);
+    }
+  }
+  if len(names) < 2 {
     return;
   }
   let format = store(["tournaments", tid, "format"]);
+  let settings = store(["tournaments", tid, "settings"]);
   let built = nil;
   if format == "double" {
-    built = build_double(players);
+    built = build_double(names);
   } else if format == "robin" {
-    built = build_robin(players);
+    built = build_robin(names, "r", nil);
+  } else if format == "swiss" {
+    built = build_swiss(names, settings.swiss_rounds);
+    store(["tournaments", tid, "round", store.set(1)]);
+  } else if format == "groups" {
+    built = build_groups(names, settings.group_size);
+    store(["tournaments", tid, "stage", store.set("groups")]);
   } else {
-    built = build_single(players);
+    built = build_single(names, settings.third == true);
   }
+  number_matches(built.ms, format, built.rounds, 0);
   store(["tournaments", tid, "status", store.set("live")]);
   store(["tournaments", tid, "rounds", store.set(built.rounds)]);
   for mid, m in built.ms {
@@ -131,7 +340,9 @@ fn start_bracket(tid) {
   }
 }
 
-fn build_single(players) {
+// Single elimination. With `third`, the semifinal losers drop into one
+// extra match "3p" (round k, slot 2, no onward link).
+fn build_single(players, third) {
   let n = len(players);
   let size = pow2_from(1, n);
   let rounds = log2i(size);
@@ -142,8 +353,15 @@ fn build_single(players) {
       if r < rounds {
         w_to = ["r" .. (r + 1) .. "m" .. floor((s + 1) / 2), side_of(s)];
       }
-      ms["r" .. r .. "m" .. s] = { round = r, slot = s, bracket = "w", w_to = w_to };
+      let m = { round = r, slot = s, bracket = "w", w_to = w_to };
+      if third && rounds >= 2 && r == rounds - 1 {
+        m.l_to = ["3p", side_of(s)];
+      }
+      ms["r" .. r .. "m" .. s] = m;
     }
+  }
+  if third && rounds >= 2 {
+    ms["3p"] = { round = rounds, slot = 2, bracket = "3p" };
   }
   seed_round1(ms, players, size, "r");
   for _, s in range(1, pow2i(rounds - 1) + 1) {
@@ -197,8 +415,9 @@ fn build_double(players) {
 }
 
 // Round robin by the circle method: fix seat 0, rotate the rest. Bye
-// pairings (odd field) are simply not created.
-fn build_robin(players) {
+// pairings (odd field) are simply not created. `prefix` and `grp` let the
+// same builder lay out group-stage pools ("g2r…", grp = 2).
+fn build_robin(players, prefix, grp) {
   let ps = [];
   for _, p in players {
     push(ps, p);
@@ -216,7 +435,8 @@ fn build_robin(players) {
       let b = ps[pos[m - 1 - j]];
       if a != "__bye" && b != "__bye" {
         cnt = cnt + 1;
-        ms["r" .. r .. "m" .. cnt] = { round = r, slot = cnt, bracket = "rr", p1 = a, p2 = b };
+        ms[prefix .. r .. "m" .. cnt] =
+          { round = r, slot = cnt, bracket = "rr", grp = grp, p1 = a, p2 = b };
       }
     }
     pos = rotate(pos);
@@ -233,9 +453,73 @@ fn rotate(pos) {
   return out;
 }
 
+// Swiss round 1: top half vs bottom half by seed; an odd field gives the
+// lowest seed the bye (a free win, stored as a decided "__bye" match).
+// Later rounds are paired from standings — see swiss_next_round.
+fn build_swiss(players, rounds_setting) {
+  let n = len(players);
+  let rounds = rounds_setting;
+  if !rounds || rounds < 1 {
+    rounds = log2i(pow2_from(1, n));
+    if rounds < 1 {
+      rounds = 1;
+    }
+  }
+  let ms = {};
+  let half = floor(n / 2);
+  for _, j in range(0, half) {
+    ms["r1m" .. (j + 1)] =
+      { round = 1, slot = j + 1, bracket = "sw", p1 = players[j], p2 = players[j + half] };
+  }
+  if n % 2 == 1 {
+    ms["r1m" .. (half + 1)] =
+      { round = 1, slot = half + 1, bracket = "sw", p1 = players[n - 1], p2 = "__bye",
+        winner = players[n - 1] };
+  }
+  return { ms = ms, rounds = rounds };
+}
+
+// Two-stage groups: snake-seed into ceil(n / size) pools, round robin in
+// each. Group k's matches live at "g<k>r<r>m<s>" with grp = k.
+fn build_groups(players, size) {
+  let n = len(players);
+  if !size || size < 2 {
+    size = 4;
+  }
+  let g = floor((n + size - 1) / size);
+  if g < 1 {
+    g = 1;
+  }
+  let pools = {};
+  for _, k in range(1, g + 1) {
+    pools[k] = [];
+  }
+  for i, p in players {
+    let row = floor(i / g);
+    let col = i % g;
+    let k = col + 1;
+    if row % 2 == 1 {
+      k = g - col;
+    }
+    push(pools[k], p);
+  }
+  let ms = {};
+  let rounds = 1;
+  for k, pool in pools {
+    let built = build_robin(pool, "g" .. k .. "r", k);
+    for mid, m in built.ms {
+      ms[mid] = m;
+    }
+    if built.rounds > rounds {
+      rounds = built.rounds;
+    }
+  }
+  return { ms = ms, rounds = rounds };
+}
+
 // Bracket position j gets seed order[j] (standard mirror-interleave:
 // 1 8 4 5 2 7 3 6 for size 8, so byes land on top seeds). Entrants are
-// seeded in list order — that is what the signup arrows reorder.
+// seeded in list order — that is what the signup tools reorder.
 fn seed_round1(ms, players, size, prefix) {
   let n = len(players);
   let order = seed_order(size);
@@ -274,7 +558,7 @@ fn sim_auto(ms, mid) {
 }
 
 fn sim_place(ms, to, player) {
-  if to == "champion" {
+  if !to || to == "champion" {
     return;                                  // unreachable with 2+ real players
   }
   let m = ms[to[0]];
@@ -284,6 +568,349 @@ fn sim_place(ms, to, player) {
     m.p2 = player;
   }
   sim_auto(ms, to[0]);
+}
+
+// Number matches in call order ("match #12" on the card, and the queue's
+// sort key). Elimination interleaves winners and losers rounds the way
+// they are actually played; everything else is (round, group, slot). Byes
+// never get a number — nobody plays them.
+fn number_matches(ms, format, k, base) {
+  let order = [];
+  if format == "double" || (format == "groups" && k == 0) {
+    // k == 0 flags a finals build; the caller passes the real depth via
+    // rounds on the ms entries, so recompute it
+    k = 0;
+    for mid, m in ms {
+      if m.bracket == "w" && m.round > k {
+        k = m.round;
+      }
+    }
+    push(order, ["w", 1]);
+    if k > 1 {
+      push(order, ["l", 1]);
+    }
+    let r = 2;
+    while r <= k {
+      push(order, ["w", r]);
+      push(order, ["l", 2 * r - 2]);
+      push(order, ["l", 2 * r - 1]);
+      r = r + 1;
+    }
+    push(order, ["gf", 1]);
+  } else {
+    let maxr = 0;
+    for mid, m in ms {
+      if m.round > maxr {
+        maxr = m.round;
+      }
+    }
+    let r = 1;
+    while r <= maxr {
+      push(order, ["*", r]);
+      r = r + 1;
+    }
+  }
+  let n = base;
+  for _, br in order {
+    let batch = [];
+    for mid, m in ms {
+      if m.round == br[1] && (br[0] == "*" || m.bracket == br[0])
+         && m.p1 != "__bye" && m.p2 != "__bye" {
+        push(batch, { mid = mid, g = m.grp || 0, slot = m.slot });
+      }
+    }
+    sort_by(batch, [:g, :slot]);
+    for _, b in batch {
+      let mm = ms[b.mid];
+      mm.num = n + 1;
+      n = n + 1;
+    }
+  }
+}
+
+// ── swiss: pair the next round from standings ───────────────────────────
+
+// All of the current round decided → sort by (points, buchholz, seed),
+// pair top-down avoiding rematches (allowing one as a last resort), give
+// an odd field's bye to the lowest-standing player who has not had one.
+fn swiss_next_round(tid) {
+  let format = store(["tournaments", tid, "format"]);
+  let status = store(["tournaments", tid, "status"]);
+  let round = store(["tournaments", tid, "round"]);
+  let rounds = store(["tournaments", tid, "rounds"]);
+  if format != "swiss" || status != "live" || !round || round >= rounds {
+    return;
+  }
+  if !all_decided(tid, {}) {
+    return;
+  }
+  let players = roster(tid);
+  let items = match_items(store(["tournaments", tid, "matches"]));
+  let rows = swiss_rows(players, items);
+  let n = len(rows);
+  if n < 2 {
+    return;
+  }
+  let used = {};
+  let bye = nil;
+  if n % 2 == 1 {
+    let j = n - 1;
+    while j >= 0 {
+      if !bye && !rows[j].had_bye {
+        bye = rows[j].name;
+      }
+      j = j - 1;
+    }
+    if !bye {
+      bye = rows[n - 1].name;
+    }
+    used[bye] = true;
+  }
+  let pairs = [];
+  for ai, a in rows {
+    if !used[a.name] {
+      used[a.name] = true;
+      let opp = nil;
+      let j = ai + 1;
+      while j < n {
+        let b = rows[j];
+        if !opp && !used[b.name] && !a.opps[b.name] {
+          opp = b.name;
+        }
+        j = j + 1;
+      }
+      j = ai + 1;
+      while j < n {
+        let b = rows[j];
+        if !opp && !used[b.name] {
+          opp = b.name;
+        }
+        j = j + 1;
+      }
+      if opp {
+        used[opp] = true;
+        push(pairs, [a.name, opp]);
+      }
+    }
+  }
+  let r = round + 1;
+  let num = max_num(items);
+  for s, pr in pairs {
+    store(["tournaments", tid, "matches", "r" .. r .. "m" .. (s + 1), store.set(
+      { round = r, slot = s + 1, bracket = "sw", p1 = pr[0], p2 = pr[1], num = num + s + 1 })]);
+  }
+  if bye {
+    store(["tournaments", tid, "matches", "r" .. r .. "m" .. (len(pairs) + 1), store.set(
+      { round = r, slot = len(pairs) + 1, bracket = "sw", p1 = bye, p2 = "__bye", winner = bye })]);
+  }
+  store(["tournaments", tid, "round", store.set(r)]);
+}
+
+// Points (wins and byes), buchholz (sum of opponents' points), and who
+// has already met whom — from the matches, for both pairing and display.
+// Dropped players keep their record but stop being paired.
+fn swiss_rows(players, items) {
+  let pts = {};
+  let opps = {};
+  let had_bye = {};
+  let seed = {};
+  let outs = {};
+  if players {
+    for i, p in players {
+      pts[p.name] = 0;
+      opps[p.name] = {};
+      seed[p.name] = i;
+      if p.st == "out" {
+        outs[p.name] = true;
+      }
+    }
+  }
+  for _, m in items {
+    if m.p2 == "__bye" {
+      if m.winner && pts[m.winner] != nil {
+        pts[m.winner] = pts[m.winner] + 1;
+      }
+      had_bye[m.p1] = true;
+    } else if m.p1 && m.p2 && m.p1 != "__bye" {
+      if opps[m.p1] != nil {
+        opps[m.p1][m.p2] = true;
+      }
+      if opps[m.p2] != nil {
+        opps[m.p2][m.p1] = true;
+      }
+      if m.winner && pts[m.winner] != nil {
+        pts[m.winner] = pts[m.winner] + 1;
+      }
+    }
+  }
+  let rows = [];
+  if players {
+    for i, p in players {
+      if p.st != "out" {
+        let buch = 0;
+        for o, _t in opps[p.name] {
+          if pts[o] != nil {
+            buch = buch + pts[o];
+          }
+        }
+        push(rows, {
+          name = p.name, pts = pts[p.name], buch = buch, seed = i,
+          opps = opps[p.name], had_bye = had_bye[p.name] == true,
+          k1 = 0 - pts[p.name], k2 = 0 - buch
+        });
+      }
+    }
+  }
+  sort_by(rows, [:k1, :k2, :seed]);
+  return rows;
+}
+
+// ── groups: standings seed the finals ────────────────────────────────────
+
+// Every pool decided → take the top `advance` of each (winners first,
+// then runners-up, …) and build the elimination stage from them.
+fn start_finals(tid) {
+  let format = store(["tournaments", tid, "format"]);
+  let stage = store(["tournaments", tid, "stage"]);
+  let status = store(["tournaments", tid, "status"]);
+  if format != "groups" || stage != "groups" || status != "live" {
+    return;
+  }
+  if !all_decided(tid, {}) {
+    return;
+  }
+  let players = roster(tid);
+  let items = match_items(store(["tournaments", tid, "matches"]));
+  let settings = store(["tournaments", tid, "settings"]);
+  let advance = settings.advance || 2;
+  let tables = group_tables(players, items);
+  let seeds = [];
+  for _, place in range(0, advance) {
+    for _, tbl in tables {
+      if place < len(tbl.rows) {
+        let row = tbl.rows[place];
+        if row.st != "out" {
+          push(seeds, row.name);
+        }
+      }
+    }
+  }
+  if len(seeds) < 2 {
+    return;
+  }
+  let built = nil;
+  if settings.final_format == "double" {
+    built = build_double(seeds);
+  } else {
+    built = build_single(seeds, settings.third == true);
+  }
+  let fmt = "single";
+  if settings.final_format == "double" {
+    fmt = "double";
+  }
+  number_matches(built.ms, fmt, built.rounds, max_num(items));
+  store(["tournaments", tid, "stage", store.set("finals")]);
+  store(["tournaments", tid, "rounds", store.set(built.rounds)]);
+  for mid, m in built.ms {
+    store(["tournaments", tid, "matches", mid, store.set(m)]);
+  }
+}
+
+// Per-group standings: wins desc, head-to-head between exactly two tied,
+// then seed. Rows carry st so no-shows render greyed.
+fn group_tables(players, items) {
+  let seed = {};
+  let sts = {};
+  if players {
+    for i, p in players {
+      seed[p.name] = i;
+      sts[p.name] = p.st;
+    }
+  }
+  let pools = {};
+  for _, m in items {
+    if m.grp {
+      if !pools[m.grp] {
+        pools[m.grp] = [];
+      }
+      push(pools[m.grp], m);
+    }
+  }
+  let tables = [];
+  for k, ms in pools {
+    let names = {};
+    for _, m in ms {
+      names[m.p1] = true;
+      names[m.p2] = true;
+    }
+    let rows = rr_rows(names, ms, seed, sts);
+    push(tables, { grp = k, rows = rows });
+  }
+  return tables;
+}
+
+// Round-robin table rows over a set of matches. `names` is a map of
+// participants; seed and st maps come from the player list.
+fn rr_rows(names, ms, seed, sts) {
+  let wins = {};
+  let losses = {};
+  for nm, _t in names {
+    wins[nm] = 0;
+    losses[nm] = 0;
+  }
+  for _, m in ms {
+    if m.winner && m.winner != "__bye" {
+      let loser = m.p1;
+      if m.winner == m.p1 {
+        loser = m.p2;
+      }
+      if wins[m.winner] != nil {
+        wins[m.winner] = wins[m.winner] + 1;
+      }
+      if losses[loser] != nil {
+        losses[loser] = losses[loser] + 1;
+      }
+    }
+  }
+  let rows = [];
+  for nm, _t in names {
+    push(rows, {
+      name = nm, w = wins[nm], l = losses[nm],
+      seed = seed[nm] || 0, st = sts[nm] || "active",
+      k1 = 0 - wins[nm], k2 = losses[nm]
+    });
+  }
+  sort_by(rows, [:k1, :k2, :seed]);
+  h2h_fix(rows, ms);
+  return rows;
+}
+
+// Exactly two players tied on wins, and one beat the other: the winner
+// goes first. Bigger knots stay on (wins, losses, seed).
+fn h2h_fix(rows, ms) {
+  let n = len(rows);
+  for _, i in range(0, n) {
+    if i + 1 < n {
+      let a = rows[i];
+      let b = rows[i + 1];
+      let same = a.w == b.w && a.l == b.l;
+      let two = same;
+      if i > 0 && rows[i - 1].w == a.w && rows[i - 1].l == a.l {
+        two = false;
+      }
+      if i + 2 < n && rows[i + 2].w == b.w && rows[i + 2].l == b.l {
+        two = false;
+      }
+      if two {
+        for _, m in ms {
+          if m.winner == b.name && (m.p1 == a.name || m.p2 == a.name) {
+            rows[i] = b;
+            rows[i + 1] = a;
+          }
+        }
+      }
+    }
+  }
 }
 
 // ── report: one generic walk along the links ────────────────────────────
@@ -299,40 +926,72 @@ fn report_result(event) {
     return;
   }
   store(["tournaments", tid, "matches", mid, "winner", store.set(event.winner)]);
-  if event.s1 {
+  if event.s1 != nil {
     store(["tournaments", tid, "matches", mid, "s1", store.set(event.s1)]);
   }
-  if event.s2 {
+  if event.s2 != nil {
     store(["tournaments", tid, "matches", mid, "s2", store.set(event.s2)]);
   }
   let loser = m.p2;
   if event.winner == m.p2 {
     loser = m.p1;
   }
+  after_decide(tid, mid, m, event.winner, loser, nil);
+}
+
+// What a decision means — shared by report and forfeit. `gone1` is the
+// player this same event marked out (their st write is not committed
+// yet, so the walk carries it by hand).
+fn after_decide(tid, mid, m, winner, loser, gone1) {
+  let format = store(["tournaments", tid, "format"]);
   if m.bracket == "rr" {
-    rr_check_done(tid, mid, event.winner);
-    return;
+    if format == "robin" {
+      let d = {};
+      d[mid] = true;
+      if all_decided(tid, d) {
+        store(["tournaments", tid, "status", store.set("review")]);
+      }
+    }
+    return;                                  // group pools: readiness is derived
   }
-  if mid == "gf1" {
-    if event.winner == m.p1 {
-      crown(tid, event.winner);          // the WB champion stays undefeated
-    } else {
-      // first loss for the WB champion: reset — one match for everything
-      store(["tournaments", tid, "matches", "gf2", store.set(
-        { round = 2, slot = 1, bracket = "gf", p1 = m.p1, p2 = m.p2, w_to = "champion" })]);
+  if m.bracket == "sw" {
+    let round = store(["tournaments", tid, "round"]);
+    let rounds = store(["tournaments", tid, "rounds"]);
+    let d = {};
+    d[mid] = true;
+    if round == rounds && all_decided(tid, d) {
+      store(["tournaments", tid, "status", store.set("review")]);
     }
     return;
   }
-  place(tid, m.w_to, event.winner);
+  if mid == "gf1" {
+    if winner == m.p1 {
+      crown(tid, winner);                    // the WB champion stays undefeated
+    } else if gone1 && loser == gone1 {
+      crown(tid, winner);                    // no reset against a forfeit
+    } else {
+      // first loss for the WB champion: reset — one match for everything
+      let num = store(["tournaments", tid, "matches", "gf1", "num"]);
+      store(["tournaments", tid, "matches", "gf2", store.set(
+        { round = 2, slot = 1, bracket = "gf", p1 = m.p1, p2 = m.p2,
+          w_to = "champion", num = num + 1 })]);
+    }
+    return;
+  }
+  place(tid, m.w_to, winner, gone1);
   if m.l_to {
-    place(tid, m.l_to, loser);
+    place(tid, m.l_to, loser, gone1);
   }
 }
 
-// Put `player` where a link points. If that fills a match against a bye,
-// the auto-win continues the walk. The other side is read from committed
-// state; the winner and loser walks of one report never share a match.
-fn place(tid, to, player) {
+// Put `player` where a link points. If that fills a match against a bye
+// — or against (or with) a player who is out — the auto-result continues
+// the walk. The other side is read from committed state; the winner and
+// loser walks of one report never share a match.
+fn place(tid, to, player, gone1) {
+  if !to {
+    return;                                  // 3p and gf have no onward link
+  }
   if to == "champion" {
     crown(tid, player);
     return;
@@ -345,21 +1004,56 @@ fn place(tid, to, player) {
     return;
   }
   let w = nil;
+  let ff = false;
   if player == "__bye" && other == "__bye" {
     w = "__bye";
   } else if other == "__bye" {
     w = player;
   } else if player == "__bye" {
     w = other;
+  } else {
+    let pg = is_gone(tid, player, gone1);
+    let og = is_gone(tid, other, gone1);
+    if pg && og {
+      w = other;
+      ff = true;
+    } else if og {
+      w = player;
+      ff = true;
+    } else if pg {
+      w = other;
+      ff = true;
+    }
   }
   if w {
     store(["tournaments", tid, "matches", mid, "winner", store.set(w)]);
+    if ff {
+      store(["tournaments", tid, "matches", mid, "ff", store.set(true)]);
+    }
+    let l = "__bye";
+    if ff {
+      l = player;
+      if w == player {
+        l = other;
+      }
+    }
     let m = store(["tournaments", tid, "matches", mid]);
-    place(tid, m.w_to, w);
+    if mid == "gf1" {
+      crown(tid, w);                         // an auto-decided gf allows no reset
+      return;
+    }
+    place(tid, m.w_to, w, gone1);
     if m.l_to {
-      place(tid, m.l_to, "__bye");
+      place(tid, m.l_to, l, gone1);
     }
   }
+}
+
+fn is_gone(tid, name, gone1) {
+  if name == gone1 {
+    return true;
+  }
+  return store(["tournaments", tid, "players", name, "st"]) == "out";
 }
 
 fn crown(tid, player) {
@@ -367,45 +1061,61 @@ fn crown(tid, player) {
   store(["tournaments", tid, "status", store.set("done")]);
 }
 
-// All round-robin matches reported → standings decide the champion
-// (unique win-count max; a tie finishes the tournament without one).
-fn rr_check_done(tid, mid, winner) {
+// Every match decided (winner set), overlooking `decided` — the mids this
+// same event resolved, whose writes are not yet visible.
+fn all_decided(tid, decided) {
   let ms = store(["tournaments", tid, "matches"]);
-  let total = 0;
-  let done = 0;
-  let wins = {};
-  for mid2, m2 in ms {
-    total = total + 1;
-    let w = m2.winner;
-    if mid2 == mid {
-      w = winner;                            // this event's write, not yet visible
-    }
-    if w {
-      done = done + 1;
-      if !wins[w] {
-        wins[w] = 0;
-      }
-      wins[w] = wins[w] + 1;
+  let all = true;
+  for mid, m in ms {
+    if !m.winner && !decided[mid] {
+      all = false;
     }
   }
-  if done < total {
+  return all;
+}
+
+// ── forfeit: one player out, their open matches auto-decided ────────────
+
+// Marks the player out, hands every currently-open match they occupy to
+// the opponent, and lets the place-walks wash them out of any match they
+// would have reached later (is_gone above).
+fn forfeit_player(tid, name) {
+  let status = store(["tournaments", tid, "status"]);
+  if status != "live" && status != "review" {
     return;
   }
-  let best = nil;
-  let bestw = -1;
-  let tie = false;
-  for p, w in wins {
-    if w > bestw {
-      best = p;
-      bestw = w;
-      tie = false;
-    } else if w == bestw {
-      tie = true;
+  let p = store(["tournaments", tid, "players", name]);
+  if !p || p.st == "out" {
+    return;
+  }
+  store(["tournaments", tid, "players", name, "st", store.set("out")]);
+  let ms = store(["tournaments", tid, "matches"]);
+  let decided = {};
+  for mid, m in ms {
+    if !m.winner && m.p1 && m.p2 && m.p1 != "__bye" && m.p2 != "__bye"
+       && (m.p1 == name || m.p2 == name) {
+      let other = m.p1;
+      if m.p1 == name {
+        other = m.p2;
+      }
+      store(["tournaments", tid, "matches", mid, "winner", store.set(other)]);
+      store(["tournaments", tid, "matches", mid, "ff", store.set(true)]);
+      decided[mid] = true;
+      if m.bracket == "w" || m.bracket == "l" || m.bracket == "gf" || m.bracket == "3p" {
+        after_decide(tid, mid, m, other, name, name);
+      }
     }
   }
-  store(["tournaments", tid, "status", store.set("done")]);
-  if !tie {
-    store(["tournaments", tid, "champion", store.set(best)]);
+  let format = store(["tournaments", tid, "format"]);
+  if format == "robin" && all_decided(tid, decided) {
+    store(["tournaments", tid, "status", store.set("review")]);
+  }
+  if format == "swiss" {
+    let round = store(["tournaments", tid, "round"]);
+    let rounds = store(["tournaments", tid, "rounds"]);
+    if round == rounds && all_decided(tid, decided) {
+      store(["tournaments", tid, "status", store.set("review")]);
+    }
   }
 }
 
@@ -416,25 +1126,56 @@ fn unreport_match(tid, mid) {
   if !m || !m.winner {
     return;
   }
-  if m.p1 == "__bye" || m.p2 == "__bye" {
-    return;                                  // bye results are structural
+  if m.p1 == "__bye" || m.p2 == "__bye" || m.ff {
+    return;                                  // bye and forfeit results are structural
+  }
+  if m.bracket == "sw" {
+    // only the round being played reopens — earlier rounds seeded later ones
+    if m.round != store(["tournaments", tid, "round"]) {
+      return;
+    }
+    clear_result(tid, mid);
+    reopen_status(tid);
+    return;
+  }
+  if m.bracket == "rr" {
+    if m.grp && store(["tournaments", tid, "stage"]) == "finals" {
+      return;                                // the pool stage is sealed
+    }
+    clear_result(tid, mid);
+    if !m.grp {
+      store(["tournaments", tid, "champion", store.del]);
+      reopen_status(tid);
+    }
+    return;
   }
   retract_result(tid, mid);
 }
 
-// Clear a decided match, first pulling its winner (and loser) back out of
-// every downstream match — recursively, so a reopened semifinal also
-// reopens the final it fed.
+fn clear_result(tid, mid) {
+  store(["tournaments", tid, "matches", mid, "winner", store.del]);
+  store(["tournaments", tid, "matches", mid, "s1", store.del]);
+  store(["tournaments", tid, "matches", mid, "s2", store.del]);
+  store(["tournaments", tid, "matches", mid, "ff", store.del]);
+}
+
+fn reopen_status(tid) {
+  let st = store(["tournaments", tid, "status"]);
+  if st == "review" || st == "done" {
+    store(["tournaments", tid, "status", store.set("live")]);
+  }
+}
+
+// Clear a decided elimination match, first pulling its winner (and loser)
+// back out of every downstream match — recursively, so a reopened
+// semifinal also reopens the final it fed.
 fn retract_result(tid, mid) {
   let m = store(["tournaments", tid, "matches", mid]);
   let loser = m.p2;
   if m.winner == m.p2 {
     loser = m.p1;
   }
-  if m.bracket == "rr" {
-    store(["tournaments", tid, "status", store.set("live")]);
-    store(["tournaments", tid, "champion", store.del]);
-  } else if mid == "gf1" {
+  if mid == "gf1" {
     if store(["tournaments", tid, "matches", "gf2", "round"]) {
       uncrown_if(tid, store(["tournaments", tid, "matches", "gf2", "winner"]));
       store(["tournaments", tid, "matches", "gf2", store.del]);
@@ -447,12 +1188,13 @@ fn retract_result(tid, mid) {
       retract_from(tid, m.l_to, loser);
     }
   }
-  store(["tournaments", tid, "matches", mid, "winner", store.del]);
-  store(["tournaments", tid, "matches", mid, "s1", store.del]);
-  store(["tournaments", tid, "matches", mid, "s2", store.del]);
+  clear_result(tid, mid);
 }
 
 fn retract_from(tid, to, player) {
+  if !to {
+    return;
+  }
   if to == "champion" {
     uncrown(tid);
     return;
@@ -475,6 +1217,71 @@ fn uncrown_if(tid, had_winner) {
   } else {
     store(["tournaments", tid, "status", store.set("live")]);
   }
+}
+
+// ── finalize and reset ──────────────────────────────────────────────────
+
+// Robin and swiss end by decree: awaiting-review → done, the top of the
+// tiebroken standings takes the crown. (Elimination crowns itself.)
+fn finalize_t(tid) {
+  let format = store(["tournaments", tid, "format"]);
+  let status = store(["tournaments", tid, "status"]);
+  if status != "review" || (format != "robin" && format != "swiss") {
+    return;
+  }
+  let players = roster(tid);
+  let items = match_items(store(["tournaments", tid, "matches"]));
+  let champ = nil;
+  if format == "swiss" {
+    let rows = swiss_rows(players, items);
+    if len(rows) > 0 {
+      champ = rows[0].name;
+    }
+  } else {
+    let names = {};
+    let seed = {};
+    let sts = {};
+    if players {
+      for i, p in players {
+        names[p.name] = true;
+        seed[p.name] = i;
+        sts[p.name] = p.st;
+      }
+    }
+    let rows = rr_rows(names, items, seed, sts);
+    if len(rows) > 0 {
+      champ = rows[0].name;
+    }
+  }
+  if champ {
+    store(["tournaments", tid, "champion", store.set(champ)]);
+  }
+  store(["tournaments", tid, "status", store.set("done")]);
+}
+
+// Back to signup: the bracket, crown, and no-show marks dissolve; the
+// entrants (and their check-in state) survive.
+fn reset_t(tid) {
+  let status = store(["tournaments", tid, "status"]);
+  if status != "live" && status != "review" && status != "done" {
+    return;
+  }
+  let mids = store(["tournaments", tid, "matches", store.keys]);
+  if mids {
+    for _, mid in mids {
+      store(["tournaments", tid, "matches", mid, store.del]);
+    }
+  }
+  store(["tournaments", tid, "champion", store.del]);
+  store(["tournaments", tid, "rounds", store.del]);
+  store(["tournaments", tid, "round", store.del]);
+  store(["tournaments", tid, "stage", store.del]);
+  for _, p in roster(tid) {
+    if p.st == "out" {
+      store(["tournaments", tid, "players", p.name, "st", store.set("active")]);
+    }
+  }
+  store(["tournaments", tid, "status", store.set("signup")]);
 }
 
 // ── shared arithmetic ───────────────────────────────────────────────────
@@ -541,23 +1348,58 @@ fn range_into(out, a, b) {
   range_into(out, a + 1, b);
 }
 
+// matches map → array of records with the key as `id`
+fn match_items(ms) {
+  let out = [];
+  for mid, m in ms {
+    m.id = mid;
+    push(out, m);
+  }
+  return out;
+}
+
+fn max_num(items) {
+  let n = 0;
+  for _, m in items {
+    if m.num && m.num > n {
+      n = m.num;
+    }
+  }
+  return n;
+}
+
+fn ordinal(n) {
+  let r = n % 10;
+  let h = n % 100;
+  if r == 1 && h != 11 {
+    return n .. "st";
+  }
+  if r == 2 && h != 12 {
+    return n .. "nd";
+  }
+  if r == 3 && h != 13 {
+    return n .. "rd";
+  }
+  return n .. "th";
+}
+
 // ── server-side snapshots ───────────────────────────────────────────────
 
 fn snapshot(tid) {
-  if tid {
+  if tid != nil && tid != "lobby" {
     let t = load_t(tid);
     if t {
       return { t = t };
     }
   }
-  // the lobby needs names and counts, not whole brackets: select the map
-  // keys, then point-read exactly what the list shows
+  // the lobby needs names and counts, not whole brackets
   let ids = store(["tournaments", store.keys]);
   let list = [];
   for _, id in ids {
     push(list, {
       id = id,
       name = store(["tournaments", id, "name"]),
+      game = store(["tournaments", id, "game"]),
       format = store(["tournaments", id, "format"]),
       status = store(["tournaments", id, "status"]),
       entrants = len(store(["tournaments", id, "players"]))
@@ -573,54 +1415,140 @@ fn load_t(tid) {
   }
   let ms = store.items(["tournaments", tid, "matches"]);
   sort_by(ms, [:round, :slot]);
-  return {
+  let players = roster(tid);
+  let t = {
     id = tid,
     name = name,
+    desc = store(["tournaments", tid, "desc"]),
+    game = store(["tournaments", tid, "game"]),
     format = store(["tournaments", tid, "format"]),
     status = store(["tournaments", tid, "status"]),
-    players = store(["tournaments", tid, "players"]),
+    stage = store(["tournaments", tid, "stage"]),
+    settings = store(["tournaments", tid, "settings"]),
+    players = players,
     rounds = store(["tournaments", tid, "rounds"]),
+    round = store(["tournaments", tid, "round"]),
     matches = ms,
     champion = store(["tournaments", tid, "champion"])
   };
+  t.queue = open_queue(ms);
+  return t;
+}
+
+// The call sheet: open matches (both sides real), in number order.
+fn open_queue(items) {
+  let q = [];
+  for _, m in items {
+    if !m.winner && m.p1 && m.p2 && m.p1 != "__bye" && m.p2 != "__bye" {
+      push(q, m);
+    }
+  }
+  sort_by(q, [:num]);
+  return q;
+}
+
+// Final placements. Elimination ranks by exit point (champion, then the
+// grand-final loser, then bracket depth); tables rank by their tiebroken
+// standings. Ties share a place — "3rd–4th".
+fn placements(t) {
+  if t.format == "robin" || (t.format == "groups" && t.stage != "finals") {
+    let names = {};
+    let seed = {};
+    let sts = {};
+    if t.players {
+      for i, p in t.players {
+        names[p.name] = true;
+        seed[p.name] = i;
+        sts[p.name] = p.st;
+      }
+    }
+    let rows = rr_rows(names, t.matches, seed, sts);
+    return share_places(rows);
+  }
+  if t.format == "swiss" {
+    let rows = swiss_rows(t.players, t.matches);
+    return share_places(rows);
+  }
+  // elimination (single, double, groups finals)
+  let out = [];
+  if t.players {
+    for _, p in t.players {
+      let k = exit_key(t, p.name);
+      push(out, { name = p.name, st = p.st, k1 = 0 - k, k2 = 0 });
+    }
+  }
+  sort_by(out, [:k1]);
+  return share_places(out);
+}
+
+fn exit_key(t, name) {
+  if t.champion == name {
+    return 1000000;
+  }
+  let best = 0;
+  for _, m in t.matches {
+    if m.winner && m.p1 && m.p2 && m.p1 != "__bye" && m.p2 != "__bye"
+       && (m.p1 == name || m.p2 == name) {
+      let k = nil;
+      if m.winner == name {
+        if m.bracket == "3p" {
+          k = 10 * t.rounds - 2;
+        }
+      } else if m.bracket == "3p" {
+        k = 10 * t.rounds - 4;
+      } else if m.bracket == "gf" {
+        k = 100000;
+      } else if m.bracket == "l" {
+        k = 1000 + 10 * m.round;
+      } else if m.bracket == "w" && t.format != "double"
+             && !(t.format == "groups" && t.settings.final_format == "double") {
+        k = 10 * m.round;
+      }
+      if k && k > best {
+        best = k;
+      }
+    }
+  }
+  return best;
+}
+
+// rows sorted best-first, sharing a place on equal (k1, k2)
+fn share_places(rows) {
+  let out = [];
+  let place = 0;
+  let prev = nil;
+  for i, r in rows {
+    if !prev || r.k1 != prev.k1 || r.k2 != prev.k2 {
+      place = i + 1;
+    }
+    r.place = place;
+    prev = r;
+    push(out, r);
+  }
+  return out;
 }
 
 // ── views ───────────────────────────────────────────────────────────────
 
-fn render(snap) {
+fn app_view(snap, adm, me) {
+  let body = nil;
   if snap.t {
-    hui.render("#app", t_view(snap.t));
+    body = t_view(snap.t, adm);
   } else {
-    hui.render("#app", lobby_view(snap.list));
-  }
-}
-
-fn lobby_view(list) {
-  let rows = [];
-  if list {
-    for _, t in list {
-      let tid = t.id;
-      push(rows, [:li, { id = "t-" .. tid },
-        [:span, { class = "clickable", style = "cursor:pointer", onclick = fn(e) { open_t(tid); } }, t.name],
-        [:span, { class = "meta" },
-          "  " .. fmt_name(t.format) .. " · " .. t.status .. " · " .. t.entrants .. " entrants  "],
-        [:button, { class = "pair meta", style = "font-size:0.75rem", onclick = fn(e) { delete_t(tid); } }, "✕"]
-      ]);
-    }
+    body = lobby_view(snap.list, adm);
   }
   return [:div, {},
-    [:h1, {}, "tournaments"],
-    [:div, { class = "row" },
-      [:input, { id = "t-name", placeholder = "new tournament" }],
-      [:select, { id = "t-format" },
-        [:option, { value = "single" }, "single elimination"],
-        [:option, { value = "double" }, "double elimination"],
-        [:option, { value = "robin" }, "round robin"]
-      ],
-      [:button, { id = "create", onclick = fn(e) { create_t(); } }, "create"]
-    ],
-    [:ul, { id = "t-list" }, rows]
+    [:div, { class = "tn-id meta" }, login_view(me)],
+    body
   ];
+}
+
+fn login_view(me) {
+  if me && me != "" {
+    return [[:span, {}, "signed in as " .. me .. "  "],
+            [:a, { href = "/auth/logout" }, "sign out"]];
+  }
+  return [:a, { href = "/auth/discord" }, "sign in with discord"];
 }
 
 fn fmt_name(format) {
@@ -630,97 +1558,532 @@ fn fmt_name(format) {
   if format == "robin" {
     return "round robin";
   }
+  if format == "swiss" {
+    return "swiss";
+  }
+  if format == "groups" {
+    return "groups → finals";
+  }
   return "single elim";
 }
 
-fn t_view(t) {
-  let body = [];
-  if t.status == "signup" {
-    body = signup_view(t);
-  } else if t.format == "robin" {
-    body = rr_view(t);
+fn lobby_view(list, adm) {
+  let rows = [];
+  if list {
+    for _, t in list {
+      let tid = t.id;
+      let game = "";
+      if t.game && t.game != "" {
+        game = t.game .. " · ";
+      }
+      let del = nil;
+      if adm {
+        del = [:button, { class = "pair meta", style = "font-size:0.75rem",
+                          onclick = fn(e) { delete_t(tid); } }, "✕"];
+      }
+      push(rows, [:li, { id = "t-" .. tid },
+        [:span, { class = "clickable", style = "cursor:pointer", onclick = fn(e) { open_t(tid); } }, t.name],
+        [:span, { class = "meta" },
+          "  " .. game .. fmt_name(t.format) .. " · " .. t.status .. " · " .. t.entrants .. " entrants  "],
+        del
+      ]);
+    }
+  }
+  let create = nil;
+  if adm {
+    create = [:div, { class = "row" },
+      [:input, { id = "t-name", placeholder = "new tournament" }],
+      [:select, { id = "t-format" },
+        [:option, { value = "single" }, "single elimination"],
+        [:option, { value = "double" }, "double elimination"],
+        [:option, { value = "robin" }, "round robin"],
+        [:option, { value = "swiss" }, "swiss"],
+        [:option, { value = "groups" }, "groups → finals"]
+      ],
+      [:button, { id = "create", onclick = fn(e) { create_t(); } }, "create"]
+    ];
+  }
+  return [:div, {},
+    [:h1, {}, "tournaments"],
+    create,
+    [:ul, { id = "t-list" }, rows]
+  ];
+}
+
+fn t_view(t, adm) {
+  let body = nil;
+  if t.status == "signup" || t.status == "checkin" {
+    body = setup_view(t, adm);
   } else {
-    body = bracket_view(t);
+    body = play_view(t, adm);
+  }
+  let sub = fmt_name(t.format) .. " · " .. t.status;
+  if t.game && t.game != "" {
+    sub = t.game .. " · " .. sub;
+  }
+  let desc = nil;
+  if t.desc && t.desc != "" {
+    desc = [:div, { class = "meta", id = "t-desc" }, t.desc];
   }
   return [:div, {},
     [:div, { class = "row" },
       [:button, { id = "back", onclick = fn(e) { go_lobby(); } }, "lobby"],
       [:h1, {}, t.name],
-      [:span, { class = "meta", id = "t-status" }, fmt_name(t.format) .. " · " .. t.status]
+      [:span, { class = "meta", id = "t-status" }, sub]
     ],
-    [:input, { id = "current-tid", type = "hidden", value = t.id }],
+    desc,
     body
   ];
 }
 
-// signup: the list order *is* the seeding — ↑ promotes, ✕ removes
-fn signup_view(t) {
+// ── setup: settings, entrants, check-in ─────────────────────────────────
+
+fn setup_view(t, adm) {
+  let parts = [];
+  if adm {
+    push(parts, settings_view(t));
+  }
+  push(parts, entrants_view(t, adm));
+  if adm {
+    push(parts, setup_actions(t));
+  }
+  return [:div, {}, parts];
+}
+
+fn settings_view(t) {
+  let tid = t.id;
+  let s = t.settings;
+  let fmt_opts = [];
+  if t.format == "single" || (t.format == "groups" && s.final_format == "single") {
+    let label = "third-place match: off";
+    if s.third == true {
+      label = "third-place match: on";
+    }
+    let want = !(s.third == true);
+    push(fmt_opts, [:button, { id = "cfg-third", class = "pair meta",
+      onclick = fn(e) { cfg_set(tid, "third", want); } }, label]);
+  }
+  if t.format == "swiss" {
+    push(fmt_opts, [:span, { class = "meta" }, "rounds "]);
+    push(fmt_opts, [:input, { id = "cfg-swiss-rounds", style = "max-width:4em;flex:0 1 auto",
+      value = s.swiss_rounds || "",
+      placeholder = "auto",
+      onchange = fn(e) { cfg_num(tid, "swiss_rounds", "#cfg-swiss-rounds"); } }]);
+  }
+  if t.format == "groups" {
+    push(fmt_opts, [:span, { class = "meta" }, "group size "]);
+    push(fmt_opts, [:input, { id = "cfg-group-size", style = "max-width:4em;flex:0 1 auto",
+      value = s.group_size || 4,
+      onchange = fn(e) { cfg_num(tid, "group_size", "#cfg-group-size"); } }]);
+    push(fmt_opts, [:span, { class = "meta" }, "advance "]);
+    push(fmt_opts, [:input, { id = "cfg-advance", style = "max-width:4em;flex:0 1 auto",
+      value = s.advance || 2,
+      onchange = fn(e) { cfg_num(tid, "advance", "#cfg-advance"); } }]);
+    push(fmt_opts, [:span, { class = "meta" }, "finals "]);
+    push(fmt_opts, [:select, { id = "cfg-final-format",
+      onchange = fn(e) { cfg_pick(tid, "final_format", "#cfg-final-format"); } },
+      [:option, { value = "single", selected = s.final_format == "single" }, "single elim"],
+      [:option, { value = "double", selected = s.final_format == "double" }, "double elim"]
+    ]);
+  }
+  return [:div, { class = "card", id = "settings" },
+    [:div, { class = "meta" }, "settings"],
+    [:div, { class = "row" },
+      [:input, { id = "cfg-name", value = t.name, placeholder = "name",
+                 onchange = fn(e) { cfg_pick(tid, "name", "#cfg-name"); } }],
+      [:input, { id = "cfg-game", value = t.game || "", placeholder = "game",
+                 onchange = fn(e) { cfg_pick(tid, "game", "#cfg-game"); } }],
+      [:select, { id = "cfg-format", onchange = fn(e) { cfg_pick(tid, "format", "#cfg-format"); } },
+        [:option, { value = "single", selected = t.format == "single" }, "single elimination"],
+        [:option, { value = "double", selected = t.format == "double" }, "double elimination"],
+        [:option, { value = "robin", selected = t.format == "robin" }, "round robin"],
+        [:option, { value = "swiss", selected = t.format == "swiss" }, "swiss"],
+        [:option, { value = "groups", selected = t.format == "groups" }, "groups → finals"]
+      ]
+    ],
+    [:div, { class = "row" },
+      [:input, { id = "cfg-desc", value = t.desc || "", placeholder = "description",
+                 onchange = fn(e) { cfg_pick(tid, "desc", "#cfg-desc"); } }]
+    ],
+    [:div, { class = "row" }, fmt_opts]
+  ];
+}
+
+// The list order *is* the seeding — ↑ promotes, ✕ removes, the name field
+// renames. During check-in each row grows its toggle.
+fn entrants_view(t, adm) {
   let tid = t.id;
   let rows = [];
   if t.players {
     for i, p in t.players {
       let idx = i;
-      let up = nil;
-      if i > 0 {
-        up = [:button, { class = "pair meta", style = "font-size:0.75rem",
-                         onclick = fn(e) { move_p(tid, idx); } }, "↑"];
+      let bits = [[:span, { class = "meta" }, (i + 1) .. ". "]];
+      if adm {
+        push(bits, [:input, { id = "pn-" .. i, value = p.name, class = "tn-name",
+          onchange = fn(e) { rename_p(tid, idx); },
+          onkeydown = fn(e) { if e.key == "Enter" { rename_p(tid, idx); } } }]);
+      } else {
+        push(bits, [:span, {}, p.name]);
       }
-      push(rows, [:li, { id = "seed-" .. (i + 1) },
-        [:span, { class = "meta" }, (i + 1) .. ". "],
-        [:span, {}, p],
-        [:span, {}, "  "],
-        up,
-        [:button, { class = "pair meta", style = "font-size:0.75rem",
-                    onclick = fn(e) { drop_p(tid, idx); } }, "✕"]
-      ]);
+      if t.status == "checkin" {
+        if p.ci == true {
+          push(bits, [:span, { class = "tn-ci" }, " ✓ in "]);
+        } else {
+          push(bits, [:span, { class = "meta" }, " — "]);
+        }
+        if adm {
+          let want = !(p.ci == true);
+          let label = "check in";
+          if p.ci == true {
+            label = "undo";
+          }
+          push(bits, [:button, { class = "pair meta", style = "font-size:0.75rem",
+            onclick = fn(e) { checkin_p(tid, idx, want); } }, label]);
+        }
+      }
+      if adm {
+        if i > 0 {
+          push(bits, [:button, { class = "pair meta", style = "font-size:0.75rem",
+                                 onclick = fn(e) { move_p(tid, idx); } }, "↑"]);
+        }
+        push(bits, [:button, { class = "pair meta", style = "font-size:0.75rem",
+                               onclick = fn(e) { drop_p(tid, idx); } }, "✕"]);
+      }
+      push(rows, [:li, { id = "seed-" .. (i + 1) }, bits]);
     }
   }
-  return [:div, {},
-    [:div, { class = "row" },
-      [:input, { id = "p-name", placeholder = "player name" }],
-      [:button, { id = "enter", onclick = fn(e) { enter_p(tid); } }, "enter"],
-      [:button, { id = "start", onclick = fn(e) { start_t(tid); } }, "start"]
-    ],
+  let add = nil;
+  if adm {
+    add = [:div, {},
+      [:div, { class = "row" },
+        [:input, { id = "p-name", placeholder = "player name",
+                   onkeydown = fn(e) { if e.key == "Enter" { enter_p(tid); } } }],
+        [:button, { id = "enter", onclick = fn(e) { enter_p(tid); } }, "enter"],
+        [:button, { id = "shuffle", class = "pair", onclick = fn(e) { shuffle_t(tid); } }, "shuffle seeds"]
+      ],
+      [:div, { class = "row" },
+        [:textarea, { id = "bulk", placeholder = "bulk add — one name per line", rows = 3,
+                      style = "flex:1;padding:8px;font-size:0.9rem" }],
+        [:button, { id = "bulk-add", onclick = fn(e) { bulk_add(tid); } }, "add all"]
+      ]
+    ];
+  }
+  return [:div, { class = "card" },
+    [:div, { class = "meta" }, "entrants (list order = seeding)"],
+    add,
     [:ul, { id = "players" }, rows]
   ];
 }
 
-fn bracket_view(t) {
-  let banner = [];
-  if t.champion {
-    banner = [:h2, { id = "champion" }, "champion: " .. t.champion];
+fn setup_actions(t) {
+  let tid = t.id;
+  let bits = [];
+  if t.status == "signup" {
+    push(bits, [:button, { id = "open-checkin", class = "pair",
+      onclick = fn(e) { open_checkin_t(tid); } }, "open check-in"]);
   }
-  let sections = [banner, columns_view(t, "w")];
-  if t.format == "double" {
+  if t.status == "checkin" {
+    push(bits, [:button, { id = "checkin-all", class = "pair",
+      onclick = fn(e) { checkin_all_t(tid); } }, "check in everyone"]);
+  }
+  push(bits, [:button, { id = "start", onclick = fn(e) { start_t(tid); } }, "start"]);
+  return [:div, { class = "row" }, bits];
+}
+
+// ── play: brackets, tables, the queue, review, placements ───────────────
+
+fn play_view(t, adm) {
+  let parts = [];
+  if t.champion {
+    push(parts, [:h2, { id = "champion" }, "champion: " .. t.champion]);
+  }
+  if t.status == "review" && adm {
+    push(parts, [:div, { class = "card tn-review" },
+      [:span, {}, "all results are in — "],
+      [:button, { id = "finalize", onclick = fn(e) { finalize_t_f(t.id); } }, "finalize"]
+    ]);
+  }
+  if t.status == "live" && len(t.queue) > 0 {
+    push(parts, queue_view(t));
+  }
+  if t.format == "robin" {
+    push(parts, standings_view(t));
+    push(parts, rounds_view(t, nil, adm));
+  } else if t.format == "swiss" {
+    push(parts, swiss_controls(t, adm));
+    push(parts, standings_view(t));
+    push(parts, rounds_view(t, nil, adm));
+  } else if t.format == "groups" {
+    push(parts, groups_view(t, adm));
+  } else {
+    push(parts, bracket_view(t, adm));
+  }
+  if t.status == "done" || t.status == "review" {
+    push(parts, placements_view(t));
+  }
+  if adm {
+    if t.status == "live" {
+      push(parts, forfeit_view(t));
+    }
+    push(parts, [:div, { class = "row" },
+      [:button, { id = "reset", class = "pair meta",
+                  onclick = fn(e) { reset_tour(t.id); } }, "reset to signup"]
+    ]);
+  }
+  return [:div, {}, parts];
+}
+
+// The TO's participant panel while live: rename anyone, forfeit anyone
+// still standing.
+fn forfeit_view(t) {
+  let tid = t.id;
+  let rows = [];
+  if t.players {
+    for i, p in t.players {
+      let idx = i;
+      let nm = p.name;
+      let bits = [[:input, { id = "pn-" .. i, value = p.name, class = "tn-name",
+        onchange = fn(e) { rename_p(tid, idx); },
+        onkeydown = fn(e) { if e.key == "Enter" { rename_p(tid, idx); } } }]];
+      if p.st == "out" {
+        push(bits, [:span, { class = "meta" }, "  out"]);
+      } else {
+        push(bits, [:button, { class = "pair meta", style = "font-size:0.75rem",
+          onclick = fn(e) { forfeit_p(tid, nm); } }, "forfeit"]);
+      }
+      push(rows, [:li, { id = "live-p-" .. i, class = "tn-liverow" }, bits]);
+    }
+  }
+  return [:div, { class = "card" },
+    [:div, { class = "meta" }, "participants (rename · forfeit)"],
+    [:ul, { id = "live-players" }, rows]
+  ];
+}
+
+fn queue_view(t) {
+  let bits = [[:span, { class = "meta" }, "up next  "]];
+  for i, m in t.queue {
+    if i < 6 {
+      push(bits, [:span, { class = "tn-quext" },
+        "#" .. m.num .. " " .. m.p1 .. " vs " .. m.p2 .. "   "]);
+    }
+  }
+  return [:div, { class = "card tn-queue", id = "queue" }, bits];
+}
+
+fn swiss_controls(t, adm) {
+  if !adm || t.status != "live" || t.round >= t.rounds {
+    return [:div, { class = "meta" }, "round " .. t.round .. " of " .. t.rounds];
+  }
+  let open = 0;
+  for _, m in t.queue {
+    open = open + 1;
+  }
+  let bits = [[:span, { class = "meta" }, "round " .. t.round .. " of " .. t.rounds .. "  "]];
+  if open == 0 {
+    push(bits, [:button, { id = "next-round", onclick = fn(e) { next_round_t(t.id); } },
+      "pair round " .. (t.round + 1)]);
+  }
+  return [:div, { class = "row" }, bits];
+}
+
+// derived standings table for robin and swiss
+fn standings_view(t) {
+  let rows = [];
+  if t.format == "swiss" {
+    let data = swiss_rows(t.players, t.matches);
+    for i, r in data {
+      push(rows, [:tr, {},
+        [:td, { class = "meta" }, i + 1],
+        [:td, {}, r.name],
+        [:td, {}, r.pts],
+        [:td, { class = "meta" }, r.buch]
+      ]);
+    }
+    return [:div, { class = "card" },
+      [:div, { class = "meta" }, "standings"],
+      [:table, { id = "standings", class = "tn-table" },
+        [:tr, {}, [:th, {}, ""], [:th, {}, "player"], [:th, {}, "pts"], [:th, {}, "buchholz"]],
+        rows
+      ]
+    ];
+  }
+  let names = {};
+  let seed = {};
+  let sts = {};
+  if t.players {
+    for i, p in t.players {
+      names[p.name] = true;
+      seed[p.name] = i;
+      sts[p.name] = p.st;
+    }
+  }
+  let data = rr_rows(names, t.matches, seed, sts);
+  for i, r in data {
+    let cls = "";
+    if r.st == "out" {
+      cls = "tn-out";
+    }
+    push(rows, [:tr, { class = cls },
+      [:td, { class = "meta" }, i + 1],
+      [:td, {}, r.name],
+      [:td, {}, r.w .. "–" .. r.l]
+    ]);
+  }
+  return [:div, { class = "card" },
+    [:div, { class = "meta" }, "standings"],
+    [:table, { id = "standings", class = "tn-table" },
+      [:tr, {}, [:th, {}, ""], [:th, {}, "player"], [:th, {}, "w–l"]],
+      rows
+    ]
+  ];
+}
+
+fn placements_view(t) {
+  let rows = [];
+  let data = placements(t);
+  for _, r in data {
+    let cls = "";
+    if r.st == "out" {
+      cls = "tn-out";
+    }
+    push(rows, [:tr, { class = cls },
+      [:td, { class = "meta" }, ordinal(r.place)],
+      [:td, {}, r.name]
+    ]);
+  }
+  return [:div, { class = "card" },
+    [:div, { class = "meta" }, "final placement"],
+    [:table, { id = "placements", class = "tn-table" }, rows]
+  ];
+}
+
+// round-robin and swiss matches, one column per round
+fn rounds_view(t, grp, adm) {
+  let cols = {};
+  for _, m in t.matches {
+    if (m.bracket == "rr" || m.bracket == "sw") && m.grp == grp
+       && m.p2 != "__bye" && m.p1 != "__bye" {
+      if !cols[m.round] {
+        cols[m.round] = [];
+      }
+      push(cols[m.round], match_view(t, m, adm));
+    }
+  }
+  let colviews = [];
+  for r, col in cols {
+    push(colviews, [:div, { class = "tn-col" },
+      [:div, { class = "meta tn-colhead" }, "round " .. r],
+      col
+    ]);
+  }
+  return [:div, { class = "tn-bracket tn-wide" }, colviews];
+}
+
+fn groups_view(t, adm) {
+  let parts = [];
+  if t.stage == "groups" {
+    if adm && t.status == "live" && len(t.queue) == 0 {
+      push(parts, [:div, { class = "row" },
+        [:button, { id = "start-finals", onclick = fn(e) { start_finals_t(t.id); } },
+          "start finals"]
+      ]);
+    }
+  } else {
+    push(parts, [:h2, { class = "meta" }, "finals"]);
+    push(parts, bracket_view(t, adm));
+    push(parts, [:h2, { class = "meta" }, "group stage"]);
+  }
+  let tables = group_tables(t.players, t.matches);
+  sort_by(tables, [:grp]);
+  for _, tbl in tables {
+    let rows = [];
+    for i, r in tbl.rows {
+      let cls = "";
+      if r.st == "out" {
+        cls = "tn-out";
+      }
+      push(rows, [:tr, { class = cls },
+        [:td, { class = "meta" }, i + 1],
+        [:td, {}, r.name],
+        [:td, {}, r.w .. "–" .. r.l]
+      ]);
+    }
+    push(parts, [:div, { class = "card" },
+      [:div, { class = "meta" }, "group " .. tbl.grp],
+      [:table, { class = "tn-table", id = "group-" .. tbl.grp }, rows]
+    ]);
+    push(parts, rounds_view(t, tbl.grp, adm));
+  }
+  return [:div, {}, parts];
+}
+
+fn bracket_view(t, adm) {
+  let sections = [columns_view(t, "w", adm)];
+  if t.format == "double" || (t.format == "groups" && t.settings.final_format == "double") {
     push(sections, [:h2, { class = "meta" }, "losers bracket"]);
-    push(sections, columns_view(t, "l"));
+    push(sections, columns_view(t, "l", adm));
     push(sections, [:h2, { class = "meta" }, "grand final"]);
-    push(sections, columns_view(t, "gf"));
+    push(sections, columns_view(t, "gf", adm));
+  } else {
+    let has3p = false;
+    for _, m in t.matches {
+      if m.bracket == "3p" {
+        has3p = true;
+      }
+    }
+    if has3p {
+      push(sections, [:h2, { class = "meta" }, "third place"]);
+      push(sections, columns_view(t, "3p", adm));
+    }
   }
   return [:div, { id = "bracket" }, sections];
 }
 
-fn columns_view(t, b) {
+// One bracket as columns of pair-groups; the pair wrapper draws the
+// connector elbow in CSS. The last column (and singleton pairs) draw none.
+fn columns_view(t, b, adm) {
   let cols = {};
+  let maxr = 0;
   for _, m in t.matches {
     if m.bracket == b {
       if !cols[m.round] {
         cols[m.round] = [];
       }
-      push(cols[m.round], match_view(t, m));
+      push(cols[m.round], m);
+      if m.round > maxr {
+        maxr = m.round;
+      }
     }
   }
   let colviews = [];
   for r, col in cols {
-    push(colviews, [:div, {
-      class = "bracket-col",
-      style = "display:flex;flex-direction:column;justify-content:space-around;gap:8px;flex:1"
-    },
-      [:div, { class = "meta" }, col_label(t, b, r)],
-      col
+    let pairs = [];
+    let cur = [];
+    for _, m in col {
+      push(cur, match_view(t, m, adm));
+      if len(cur) == 2 {
+        push(pairs, cur);
+        cur = [];
+      }
+    }
+    if len(cur) == 1 {
+      push(pairs, cur);
+    }
+    let pviews = [];
+    for _, pr in pairs {
+      let cls = "tn-pair";
+      if r == maxr || len(pr) == 1 {
+        cls = "tn-pair tn-solo";
+      }
+      push(pviews, [:div, { class = cls }, pr]);
+    }
+    push(colviews, [:div, { class = "tn-col" },
+      [:div, { class = "meta tn-colhead" }, col_label(t, b, r) ],
+      [:div, { class = "tn-pairs" }, pviews]
     ]);
   }
-  return [:div, { class = "row", style = "align-items:stretch" }, colviews];
+  return [:div, { class = "tn-bracket tn-wide" }, colviews];
 }
 
 fn col_label(t, b, r) {
@@ -730,11 +2093,14 @@ fn col_label(t, b, r) {
     }
     return "grand final";
   }
+  if b == "3p" {
+    return "third place";
+  }
   if b == "l" {
     return "lb round " .. r;
   }
   let prefix = "";
-  if t.format == "double" {
+  if t.format == "double" || (t.format == "groups" && t.settings.final_format == "double") {
     prefix = "wb ";
   }
   let tail = t.rounds - r;
@@ -750,56 +2116,10 @@ fn col_label(t, b, r) {
   return prefix .. "round " .. r;
 }
 
-fn rr_view(t) {
-  let banner = [];
-  if t.champion {
-    banner = [:h2, { id = "champion" }, "champion: " .. t.champion];
-  }
-  return [:div, {},
-    banner,
-    standings_view(t),
-    columns_view(t, "rr")
-  ];
-}
-
-// derived standings: W–L per player, most wins first
-fn standings_view(t) {
-  let stats = {};
-  if t.players {
-    for _, p in t.players {
-      stats[p] = { pl = p, w = 0, l = 0 };
-    }
-  }
-  for _, m in t.matches {
-    if m.winner {
-      let loser = m.p1;
-      if m.winner == m.p1 {
-        loser = m.p2;
-      }
-      stats[m.winner].w = stats[m.winner].w + 1;
-      stats[loser].l = stats[loser].l + 1;
-    }
-  }
-  let tbl = [];
-  for p, st in stats {
-    st.key = 0 - st.w;                       // sort_by is ascending
-    push(tbl, st);
-  }
-  sort_by(tbl, [:key, :l]);
-  let rows = [];
-  for i, st in tbl {
-    push(rows, [:li, {}, st.pl, [:span, { class = "meta" }, "  " .. st.w .. "–" .. st.l]]);
-  }
-  return [:div, { class = "card" },
-    [:div, { class = "meta" }, "standings"],
-    [:ul, { id = "standings" }, rows]
-  ];
-}
-
-fn match_view(t, m) {
+fn match_view(t, m, adm) {
   let open = m.p1 && m.p2 && !m.winner && m.p1 != "__bye" && m.p2 != "__bye";
   let scores = nil;
-  if open {
+  if open && adm {
     scores = [:div, { class = "row", style = "gap:4px;margin:2px 0;flex-wrap:nowrap" },
       [:input, { id = "s1-" .. m.id, placeholder = "0", style = "width:3em;flex:0 1 auto;padding:4px" }],
       [:span, { class = "meta" }, "–"],
@@ -807,28 +2127,33 @@ fn match_view(t, m) {
     ];
   }
   let reopen = nil;
-  if m.winner && m.p1 != "__bye" && m.p2 != "__bye" {
+  if adm && m.winner && m.p1 != "__bye" && m.p2 != "__bye" && !m.ff {
     let tid = t.id;
     let mid = m.id;
     reopen = [:button, { class = "pair meta", style = "float:right;font-size:0.7rem",
-      onclick = fn(e) {
-        server!();
-        store.append({ type = "unreport", tid = tid, mid = mid });
-        cast browsers { refresh(); }
-      } }, "reopen"];
+      onclick = fn(e) { unreport_m(tid, mid); } }, "reopen"];
   }
-  return [:div, { class = "card", id = "match-" .. m.id, style = "padding:8px;min-width:150px" },
+  let tag = nil;
+  if m.num {
+    let ffs = "";
+    if m.ff {
+      ffs = " · forfeit";
+    }
+    tag = [:span, { class = "meta", style = "font-size:0.7rem" }, "#" .. m.num .. ffs];
+  }
+  return [:div, { class = "card tn-match", id = "match-" .. m.id, style = "padding:8px;min-width:150px" },
     reopen,
-    side_view(t.id, m, m.p1, m.s1),
+    tag,
+    side_view(t.id, m, m.p1, m.s1, adm),
     scores,
-    side_view(t.id, m, m.p2, m.s2)
+    side_view(t.id, m, m.p2, m.s2, adm)
   ];
 }
 
 // A side: a hole awaiting its feeder, a bye, the (bold) winner with score,
-// a struck-out loser, or — in an open match — a button that reports this
-// player as the winner with whatever scores are typed in. The closure hops.
-fn side_view(tid, m, p, sc) {
+// a struck-out loser, or — in an open match, for an admin — a button that
+// reports this player as the winner with whatever scores are typed in.
+fn side_view(tid, m, p, sc, adm) {
   if !p {
     return [:div, { class = "meta" }, "…"];
   }
@@ -836,7 +2161,7 @@ fn side_view(tid, m, p, sc) {
     return [:div, { class = "meta" }, "bye"];
   }
   let scs = "";
-  if sc {
+  if sc != nil {
     scs = "  " .. sc;
   }
   if m.winner {
@@ -845,29 +2170,46 @@ fn side_view(tid, m, p, sc) {
     }
     return [:div, { class = "meta", style = "text-decoration:line-through" }, p .. scs];
   }
-  if m.p1 && m.p2 && m.p1 != "__bye" && m.p2 != "__bye" {
+  if adm && m.p1 && m.p2 && m.p1 != "__bye" && m.p2 != "__bye" {
     let mid = m.id;
     let name = p;
     return [:button, { class = "pair", style = "display:block;width:100%;margin:2px 0",
-      onclick = fn(e) {
-        let a = tonumber(dom.get("#s1-" .. mid));
-        let b = tonumber(dom.get("#s2-" .. mid));
-        server!();
-        store.append({ type = "report", tid = tid, mid = mid, winner = name, s1 = a, s2 = b });
-        cast browsers { refresh(); }
-      } }, p];
+      onclick = fn(e) { report_m(tid, mid, name); } }, p];
   }
   return [:div, {}, p];
 }
 
-// ── interactions ────────────────────────────────────────────────────────
+// ── interactions (flows) ────────────────────────────────────────────────
 
-fn refresh() {
-  let tid = tonumber(dom.get("#current-tid"));
-  server!();
+fn is_admin(uid) {
+  return store(["users", uid, "admin"]) == true;
+}
+
+// Repaint one user's tabs through their view of the store.
+fn paint_user(uid) {
+  let view = store(["views", uid]);
+  if !view {
+    return;
+  }
+  let tid = nil;
+  if view != "lobby" {
+    tid = view;
+  }
   let snap = snapshot(tid);
-  browser!();
-  render(snap);
+  let adm = is_admin(uid);
+  let me = store(["users", uid, "name"]);
+  cast user(uid) {
+    hui.render("#app", app_view(snap, adm, me));
+  }
+}
+
+fn paint_all() {
+  let uids = store(["views", store.keys]);
+  if uids {
+    for _, uid in uids {
+      paint_user(uid);
+    }
+  }
 }
 
 fn create_t() {
@@ -878,25 +2220,63 @@ fn create_t() {
   }
   dom.clear("#t-name");
   server!();
+  let uid = user();
+  if !is_admin(uid) {
+    return;
+  }
   let tid = store.append({ type = "create", name = name, format = format });
-  let snap = snapshot(tid);
-  let me = session();
-  cast browsers { refresh(); }
-  cast session(me) { render(snap); }
+  store.append({ type = "view", uid = uid, tid = tid });
+  paint_all();
 }
 
 fn open_t(tid) {
   server!();
-  let snap = snapshot(tid);
-  let me = session();
-  cast session(me) { render(snap); }
+  store.append({ type = "view", uid = user(), tid = tid });
+  paint_user(user());
 }
 
 fn go_lobby() {
   server!();
-  let snap = snapshot(nil);
-  let me = session();
-  cast session(me) { render(snap); }
+  store.append({ type = "view", uid = user(), tid = "lobby" });
+  paint_user(user());
+}
+
+fn delete_t(tid) {
+  server!();
+  if !is_admin(user()) {
+    return;
+  }
+  store.append({ type = "delete", tid = tid });
+  paint_all();
+}
+
+fn cfg_set(tid, k, v) {
+  server!();
+  if !is_admin(user()) {
+    return;
+  }
+  store.append({ type = "config", tid = tid, k = k, v = v });
+  paint_all();
+}
+
+fn cfg_pick(tid, k, sel) {
+  let v = dom.get(sel);
+  server!();
+  if !is_admin(user()) {
+    return;
+  }
+  store.append({ type = "config", tid = tid, k = k, v = v });
+  paint_all();
+}
+
+fn cfg_num(tid, k, sel) {
+  let v = tonumber(dom.get(sel));
+  server!();
+  if !is_admin(user()) {
+    return;
+  }
+  store.append({ type = "config", tid = tid, k = k, v = v });
+  paint_all();
 }
 
 fn enter_p(tid) {
@@ -906,35 +2286,219 @@ fn enter_p(tid) {
   }
   dom.clear("#p-name");
   server!();
-  store.append({ type = "enter", tid = tid, player = name });
-  cast browsers { refresh(); }
+  if !is_admin(user()) {
+    return;
+  }
+  store.append({ type = "enter", tid = tid, player = str.trim(name) });
+  paint_all();
+}
+
+fn bulk_add(tid) {
+  let text = dom.get("#bulk");
+  if text == "" {
+    return;
+  }
+  dom.clear("#bulk");
+  server!();
+  if !is_admin(user()) {
+    return;
+  }
+  let names = [];
+  for _, line in str.split(text, "\n") {
+    let nm = str.trim(line);
+    if nm != "" {
+      push(names, nm);
+    }
+  }
+  if len(names) == 0 {
+    return;
+  }
+  store.append({ type = "enter_bulk", tid = tid, players = names });
+  paint_all();
+}
+
+fn rename_p(tid, i) {
+  let name = dom.get("#pn-" .. i);
+  server!();
+  if !is_admin(user()) {
+    return;
+  }
+  let nm = str.trim(name);
+  if nm == "" {
+    paint_all();                              // repaint restores the old name
+    return;
+  }
+  store.append({ type = "rename", tid = tid, i = i, name = nm });
+  paint_all();
 }
 
 fn move_p(tid, i) {
   server!();
+  if !is_admin(user()) {
+    return;
+  }
   store.append({ type = "move", tid = tid, i = i });
-  cast browsers { refresh(); }
+  paint_all();
 }
 
 fn drop_p(tid, i) {
   server!();
+  if !is_admin(user()) {
+    return;
+  }
   store.append({ type = "drop", tid = tid, i = i });
-  cast browsers { refresh(); }
+  paint_all();
+}
+
+// Fisher–Yates in the flow; the reducer replays the permutation, not the
+// entropy (rand is a platform effect).
+fn shuffle_t(tid) {
+  server!();
+  if !is_admin(user()) {
+    return;
+  }
+  let players = roster(tid);
+  let n = len(players);
+  if n < 2 {
+    return;
+  }
+  let order = [];
+  for i, p in players {
+    push(order, i);
+  }
+  let i = n - 1;
+  while i > 0 {
+    let j = rand(i + 1);
+    let tmp = order[i];
+    order[i] = order[j];
+    order[j] = tmp;
+    i = i - 1;
+  }
+  store.append({ type = "reorder", tid = tid, order = order });
+  paint_all();
+}
+
+fn open_checkin_t(tid) {
+  server!();
+  if !is_admin(user()) {
+    return;
+  }
+  store.append({ type = "checkin_open", tid = tid });
+  paint_all();
+}
+
+fn checkin_p(tid, i, v) {
+  server!();
+  if !is_admin(user()) {
+    return;
+  }
+  store.append({ type = "checkin", tid = tid, i = i, v = v });
+  paint_all();
+}
+
+fn checkin_all_t(tid) {
+  server!();
+  if !is_admin(user()) {
+    return;
+  }
+  store.append({ type = "checkin_all", tid = tid });
+  paint_all();
 }
 
 fn start_t(tid) {
   server!();
+  if !is_admin(user()) {
+    return;
+  }
   store.append({ type = "start", tid = tid });
-  cast browsers { refresh(); }
+  paint_all();
 }
 
-fn delete_t(tid) {
+fn report_m(tid, mid, name) {
+  let a = tonumber(dom.get("#s1-" .. mid));
+  let b = tonumber(dom.get("#s2-" .. mid));
   server!();
-  store.append({ type = "delete", tid = tid });
-  cast browsers { refresh(); }
+  if !is_admin(user()) {
+    return;
+  }
+  store.append({ type = "report", tid = tid, mid = mid, winner = name, s1 = a, s2 = b });
+  paint_all();
 }
 
-fn on_connect(sid) {
-  let snap = snapshot(nil);
-  cast session(sid) { render(snap); }
+fn unreport_m(tid, mid) {
+  server!();
+  if !is_admin(user()) {
+    return;
+  }
+  store.append({ type = "unreport", tid = tid, mid = mid });
+  paint_all();
+}
+
+fn next_round_t(tid) {
+  server!();
+  if !is_admin(user()) {
+    return;
+  }
+  store.append({ type = "next_round", tid = tid });
+  paint_all();
+}
+
+fn start_finals_t(tid) {
+  server!();
+  if !is_admin(user()) {
+    return;
+  }
+  store.append({ type = "start_finals", tid = tid });
+  paint_all();
+}
+
+fn forfeit_p(tid, name) {
+  server!();
+  if !is_admin(user()) {
+    return;
+  }
+  store.append({ type = "forfeit", tid = tid, name = name });
+  paint_all();
+}
+
+fn finalize_t_f(tid) {
+  server!();
+  if !is_admin(user()) {
+    return;
+  }
+  store.append({ type = "finalize", tid = tid });
+  paint_all();
+}
+
+fn reset_tour(tid) {
+  server!();
+  if !is_admin(user()) {
+    return;
+  }
+  store.append({ type = "reset", tid = tid });
+  paint_all();
+}
+
+// ── presence ────────────────────────────────────────────────────────────
+
+// hopd stamps the profile: display name and the admin bit (from the
+// discord allowlist, or open when none is configured). Record it, land a
+// first-time user in the lobby, paint.
+fn on_connect(sid, uid, profile) {
+  let name = "";
+  let admin = false;
+  if profile {
+    if profile.name {
+      name = profile.name;
+    }
+    admin = profile.admin == true;
+  }
+  let known = store(["users", uid]);
+  if !known || known.name != name || known.admin != admin {
+    store.append({ type = "seen", uid = uid, name = name, admin = admin });
+  }
+  if !store(["views", uid]) {
+    store.append({ type = "view", uid = uid, tid = "lobby" });
+  }
+  paint_user(uid);
 }

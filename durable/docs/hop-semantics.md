@@ -169,8 +169,19 @@ grows syntax.
   and is shared by every tab of one browser profile. `user()` mirrors
   `session()` (own user on a browser; the origin's user in a server
   segment), and `cast user(uid)` fans out to every connected tab of that
-  user. hopd fires `on_connect(sid, user)` / `on_disconnect(sid, user)`
-  on the server VM — best-effort presence, not a transaction.
+  user. hopd fires `on_connect(sid, user, profile)` /
+  `on_disconnect(sid, user)` on the server VM — best-effort presence,
+  not a transaction.
+- Users can be *authenticated*. hopd serves `GET /auth/discord` (OAuth
+  authorize redirect), `/auth/discord/callback` (code exchange +
+  `/users/@me`), and `/auth/logout`. Success mints an HMAC-signed
+  `hop_auth` cookie (`auth.rs`); the WS handshake prefers it over
+  `hop_user`, so the uid becomes `d:<discord_id>` — one identity across
+  browsers and devices. A bad signature falls back to anonymous
+  (`oauth.rs` asserts the forgery path over real sockets). The
+  `on_connect` profile is `{name, avatar, admin}` or nil; `admin` is
+  membership in `HOP_ADMIN_DISCORD_IDS` (comma-separated env var),
+  computed by hopd — apps gate mutating flows on it server-side.
 - Delivery is FIFO per transport; `browsers` fan-out enumerates connected
   sessions at delivery time, at-most-once, no ordering across VMs; the
   `user:` fan-out enumerates that user's tabs the same way.
