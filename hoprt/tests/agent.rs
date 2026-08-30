@@ -96,7 +96,8 @@ fn agent_chat_tool_loop_and_replay() {
     host.fire_args("A", "send", vec![s("A"), Value::Int(1)]);
     host.pump();
     host.assert_quiescent();
-    assert_eq!(pending(&mut host, 1), s("echo hop_tool_ok"), "approval gate armed");
+    let p = pending(&mut host, 1);
+    assert_eq!(p.get_field("cmd"), s("echo hop_tool_ok"), "approval gate armed");
     assert!(host.dom("A", "#app").contains("run `echo hop_tool_ok`"), "gate rendered");
 
     // approve: bash runs (for real), result goes on the tape, turn resumes
@@ -177,6 +178,40 @@ fn agent_threads_are_independent_and_sessions_view_their_own() {
     host.pump();
     assert_eq!(host.store_get(arr(vec![s("views"), s("A")])).unwrap(), Value::Int(2));
     assert!(host.dom("A", "#app").contains("echo: bananas"), "A now sees thread 2");
+
+    host.verify().unwrap();
+}
+
+#[test]
+fn agent_native_tool_calls_round_trip_with_call_ids() {
+    let mut host =
+        Cluster::new(&["A"], include_str!("../hop/agent.hop"), false).expect("cluster");
+    host.fire_args("server", "on_connect", vec![s("A")]);
+    host.pump();
+    host.fire("A", "toggle_auto");
+    host.pump();
+
+    // the fake's structured path: no text, a tool_calls array in the
+    // final marker — as an OpenAI-family model would answer
+    host.set_dom("A", "#draft", "CALL: echo native_ok");
+    host.fire_args("A", "send", vec![s("A"), Value::Int(1)]);
+    host.pump();
+    host.assert_quiescent();
+
+    // msgs: 0 user, 1 tool_request (with the call id), 2 tool, 3 assistant
+    let m1 = msg(&mut host, 1, 1);
+    assert_eq!(m1.get_field("role"), s("tool_request"));
+    assert_eq!(m1.get_field("text"), s("echo native_ok"));
+    assert_eq!(m1.get_field("call_id"), s("call_fake_1"), "call id on the tape");
+    let m2 = msg(&mut host, 1, 2);
+    assert_eq!(m2.get_field("role"), s("tool"));
+    assert_eq!(m2.get_field("call_id"), s("call_fake_1"), "result tied to the call");
+    assert!(
+        hoprt::value::coerce_str(&m2.get_field("text")).contains("native_ok"),
+        "tool ran: {m2}"
+    );
+    let m3 = msg(&mut host, 1, 3);
+    assert_eq!(m3.get_field("role"), s("assistant"));
 
     host.verify().unwrap();
 }

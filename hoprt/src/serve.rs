@@ -47,8 +47,32 @@ enum Ev {
     Effect(Vec<u8>),
     /// One streamed LLM delta for a stream handle.
     LlmChunk(String, String),
-    /// Stream finished: full accumulated text, or the error.
-    LlmDone(String, Result<String, String>),
+    /// Stream finished: accumulated text + assembled tool calls, or the error.
+    LlmDone(String, Result<(String, Vec<ToolCall>), String>),
+}
+
+/// A structured tool call from the model, assembled from stream deltas
+/// (arguments arrive in fragments) or read whole from a one-shot reply.
+#[derive(Default, Clone)]
+struct ToolCall {
+    id: String,
+    name: String,
+    args: String,
+}
+
+fn tool_calls_value(calls: &[ToolCall]) -> Value {
+    Value::array(
+        calls
+            .iter()
+            .map(|c| {
+                result_map(vec![
+                    ("id", Value::str(c.id.as_str())),
+                    ("name", Value::str(c.name.as_str())),
+                    ("args", Value::str(c.args.as_str())),
+                ])
+            })
+            .collect(),
+    )
 }
 
 fn session_name(n: usize) -> String {
@@ -287,7 +311,7 @@ impl LlmCfg {
 
 struct LlmStream {
     buf: VecDeque<String>,
-    done: Option<Result<String, String>>,
+    done: Option<Result<(String, Vec<ToolCall>), String>>,
     /// A parked llm.next waiting for the next chunk: its flow id.
     pending: Option<String>,
 }
@@ -373,13 +397,15 @@ fn llm_post(cfg: &LlmCfg, body: &str) -> Result<Box<dyn std::io::Read + Send + S
 }
 
 /// Read an SSE chat-completions stream, calling `on_delta` per content
-/// delta. Returns the accumulated text.
+/// delta. Returns the accumulated text and any tool calls the model made
+/// (their arguments arrive as string fragments, keyed by index).
 fn llm_read_stream(
     reader: Box<dyn std::io::Read + Send + Sync>,
     mut on_delta: impl FnMut(&str),
-) -> Result<String, String> {
+) -> Result<(String, Vec<ToolCall>), String> {
     use std::io::BufRead;
     let mut acc = String::new();
+    let mut calls: Vec<ToolCall> = Vec::new();
     for line in std::io::BufReader::new(reader).lines() {
         let line = line.map_err(|e| e.to_string())?;
         let Some(data) = line.strip_prefix("data:") else { continue };
@@ -398,14 +424,33 @@ fn llm_read_stream(
                 .unwrap_or("llm stream error")
                 .to_string());
         }
-        if let Some(delta) = j["choices"][0]["delta"]["content"].as_str() {
-            if !delta.is_empty() {
-                acc.push_str(delta);
-                on_delta(delta);
+        let delta = &j["choices"][0]["delta"];
+        if let Some(text) = delta["content"].as_str() {
+            if !text.is_empty() {
+                acc.push_str(text);
+                on_delta(text);
+            }
+        }
+        if let Some(tcs) = delta["tool_calls"].as_array() {
+            for tc in tcs {
+                let idx = tc["index"].as_u64().unwrap_or(0) as usize;
+                while calls.len() <= idx {
+                    calls.push(ToolCall::default());
+                }
+                let c = &mut calls[idx];
+                if let Some(id) = tc["id"].as_str() {
+                    c.id = id.to_string();
+                }
+                if let Some(n) = tc["function"]["name"].as_str() {
+                    c.name = n.to_string();
+                }
+                if let Some(a) = tc["function"]["arguments"].as_str() {
+                    c.args.push_str(a);
+                }
             }
         }
     }
-    Ok(acc)
+    Ok((acc, calls))
 }
 
 impl Effects {
@@ -449,23 +494,49 @@ impl Effects {
                 let cfg = cfg.clone();
                 let tx = tx.clone();
                 thread::spawn(move || {
-                    let run = || -> Result<String, String> {
+                    let run = || -> Result<(String, Vec<ToolCall>), String> {
                         let mut reader = llm_post(&cfg, &body?)?;
                         let mut s = String::new();
                         std::io::Read::read_to_string(&mut reader, &mut s)
                             .map_err(|e| e.to_string())?;
                         let j: serde_json::Value =
                             serde_json::from_str(&s).map_err(|e| e.to_string())?;
-                        j["choices"][0]["message"]["content"]
-                            .as_str()
-                            .map(str::to_string)
-                            .ok_or_else(|| format!("no content in response: {s}"))
+                        let msg = &j["choices"][0]["message"];
+                        let text = msg["content"].as_str().unwrap_or_default().to_string();
+                        let calls: Vec<ToolCall> = msg["tool_calls"]
+                            .as_array()
+                            .map(|tcs| {
+                                tcs.iter()
+                                    .map(|tc| ToolCall {
+                                        id: tc["id"].as_str().unwrap_or_default().into(),
+                                        name: tc["function"]["name"]
+                                            .as_str()
+                                            .unwrap_or_default()
+                                            .into(),
+                                        args: tc["function"]["arguments"]
+                                            .as_str()
+                                            .unwrap_or_default()
+                                            .into(),
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        if text.is_empty() && calls.is_empty() {
+                            return Err(format!("no content in response: {s}"));
+                        }
+                        Ok((text, calls))
                     };
                     let value = match run() {
-                        Ok(text) => result_map(vec![
-                            ("ok", Value::Bool(true)),
-                            ("text", Value::str(text)),
-                        ]),
+                        Ok((text, calls)) => {
+                            let mut fields = vec![
+                                ("ok", Value::Bool(true)),
+                                ("text", Value::str(text)),
+                            ];
+                            if !calls.is_empty() {
+                                fields.push(("tool_calls", tool_calls_value(&calls)));
+                            }
+                            result_map(fields)
+                        }
                         Err(e) => result_map(vec![
                             ("ok", Value::Bool(false)),
                             ("error", Value::str(e)),
@@ -562,16 +633,22 @@ impl Effects {
     }
 
     /// The next llm.next reply for a stream, if one is ready: a buffered
-    /// `{delta}`, else the `{done, text}` / `{error}` end marker.
+    /// `{delta}`, else the `{done, text, tool_calls?}` / `{error}` end marker.
     fn next_value(stream: &mut LlmStream) -> Option<Value> {
         if let Some(delta) = stream.buf.pop_front() {
             return Some(result_map(vec![("delta", Value::str(delta))]));
         }
         match &stream.done {
-            Some(Ok(text)) => Some(result_map(vec![
-                ("done", Value::Bool(true)),
-                ("text", Value::str(text.as_str())),
-            ])),
+            Some(Ok((text, calls))) => {
+                let mut fields = vec![
+                    ("done", Value::Bool(true)),
+                    ("text", Value::str(text.as_str())),
+                ];
+                if !calls.is_empty() {
+                    fields.push(("tool_calls", tool_calls_value(calls)));
+                }
+                Some(result_map(fields))
+            }
             Some(Err(e)) => Some(result_map(vec![("error", Value::str(e.as_str()))])),
             None => None,
         }
@@ -586,7 +663,12 @@ impl Effects {
         }
     }
 
-    fn on_done(&mut self, h: &str, res: Result<String, String>, tx: &mpsc::Sender<Ev>) {
+    fn on_done(
+        &mut self,
+        h: &str,
+        res: Result<(String, Vec<ToolCall>), String>,
+        tx: &mpsc::Sender<Ev>,
+    ) {
         let Some(stream) = self.streams.get_mut(h) else { return };
         stream.done = Some(res);
         if Self::wake(stream, tx) {
@@ -649,7 +731,7 @@ mod effects_tests {
             "llm:1".into(),
             LlmStream {
                 buf: VecDeque::from(["tail".to_string()]),
-                done: Some(Ok("full text".into())),
+                done: Some(Ok(("full text".into(), Vec::new()))),
                 pending: None,
             },
         );
@@ -674,6 +756,30 @@ mod effects_tests {
         assert!(!fx.streams.contains_key("llm:1"), "stream removed after the final marker");
     }
 
+    /// Streamed tool_calls arrive as fragments keyed by index; the reader
+    /// must reassemble ids, names, and argument strings.
+    #[test]
+    fn sse_reader_assembles_tool_call_fragments() {
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"let me look\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_a\",\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"cm\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"d\\\":\\\"ls\\\"}\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call_b\",\"function\":{\"name\":\"bash\",\"arguments\":\"{}\"}}]}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let reader: Box<dyn std::io::Read + Send + Sync> =
+            Box::new(std::io::Cursor::new(sse.as_bytes().to_vec()));
+        let mut deltas = Vec::new();
+        let (text, calls) = llm_read_stream(reader, |d| deltas.push(d.to_string())).unwrap();
+        assert_eq!(text, "let me look");
+        assert_eq!(deltas, vec!["let me look"]);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].id, "call_a");
+        assert_eq!(calls[0].name, "bash");
+        assert_eq!(calls[0].args, r#"{"cmd":"ls"}"#);
+        assert_eq!(calls[1].id, "call_b");
+    }
+
     /// A chunk waking a parked llm.next must not finalize either.
     #[test]
     fn wake_on_chunk_keeps_the_stream_until_done_is_delivered() {
@@ -689,7 +795,7 @@ mod effects_tests {
         assert!(fx.streams.contains_key("llm:1"));
 
         fx.streams.get_mut("llm:1").unwrap().pending = Some("f#1".into());
-        fx.on_done("llm:1", Ok("d1".into()), &tx);
+        fx.on_done("llm:1", Ok(("d1".into(), Vec::new())), &tx);
         let v = recv_reply(&rx);
         assert_eq!(v.get_field("done"), Value::Bool(true));
         assert!(!fx.streams.contains_key("llm:1"), "final via wake removes the stream");
@@ -727,7 +833,7 @@ mod effects_tests {
                         if produced < n_deltas {
                             fx.on_chunk("llm:1", format!("d{produced}"), &tx);
                         } else {
-                            fx.on_done("llm:1", Ok("all".into()), &tx);
+                            fx.on_done("llm:1", Ok(("all".into(), Vec::new())), &tx);
                         }
                         produced += 1;
                     } else if want_next && !in_flight {
@@ -740,7 +846,7 @@ mod effects_tests {
                         if produced < n_deltas {
                             fx.on_chunk("llm:1", format!("d{produced}"), &tx);
                         } else {
-                            fx.on_done("llm:1", Ok("all".into()), &tx);
+                            fx.on_done("llm:1", Ok(("all".into(), Vec::new())), &tx);
                         }
                         produced += 1;
                     }

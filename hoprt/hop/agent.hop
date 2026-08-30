@@ -53,18 +53,18 @@ fn reduce(event) {
       store(["threads", tid, "msgs", store.push({ role = "assistant", text = text })]);
       store(["threads", tid, "busy", store.set(false)]);
     }
-    tool_request { tid, cmd } => {
-      store(["threads", tid, "msgs", store.push({ role = "tool_request", text = cmd })]);
-      store(["threads", tid, "pending", store.set(cmd)]);
+    tool_request { tid, cmd, call_id } => {
+      store(["threads", tid, "msgs", store.push({ role = "tool_request", text = cmd, call_id = call_id })]);
+      store(["threads", tid, "pending", store.set({ cmd = cmd, call_id = call_id })]);
       store(["threads", tid, "busy", store.set(false)]);
     }
-    tool_result { tid, output } => {
-      store(["threads", tid, "msgs", store.push({ role = "tool", text = output })]);
+    tool_result { tid, output, call_id } => {
+      store(["threads", tid, "msgs", store.push({ role = "tool", text = output, call_id = call_id })]);
       store(["threads", tid, "pending", store.del]);
       store(["threads", tid, "busy", store.set(true)]);
     }
-    tool_denied { tid } => {
-      store(["threads", tid, "msgs", store.push({ role = "tool", text = "(user declined to run the command)" })]);
+    tool_denied { tid, call_id } => {
+      store(["threads", tid, "msgs", store.push({ role = "tool", text = "(user declined to run the command)", call_id = call_id })]);
       store(["threads", tid, "pending", store.del]);
       store(["threads", tid, "busy", store.set(true)]);
     }
@@ -93,8 +93,26 @@ fn reduce(event) {
 
 // ── the turn: stream, parse, either answer or ask to run a tool ─────────
 
+// The bash tool, bound for real: models trained on function calling
+// check what tools their request actually carries, and a text-only
+// protocol reads as "no tools available" — some will honestly refuse.
+fn bash_tool() {
+  return [{
+    type = "function",
+    function = {
+      name = "bash",
+      description = "Run a shell command in the user's project directory and return its output. One command per call; you will receive stdout/stderr and can then issue the next.",
+      parameters = {
+        type = "object",
+        properties = { cmd = { type = "string", description = "the shell command to run" } },
+        required = ["cmd"]
+      }
+    }
+  }];
+}
+
 fn llm_messages(tid) {
-  let sys = "You are a coding agent running in the user's project directory. To run a shell command, reply with a single JSON object {\"tool\":\"bash\",\"cmd\":\"...\"} — exactly one command per message, no prose around it, no code fences. You will receive the command's output, and can then issue the next command. When you are done (or need nothing), answer the user in plain text containing no JSON object.";
+  let sys = "You are a coding agent running in the user's project directory. Use the bash tool to run shell commands — one command per call; its output comes back as the tool result, and you can then issue the next. If your harness has no bash tool bound, reply instead with a single JSON object {\"tool\":\"bash\",\"cmd\":\"...\"} and nothing else. When you are done (or need nothing), answer the user in plain text.";
   let home = store(["home"]);
   if home {
     sys = sys .. " Your working directory is " .. home .. ".";
@@ -106,9 +124,23 @@ fn llm_messages(tid) {
       if m.role == "user" {
         push(out, { role = "user", content = m.text });
       } else if m.role == "tool" {
-        push(out, { role = "user", content = "tool output:\n" .. m.text });
+        if m.call_id {
+          push(out, { role = "tool", tool_call_id = m.call_id, content = m.text });
+        } else {
+          push(out, { role = "user", content = "tool output:\n" .. m.text });
+        }
+      } else if m.role == "tool_request" {
+        if m.call_id {
+          // replay the model's own call in the shape it emitted it
+          push(out, { role = "assistant", tool_calls = [{
+            id = m.call_id,
+            type = "function",
+            function = { name = "bash", arguments = json.encode({ cmd = m.text }) }
+          }] });
+        } else {
+          push(out, { role = "assistant", content = m.text });
+        }
       } else {
-        // assistant text and the model's own tool_request JSON
         push(out, { role = "assistant", content = m.text });
       }
     }
@@ -117,7 +149,7 @@ fn llm_messages(tid) {
 }
 
 fn run_turn(tid) {
-  let req = { messages = llm_messages(tid) };
+  let req = { messages = llm_messages(tid), tools = bash_tool() };
   let model = store(["model"]);
   if model {
     req.model = model;
@@ -136,25 +168,39 @@ fn run_turn(tid) {
     return;
   }
   let text = out.text;
-  // fish the first JSON object out of the reply — models wrap tool calls
-  // in prose, fences, or emit several; we run one and return its output
+  // native protocol first: a structured tool call from the API
+  if out.tool_calls && len(out.tool_calls) > 0 {
+    let c = out.tool_calls[0];
+    let args = json.decode(c.args);
+    if type(args) == "map" && type(args.cmd) == "string" {
+      request_tool(tid, args.cmd, c.id);
+      return;
+    }
+  }
+  // fallback: fish a JSON tool call out of the text — for models
+  // without function calling (and prose-wrapped or fenced replies)
   let call = json.first(text);
   if type(call) == "map" && call.tool == "bash" && type(call.cmd) == "string" {
-    store.append({ type = "tool_request", tid = tid, cmd = call.cmd });
-    paint_all();
-    if store(["auto"]) {
-      run_tool(tid, call.cmd);
-    }
-  } else {
-    store.append({ type = "assistant", tid = tid, text = text });
-    paint_all();
+    request_tool(tid, call.cmd, nil);
+    return;
+  }
+  store.append({ type = "assistant", tid = tid, text = text });
+  paint_all();
+}
+
+// Put a tool request on the tape; run it now if the gate is open.
+fn request_tool(tid, cmd, call_id) {
+  store.append({ type = "tool_request", tid = tid, cmd = cmd, call_id = call_id });
+  paint_all();
+  if store(["auto"]) {
+    run_tool(tid, cmd, call_id);
   }
 }
 
 // Run one approved (or auto-approved) command and resume the turn.
 // Server-side, unmarked: called from approve's server segment and from
-// run_turn; bash suspends the flow, never the VM.
-fn run_tool(tid, cmd) {
+// request_tool; bash suspends the flow, never the VM.
+fn run_tool(tid, cmd, call_id) {
   let r = bash(cmd, store(["home"]));
   let output = "";
   if r.ok {
@@ -164,7 +210,7 @@ fn run_tool(tid, cmd) {
   } else {
     output = "exit " .. r.status .. "\n" .. r.stderr .. r.stdout;
   }
-  store.append({ type = "tool_result", tid = tid, cmd = cmd, output = output });
+  store.append({ type = "tool_result", tid = tid, cmd = cmd, output = output, call_id = call_id });
   paint_all();
   spawn run_turn(tid);
 }
@@ -190,16 +236,20 @@ fn send(sid, tid) {
 
 fn approve(tid) {
   server!();
-  let cmd = store(["threads", tid, "pending"]);
-  if !cmd {
+  let p = store(["threads", tid, "pending"]);
+  if !p {
     return;
   }
-  run_tool(tid, cmd);
+  run_tool(tid, p.cmd, p.call_id);
 }
 
 fn deny(tid) {
   server!();
-  store.append({ type = "tool_denied", tid = tid });
+  let p = store(["threads", tid, "pending"]);
+  if !p {
+    return;
+  }
+  store.append({ type = "tool_denied", tid = tid, call_id = p.call_id });
   paint_all();
   spawn run_turn(tid);
 }
@@ -300,7 +350,7 @@ fn agent_app(sid, tid, threads, msgs, pending, busy, auto, model, models, home) 
   let gate = [];
   if pending {
     gate = [:div, { class = "row", id = "approval" },
-      [:span, {}, "run `" .. pending .. "` ? "],
+      [:span, {}, "run `" .. pending.cmd .. "` ? "],
       [:button, { id = "approve", onclick = fn(e) { approve(tid); } }, "run it"],
       [:button, { id = "deny", onclick = fn(e) { deny(tid); } }, "no"]
     ];

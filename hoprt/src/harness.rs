@@ -131,28 +131,55 @@ pub struct Cluster {
     shared: Shared,
     data_dir: PathBuf,
     _keep: Option<tempfile::TempDir>,
-    /// Fake llm streams: handle → (chunks still to deliver, full text).
-    fx_streams: HashMap<String, (VecDeque<String>, String)>,
+    /// Fake llm streams: handle → (chunks still to deliver, full text,
+    /// structured tool calls for the final marker).
+    fx_streams: HashMap<String, (VecDeque<String>, String, Vec<(String, String)>)>,
     fx_next: u64,
 }
 
-/// The harness's deterministic fake model: a user message "RUN: <cmd>"
-/// yields a bash tool call; anything else echoes. Enough to exercise an
-/// agent's whole loop — stream, parse, approve, tool, resume — offline.
-fn fake_llm_text(req: &Value) -> String {
+/// The harness's deterministic fake model: "RUN: <cmd>" yields a bash
+/// tool call as JSON text (the fallback protocol), "CALL: <cmd>" yields a
+/// structured tool call (the native protocol), anything else echoes.
+/// Enough to exercise an agent's whole loop — stream, parse, approve,
+/// tool, resume — offline. Returns (text, calls) where a call is
+/// (id, json-arguments).
+fn fake_llm(req: &Value) -> (String, Vec<(String, String)>) {
     let msgs = req.get_field("messages");
     let last = match &msgs {
         Value::Array(a) => a.borrow().last().cloned().unwrap_or(Value::Nil),
         _ => Value::Nil,
     };
     let content = crate::value::coerce_str(&last.get_field("content"));
-    match content.strip_prefix("RUN:") {
-        Some(cmd) => format!(
-            "{{\"tool\":\"bash\",\"cmd\":\"{}\"}}",
-            cmd.trim().replace('\\', "\\\\").replace('"', "\\\"")
-        ),
-        None => format!("echo: {content}"),
+    let quoted = |cmd: &str| cmd.trim().replace('\\', "\\\\").replace('"', "\\\"");
+    if let Some(cmd) = content.strip_prefix("RUN:") {
+        return (format!("{{\"tool\":\"bash\",\"cmd\":\"{}\"}}", quoted(cmd)), Vec::new());
     }
+    if let Some(cmd) = content.strip_prefix("CALL:") {
+        return (
+            String::new(),
+            vec![("call_fake_1".to_string(), format!("{{\"cmd\":\"{}\"}}", quoted(cmd)))],
+        );
+    }
+    (format!("echo: {content}"), Vec::new())
+}
+
+fn fake_tool_calls_value(calls: &[(String, String)]) -> Value {
+    Value::array(
+        calls
+            .iter()
+            .map(|(id, args)| {
+                Value::map(
+                    [
+                        (Value::str("id"), Value::str(id.as_str())),
+                        (Value::str("name"), Value::str("bash")),
+                        (Value::str("args"), Value::str(args.as_str())),
+                    ]
+                    .into_iter()
+                    .collect(),
+                )
+            })
+            .collect(),
+    )
 }
 
 /// Split into two chunks so streaming loops see more than one delta.
@@ -282,8 +309,12 @@ impl Cluster {
                 reply(value)
             }
             "llm" => {
-                let text = fake_llm_text(&vars.get_field("req"));
-                reply(result(vec![("ok", Value::Bool(true)), ("text", Value::str(text))]))
+                let (text, calls) = fake_llm(&vars.get_field("req"));
+                let mut fields = vec![("ok", Value::Bool(true)), ("text", Value::str(text))];
+                if !calls.is_empty() {
+                    fields.push(("tool_calls", fake_tool_calls_value(&calls)));
+                }
+                reply(result(fields))
             }
             "llm_models" => reply(result(vec![
                 ("ok", Value::Bool(true)),
@@ -295,13 +326,14 @@ impl Cluster {
             "llm_start" => {
                 self.fx_next += 1;
                 let h = format!("llm:{}", self.fx_next);
-                let text = fake_llm_text(&vars.get_field("req"));
-                self.fx_streams.insert(h.clone(), (fake_chunks(&text), text));
+                let (text, calls) = fake_llm(&vars.get_field("req"));
+                let chunks = if text.is_empty() { VecDeque::new() } else { fake_chunks(&text) };
+                self.fx_streams.insert(h.clone(), (chunks, text, calls));
                 reply(Value::str(h))
             }
             "llm_next" => {
                 let h = crate::value::coerce_str(&vars.get_field("h"));
-                let Some((chunks, full)) = self.fx_streams.get_mut(&h) else {
+                let Some((chunks, full, calls)) = self.fx_streams.get_mut(&h) else {
                     return Value::map(
                         [
                             (Value::str("kind"), Value::str("error")),
@@ -317,11 +349,16 @@ impl Cluster {
                     Some(delta) => reply(result(vec![("delta", Value::str(delta))])),
                     None => {
                         let full = full.clone();
+                        let calls = calls.clone();
                         self.fx_streams.remove(&h);
-                        reply(result(vec![
+                        let mut fields = vec![
                             ("done", Value::Bool(true)),
                             ("text", Value::str(full)),
-                        ]))
+                        ];
+                        if !calls.is_empty() {
+                            fields.push(("tool_calls", fake_tool_calls_value(&calls)));
+                        }
+                        reply(result(fields))
                     }
                 }
             }
