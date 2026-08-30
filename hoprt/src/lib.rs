@@ -14,6 +14,7 @@ pub mod compiler;
 pub mod harness;
 pub mod interp;
 pub mod ir;
+pub mod modules;
 pub mod rt;
 #[cfg(feature = "server")]
 pub mod serve;

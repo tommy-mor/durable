@@ -84,9 +84,18 @@ asserted by the same transcript tests).
 
 Ported apps use a flat, small stdlib: `push(xs, v)`, `len(x)`,
 `sort(xs, cmp?)`, `floor(n)`, `type(v)`, `tostring(v)`, `tonumber(v)`,
-`print(...)`, `json.encode(v)` / `json.decode(s)` (decode of unparsable
-input is `nil` — parse failure is data), plus `session()` and the
-`store.*` / `hui.*` / `dom.*` modules. Arrays are 0-based
+`print(...)`, plus `session()` and the `store.*` / `hui.*` / `dom.*`
+modules. Everything beyond that core is a **module** (`hoprt/src/modules.rs`):
+a Rust-side bag of named natives — pure functions or effect declarations —
+that mounts into every VM's globals by name (`bash` as a global,
+`json.first` as a field on the `json` map). The kind carries the policy:
+pure natives run on either side and in reducers; effects are server-only
+and never in a reducer, with no hand-maintained gates. The battery set
+today: `json.encode(v)` / `json.decode(s)` (decode of unparsable input is
+`nil` — parse failure is data) / `json.first(s)`, `markdown(s)`, `bash`,
+and `llm.*`. Adding a pure native is one entry in a module; adding an
+effect is that plus an executor in hopd and a fake in the harness.
+Arrays are 0-based
 (hop-values.md); `for i, v in xs` runs 0..len-1; `while cond { ... }`
 loops; map iteration is key-ordered and deterministic. The store is one
 callable — `store(path)`, where collecting and terminal navigators in the
@@ -94,7 +103,7 @@ path decide query vs mutation — specified in [hop-store.md](hop-store.md).
 
 ## Effects — suspending natives
 
-`bash(cmd)`, `llm(req)`, and the streaming pair `llm.stream(req)` →
+`bash(cmd)`, `llm.call(req)`, and the streaming pair `llm.stream(req)` →
 handle / `llm.next(h)` → `{delta}` … `{done, text}` are server-side
 natives that park the flow exactly like `At`: the interpreter returns a
 suspension targeted at the pseudo-address `@effects`, hopd runs the work

@@ -265,18 +265,17 @@ impl Host for ReduceHost<'_> {
     fn native(&mut self, id: NativeId, args: Vec<Value>) -> Result<NativeOut, String> {
         self.native_value(id, args).map(NativeOut::Val)
     }
+
+    /// Effects would make replay nondeterministic; the reducer is a
+    /// function of (committed state, event) and nothing else.
+    fn effect(&mut self, name: &str, _hop: &str, _vars: Value) -> Result<NativeOut, String> {
+        Err(format!("effects are not allowed in a reducer ({name})"))
+    }
 }
 
 impl ReduceHost<'_> {
     fn native_value(&mut self, id: NativeId, args: Vec<Value>) -> Result<Value, String> {
         match id {
-            // Effects would make replay nondeterministic; the reducer is
-            // a function of (committed state, event) and nothing else.
-            NativeId::Bash
-            | NativeId::LlmCall
-            | NativeId::LlmStream
-            | NativeId::LlmNext
-            | NativeId::LlmModels => Err("effects are not allowed in a reducer".into()),
             // the same one function. Here a terminal navigator is legal:
             // it reifies as a Write against committed state.
             NativeId::StoreCall => {

@@ -68,6 +68,13 @@ pub trait Host {
     fn spawn(&mut self, callee: Value, args: Vec<Value>) -> Result<(), String>;
     fn session(&mut self) -> Result<Value, String>;
     fn native(&mut self, id: NativeId, args: Vec<Value>) -> Result<NativeOut, String>;
+    /// A module effect (modules.rs): suspend the flow toward the
+    /// platform's executor. The default refusal is the policy for hosts
+    /// without a platform — reducers reject every effect by construction.
+    fn effect(&mut self, name: &str, hop: &str, vars: Value) -> Result<NativeOut, String> {
+        let _ = (hop, vars);
+        Err(format!("{name} is not available here"))
+    }
 }
 
 fn new_frame(f: &Function, fn_idx: usize, caps: &[Value], args: Vec<Value>) -> Frame {
@@ -268,12 +275,6 @@ pub fn run(
                             None => err!("store has no field .{}", name),
                         }
                     }
-                    Value::Native(NativeId::LlmCall) => match name {
-                        "stream" => push!(Value::Native(NativeId::LlmStream)),
-                        "next" => push!(Value::Native(NativeId::LlmNext)),
-                        "models" => push!(Value::Native(NativeId::LlmModels)),
-                        _ => err!("llm has no field .{}", name),
-                    },
                     Value::Nil => err!("field .{} of nil", name),
                     o => err!("field .{} of {}", name, o.kind()),
                 }
@@ -351,6 +352,24 @@ pub fn run(
                         }
                         Err(e) => err!("{e}"),
                     },
+                    Value::Lib(name) => {
+                        let out = match crate::modules::registry().get(name) {
+                            Some(crate::modules::NativeKind::Pure(f)) => {
+                                f(args).map(NativeOut::Val)
+                            }
+                            Some(crate::modules::NativeKind::Effect { hop, vars }) => {
+                                vars(args).and_then(|v| host.effect(name, hop, v))
+                            }
+                            None => Err(format!("unknown native {name}")),
+                        };
+                        match out {
+                            Ok(NativeOut::Val(v)) => push!(v),
+                            Ok(NativeOut::Suspend { target, hop, vars }) => {
+                                return Outcome::Suspend { target, hop, vars }
+                            }
+                            Err(e) => err!("{e}"),
+                        }
+                    }
                     Value::Nil => err!("calling nil (unknown function?)"),
                     o => err!("cannot call a {}", o.kind()),
                 }
@@ -609,13 +628,6 @@ fn call_native(id: NativeId, mut args: Vec<Value>, host: &mut dyn Host) -> Resul
                 o => Err(format!("push into {}", o.kind())),
             }
         }
-        // markdown(s) → a hiccup tree; render it like any other node.
-        // Text stays text all the way down: hui escapes it, so model
-        // output cannot inject markup.
-        NativeId::Markdown => match args.first().and_then(Value::as_str) {
-            Some(s) => Ok(crate::builtins::markdown_hiccup(s)),
-            None => Err("markdown(text) expects a string".into()),
-        },
         NativeId::Len => match args.first() {
             Some(Value::Array(a)) => Ok(Value::Int(a.borrow().len() as i64)),
             Some(Value::Map(m)) => Ok(Value::Int(m.borrow().len() as i64)),
@@ -661,42 +673,6 @@ fn call_native(id: NativeId, mut args: Vec<Value>, host: &mut dyn Host) -> Resul
         NativeId::TypeOf => Ok(Value::str(
             args.first().map(Value::kind).unwrap_or("nil"),
         )),
-        // json.encode(v) → string; json.decode(s) → value, nil if unparsable
-        // (absence = nil, per the value model — parse failure is data).
-        NativeId::JsonEncode => {
-            let v = args.first().cloned().unwrap_or(Value::Nil);
-            let j = crate::value::to_json(&v)?;
-            serde_json::to_string(&j).map(Value::str).map_err(|e| e.to_string())
-        }
-        NativeId::JsonDecode => match args.first().and_then(Value::as_str) {
-            Some(s) => Ok(match serde_json::from_str::<serde_json::Value>(s) {
-                Ok(j) => crate::value::from_json(&j),
-                Err(_) => Value::Nil,
-            }),
-            None => Err("json.decode expects a string".into()),
-        },
-        // json.first(s) → the first JSON object embedded anywhere in s
-        // (prose, code fences, and trailing objects are ignored), or nil.
-        // The forgiving side of the decode family: made for fishing a
-        // tool call out of a model's reply.
-        NativeId::JsonFirst => match args.first().and_then(Value::as_str) {
-            Some(s) => {
-                let mut found = Value::Nil;
-                for (i, c) in s.char_indices() {
-                    if c != '{' {
-                        continue;
-                    }
-                    let mut it = serde_json::Deserializer::from_str(&s[i..])
-                        .into_iter::<serde_json::Value>();
-                    if let Some(Ok(j)) = it.next() {
-                        found = crate::value::from_json(&j);
-                        break;
-                    }
-                }
-                Ok(found)
-            }
-            None => Err("json.first expects a string".into()),
-        },
         // schema shape constructors are pure data builders
         NativeId::ShapeMap | NativeId::ShapeList | NativeId::ShapeDeque => {
             let of = args.first().cloned().unwrap_or(Value::Nil);

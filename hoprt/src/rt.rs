@@ -113,7 +113,7 @@ impl Vm {
     pub fn new(prog: Rc<Program>, side: SideId, platform: &mut dyn Platform) -> Result<Vm, String> {
         let mut globals = Globals::default();
 
-        // stdlib
+        // language core
         for (name, id) in [
             ("print", NativeId::Print),
             ("error", NativeId::Error),
@@ -124,25 +124,11 @@ impl Vm {
             ("sort_by", NativeId::SortBy),
             ("floor", NativeId::Floor),
             ("type", NativeId::TypeOf),
-            ("markdown", NativeId::Markdown),
-            ("bash", NativeId::Bash),
         ] {
             globals.set(name, Value::Native(id));
         }
-        // llm is a callable (full completion) whose fields are the
-        // streaming surface: llm.stream(req) → handle, llm.next(h) → chunk
-        globals.set("llm", Value::Native(NativeId::LlmCall));
-        let json_mod = Value::map(
-            [
-                ("encode", Value::Native(NativeId::JsonEncode)),
-                ("decode", Value::Native(NativeId::JsonDecode)),
-                ("first", Value::Native(NativeId::JsonFirst)),
-            ]
-            .into_iter()
-            .map(|(k, v)| (Value::str(k), v))
-            .collect(),
-        );
-        globals.set("json", json_mod);
+        // the batteries: json, markdown, bash, llm — see modules.rs
+        crate::modules::install(&mut globals);
 
         // the store is one callable: store(path). Its module surface —
         // shape constructors, the tape, navigators — is field access on
@@ -435,18 +421,6 @@ enum RunResult {
     Failed(String),
 }
 
-/// Wire name of an effect (the `hop` field of its call packet).
-pub fn effect_hop(id: NativeId) -> &'static str {
-    match id {
-        NativeId::Bash => "bash",
-        NativeId::LlmCall => "llm",
-        NativeId::LlmStream => "llm_start",
-        NativeId::LlmNext => "llm_next",
-        NativeId::LlmModels => "llm_models",
-        _ => "?",
-    }
-}
-
 // ---------------------------------------------------------------------------
 // The per-step Host: bridges interpreter needs to VM state + platform
 // ---------------------------------------------------------------------------
@@ -528,55 +502,6 @@ impl Host for StepHost<'_> {
                 self.platform.dom_set(&sel, &html);
                 Ok(NativeOut::Val(Value::Nil))
             }
-            // Effects suspend the flow and run on the platform: the tab
-            // never gets these capabilities (and hopd's VM ignores hop
-            // ids it didn't mint, so a forged packet can't reach them).
-            NativeId::Bash
-            | NativeId::LlmCall
-            | NativeId::LlmStream
-            | NativeId::LlmNext
-            | NativeId::LlmModels => {
-                if !matches!(self.side, SideId::Server) {
-                    return Err(format!("{} is server-side only", effect_hop(id)));
-                }
-                let vars = match id {
-                    NativeId::Bash => {
-                        let cmd = args
-                            .first()
-                            .and_then(Value::as_str)
-                            .ok_or("bash(cmd) expects a command string")?;
-                        // optional second arg: the working directory
-                        let mut fields = vec![("cmd", Value::str(cmd))];
-                        if let Some(dir) = args.get(1).and_then(Value::as_str) {
-                            if !dir.is_empty() {
-                                fields.push(("dir", Value::str(dir)));
-                            }
-                        }
-                        mk_map(fields)
-                    }
-                    NativeId::LlmCall | NativeId::LlmStream => {
-                        let req = args.first().cloned().unwrap_or(Value::Nil);
-                        if !matches!(req, Value::Map(_)) {
-                            return Err("llm expects a request map ({ messages = [...] })".into());
-                        }
-                        mk_map(vec![("req", req)])
-                    }
-                    NativeId::LlmNext => {
-                        let h = args
-                            .first()
-                            .and_then(Value::as_str)
-                            .ok_or("llm.next(handle) expects a stream handle")?;
-                        mk_map(vec![("h", Value::str(h))])
-                    }
-                    NativeId::LlmModels => mk_map(vec![]),
-                    _ => unreachable!(),
-                };
-                Ok(NativeOut::Suspend {
-                    target: Value::str(EFFECTS_ADDR),
-                    hop: effect_hop(id).to_string(),
-                    vars,
-                })
-            }
             // store natives are the platform's (server has one; a browser
             // platform answers None and this errors cleanly)
             other => match self.platform.store_native(other, args, self.prog) {
@@ -584,6 +509,20 @@ impl Host for StepHost<'_> {
                 None => Err(format!("{other:?} is not available on this side")),
             },
         }
+    }
+
+    /// Module effects suspend the flow toward "@effects": the tab never
+    /// gets these capabilities (and hopd's VM ignores hop ids it didn't
+    /// mint, so a forged packet can't reach them).
+    fn effect(&mut self, name: &str, hop: &str, vars: Value) -> Result<NativeOut, String> {
+        if !matches!(self.side, SideId::Server) {
+            return Err(format!("{name} is server-side only"));
+        }
+        Ok(NativeOut::Suspend {
+            target: Value::str(EFFECTS_ADDR),
+            hop: hop.to_string(),
+            vars,
+        })
     }
 }
 

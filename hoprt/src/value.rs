@@ -24,9 +24,6 @@ pub enum NativeId {
     SortBy,
     Floor,
     TypeOf,
-    JsonEncode,
-    JsonDecode,
-    JsonFirst,
     // pure: schema shape constructors (store.map(of), store.record(fields), …)
     ShapeMap,
     ShapeList,
@@ -53,17 +50,6 @@ pub enum NativeId {
     DomClear,
     DomFocus,
     HuiRender,
-    // effects: long-running calls that suspend the flow (server flows
-    // only). The VM parks the exec and sends a call packet to "@effects";
-    // the platform runs the effect off-thread and replies. Results are
-    // data (`{ ok = false, ... }`), not errors — a failed command is an
-    // observation, not an exception.
-    Bash,
-    LlmCall,
-    LlmStream,
-    LlmNext,
-    LlmModels,
-    Markdown,
 }
 
 #[derive(Clone)]
@@ -87,6 +73,10 @@ pub enum Value {
     /// VM-local, not data: identity equality, unordered, unserializable.
     Closure(Rc<ClosureVal>),
     Native(NativeId),
+    /// A module native (modules.rs), named for dispatch and mounting.
+    /// Like Native: VM-local, not data. Both builds compile the same
+    /// module set, so a name means the same thing on every side.
+    Lib(&'static str),
 }
 
 impl Value {
@@ -148,7 +138,7 @@ impl Value {
             Value::Map(_) => "map",
             Value::Tagged(_) => "tagged",
             Value::Closure(_) => "closure",
-            Value::Native(_) => "native",
+            Value::Native(_) | Value::Lib(_) => "native",
         }
     }
 
@@ -165,6 +155,7 @@ impl Value {
             Value::Tagged(_) => 8,
             Value::Closure(_) => 9,
             Value::Native(_) => 10,
+            Value::Lib(_) => 11,
         }
     }
 
@@ -245,6 +236,7 @@ impl Ord for Value {
                 (Rc::as_ptr(a) as usize).cmp(&(Rc::as_ptr(b) as usize))
             }
             (Value::Native(a), Value::Native(b)) => format!("{a:?}").cmp(&format!("{b:?}")),
+            (Value::Lib(a), Value::Lib(b)) => a.cmp(b),
             _ => unreachable!("kind ranks matched"),
         }
     }
@@ -331,6 +323,7 @@ impl fmt::Display for Value {
             Value::Tagged(t) => write!(f, "#{} {}", t.0, t.1),
             Value::Closure(c) => write!(f, "#closure(fn {})", c.fn_idx),
             Value::Native(id) => write!(f, "#native({id:?})"),
+            Value::Lib(name) => write!(f, "#native({name})"),
         }
     }
 }

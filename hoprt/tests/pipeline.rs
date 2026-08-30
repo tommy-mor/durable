@@ -239,6 +239,27 @@ fn json_and_type_natives() {
 }
 
 #[test]
+fn module_natives_mount_as_globals() {
+    // The battery modules (modules.rs) mount by name: bare names become
+    // globals, dotted names become fields on a module map. llm is a
+    // plain map now — the one-shot call is llm.call(req).
+    let src = r#"
+        fn go() {
+          print("json=" .. type(json) .. " first=" .. type(json.first));
+          print("llm=" .. type(llm) .. " stream=" .. type(llm.stream) .. " call=" .. type(llm.call));
+          print("bash=" .. type(bash) .. " markdown=" .. type(markdown));
+        }
+    "#;
+    let mut host = Cluster::new(&["A"], src, false).expect("cluster");
+    host.fire("A", "go");
+    host.pump();
+    let all = host.log().join("\n");
+    assert!(all.contains("json=map first=native"), "{all}");
+    assert!(all.contains("llm=map stream=native call=native"), "{all}");
+    assert!(all.contains("bash=native markdown=native"), "{all}");
+}
+
+#[test]
 fn markdown_renders_hiccup_with_escaping() {
     let src = r##"
         fn go() {
