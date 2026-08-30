@@ -95,8 +95,11 @@ that mounts into every VM's globals by name (`bash` as a global,
 pure natives run on either side and in reducers; effects are server-only
 and never in a reducer, with no hand-maintained gates. The battery set
 today: `json.encode(v)` / `json.decode(s)` (decode of unparsable input is
-`nil` — parse failure is data) / `json.first(s)`, `markdown(s)`, `bash`,
-and `llm.*`. Adding a pure native is one entry in a module; adding an
+`nil` — parse failure is data) / `json.first(s)`, `markdown(s)`,
+`str.split(s, sep)` / `str.trim(s)`, `bash`, `llm.*`, and `rand(n)` — an
+effect, not a pure native, so shuffles happen server-side and land in the
+event as a concrete permutation the reducer replays deterministically.
+Adding a pure native is one entry in a module; adding an
 effect is that plus an executor in hopd and a fake in the harness.
 Arrays are 0-based
 (hop-values.md); `for i, v in xs` runs 0..len-1; `while cond { ... }`

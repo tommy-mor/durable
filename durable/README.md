@@ -253,3 +253,18 @@ cargo run -p hoprt --bin hopd -- hoprt/hop/todo.hop
 tool, and a transcript on the tape — restart hopd mid-conversation and
 the session replays. `OPENAI_API_KEY` + `HOP_LLM_MODEL` configure the
 model; the test harness fakes it so the loop is asserted offline.
+
+`hoprt/hop/tournament.hop` is a Challonge-class bracket planner: single
+and double elimination (optional third-place match), round robin, Swiss
+(standings pairing, bye rotation, Buchholz tiebreaks), and two-stage
+groups → finals; check-in, bulk entry, shuffle, rename and forfeit
+against a live bracket, cascading unreport, reset, final placements —
+every mutation an event on the tape, every format replay-tested
+(`hoprt/tests/tournament.rs`). Login is Discord OAuth behind an
+HMAC-signed cookie (`DISCORD_CLIENT_ID`/`SECRET`/`REDIRECT_URI`,
+`HOP_SESSION_SECRET`); uids in `HOP_ADMIN_DISCORD_IDS` get the TO
+controls, everyone else spectates the same live views.
+
+```bash
+cargo run -p hoprt --bin hopd -- hoprt/hop/tournament.hop
+```
