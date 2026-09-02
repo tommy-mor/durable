@@ -26,6 +26,10 @@ extern "C" {
     /// glue.js: idiomorph merge into the live tree, innerHTML fallback.
     #[wasm_bindgen(js_name = __hopMorph)]
     fn hop_morph(sel: &str, html: &str);
+    /// glue.js: unhandled flow errors land here so they are visible
+    /// in the page, not only as a binary WS frame / console line.
+    #[wasm_bindgen(js_name = __hopError)]
+    fn hop_error(msg: &str);
 }
 
 /// The DOM-backed platform. `dom.get` reads an input's value, `dom.set`
@@ -71,7 +75,12 @@ impl Platform for WebPlatform<'_> {
     }
 
     fn print(&mut self, line: String) {
-        web_sys::console::log_1(&line.into());
+        if line.starts_with("!!") {
+            hop_error(&line);
+            web_sys::console::error_1(&line.clone().into());
+        } else {
+            web_sys::console::log_1(&line.into());
+        }
     }
 
     fn dom_get(&mut self, sel: &str) -> String {
@@ -124,6 +133,10 @@ pub struct BrowserVm {
     prog: Rc<Program>,
     vm: Option<Vm>,
     send: js_sys::Function,
+    /// Frames that arrived before the hello. A localhost handshake can
+    /// deliver the first-render cast in the same burst; dropping it
+    /// leaves the tab on "connected" with an empty #app.
+    pending: Vec<Value>,
 }
 
 #[wasm_bindgen]
@@ -134,7 +147,12 @@ impl BrowserVm {
     #[wasm_bindgen(constructor)]
     pub fn new(src: &str, send: js_sys::Function) -> Result<BrowserVm, JsValue> {
         let prog = compiler::compile(src).map_err(|e| JsValue::from_str(&e))?;
-        Ok(BrowserVm { prog: Rc::new(prog), vm: None, send })
+        Ok(BrowserVm {
+            prog: Rc::new(prog),
+            vm: None,
+            send,
+            pending: Vec::new(),
+        })
     }
 
     /// Every binary WebSocket frame lands here. The first is the hello
@@ -147,10 +165,10 @@ impl BrowserVm {
                 return;
             }
         };
-        let mut platform = WebPlatform { send: &self.send };
         if pkt.get_field("kind").as_str() == Some("hello") {
             let sid = pkt.get_field("session");
             let sid = sid.as_str().unwrap_or("?").to_string();
+            let mut platform = WebPlatform { send: &self.send };
             match Vm::new(self.prog.clone(), SideId::Browser(sid), &mut platform) {
                 Ok(mut vm) => {
                     // this tab's durable identity, minted by hopd's cookie
@@ -159,10 +177,21 @@ impl BrowserVm {
                 }
                 Err(e) => web_sys::console::error_1(&format!("vm boot: {e}").into()),
             }
+            let queued = std::mem::take(&mut self.pending);
+            if let Some(vm) = &mut self.vm {
+                let mut platform = WebPlatform { send: &self.send };
+                for p in queued {
+                    vm.receive(&mut platform, p);
+                }
+            }
             return;
         }
         if let Some(vm) = &mut self.vm {
+            let mut platform = WebPlatform { send: &self.send };
             vm.receive(&mut platform, pkt);
+        } else {
+            web_sys::console::log_1(&"hop: queued packet before hello".into());
+            self.pending.push(pkt);
         }
     }
 

@@ -297,6 +297,8 @@ impl Vm {
                             ("to", pkt.get_field("reply_to")),
                             ("err", Value::str(format!("unknown hop: {hop}"))),
                         ]));
+                    } else {
+                        platform.print(format!("!! unknown hop: {hop} (cast dropped)"));
                     }
                     return;
                 };
@@ -317,7 +319,14 @@ impl Vm {
                 let flow = pkt.get_field("flow");
                 let flow = flow.as_str().unwrap_or("?").to_string();
                 let Some(stack) = self.stacks.get_mut(&flow) else {
-                    platform.print(format!("!! reply for a flow with nothing suspended: {flow}"));
+                    let extra = if kind == "error" {
+                        format!(": {}", crate::value::coerce_str(&pkt.get_field("err")))
+                    } else {
+                        String::new()
+                    };
+                    platform.print(format!(
+                        "!! {kind} for a flow with nothing suspended: {flow}{extra}"
+                    ));
                     return;
                 };
                 let parked = stack.pop().expect("stacks never hold empty vecs");

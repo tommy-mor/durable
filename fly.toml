@@ -1,0 +1,34 @@
+app = "ember-isnt-online"
+primary_region = "ord"
+
+[build]
+  dockerfile = "deploy/ember/Dockerfile"
+
+[env]
+  HOP_WS_PATH = "/ws"
+  HOP_DATA_DIR = "/data/beings/hop-data"
+  OPENAI_BASE_URL = "https://openrouter.ai/api/v1"
+
+[[services]]
+  internal_port = 3000
+  protocol = "tcp"
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [[services.ports]]
+    handlers = ["http"]
+    port = 80
+
+  [[services.ports]]
+    handlers = ["tls", "http"]
+    port = 443
+
+[[vm]]
+  memory = "2gb"
+  cpu_kind = "shared"
+  cpus = 1
+
+[[mounts]]
+  source = "beings_data"
+  destination = "/data/beings"

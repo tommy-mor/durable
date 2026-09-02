@@ -212,10 +212,11 @@ fn run_reduce(
     tx: &mut Tx,
     event: &serde_json::Value,
 ) -> Result<(), String> {
-    // the event carries its own seq — there is no tx handle in hop
+    // the event carries its own seq and tape time — there is no tx handle in hop
     let ev = from_json(event);
     if matches!(ev, Value::Map(_)) {
         ev.set_field("seq", Value::Int(tx.seq() as i64))?;
+        ev.set_field("ts_ms", Value::Int(tx.meta().ts_ms as i64))?;
     }
 
     let mut host = ReduceHost {

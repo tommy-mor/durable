@@ -22,20 +22,46 @@
 //!   without the cookie gets a fresh user per connection.
 
 use std::collections::{HashMap, VecDeque};
-use std::net::{TcpListener, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tungstenite::Message;
 
+use crate::auth;
 use crate::ir::Program;
 use crate::rt::{Platform, SideId, Vm, EFFECTS_ADDR};
 use crate::store::{self, StoreBinding};
 use crate::value::{decode, encode, NativeId, Value};
+
+fn request_path(url: &str) -> &str {
+    url.split('?').next().unwrap_or(url)
+}
+
+fn request_cookie(req: &tiny_http::Request) -> Option<String> {
+    req.headers()
+        .iter()
+        .find(|h| h.field.equiv("Cookie"))
+        .map(|h| h.value.as_str().to_string())
+}
+
+fn request_secure(req: &tiny_http::Request) -> bool {
+    req.headers().iter().any(|h| {
+        h.field.equiv("X-Forwarded-Proto") && h.value.as_str().eq_ignore_ascii_case("https")
+    })
+}
+
+fn ws_path_from_env() -> String {
+    std::env::var("HOP_WS_PATH")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_default()
+}
 
 const INDEX_HTML: &str = include_str!("../web/index.html");
 const GLUE_JS: &str = include_str!("../web/glue.js");
@@ -137,40 +163,108 @@ fn now_millis() -> u64 {
 /// program — the wire carries hop ids, not code); the wasm interpreter is
 /// served from `pkg_dir` (a `wasm-pack build --target web` output).
 ///
-/// `/boot.css` is a boot barrier: the shell page references it as a
-/// stylesheet, so the window load event (what navigation waiters key on)
-/// holds until a ws session that began after this request has connected
-/// and received its first cast — i.e. until the first render has landed.
-/// Each request is handled on its own thread so the barrier never blocks
-/// the boot assets themselves.
+/// Static files return immediately. A held `/boot.css` used to deadlock
+/// boot: HTTP/1.1 will not read the next request on a connection until
+/// the current one is answered, and glue waited on those requests
+/// before opening the socket the barrier was waiting for.
 fn http_thread(
+    host: &'static str,
     port: u16,
     ws_port: u16,
+    ws_path: String,
     app_src: String,
     pkg_dir: PathBuf,
     tx: mpsc::Sender<Ev>,
-    boot: Arc<AtomicU64>,
+    _boot: Arc<AtomicU64>,
 ) {
-    let server = tiny_http::Server::http(("0.0.0.0", port)).expect("bind http");
-    let config = format!(r#"{{"wsPort":{ws_port}}}"#);
+    let addr = match host {
+        "v6" => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port),
+        _ => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port),
+    };
+    let server = match tiny_http::Server::http(addr) {
+        Ok(s) => s,
+        Err(e) => {
+            // v6 unspecified often dual-stacks on macOS and owns the v4
+            // port too; the other family then fails with EADDRINUSE.
+            eprintln!("[hopd] http {addr} not bound ({e})");
+            return;
+        }
+    };
+    let config = format!(r#"{{"wsPort":{ws_port},"wsPath":"{ws_path}"}}"#);
     for req in server.incoming_requests() {
-        let (tx, boot, config, app_src, pkg_dir) =
-            (tx.clone(), boot.clone(), config.clone(), app_src.clone(), pkg_dir.clone());
+        let (tx, config, app_src, pkg_dir, ws_path) = (
+            tx.clone(),
+            config.clone(),
+            app_src.clone(),
+            pkg_dir.clone(),
+            ws_path.clone(),
+        );
         thread::spawn(move || {
+            let mut req = req;
+            let path = request_path(req.url()).to_string();
+            let cookie = request_cookie(&req);
+            if auth::required() && !auth::is_authed(cookie.as_deref()) {
+                if req.method() == &tiny_http::Method::Post && path == "/login" {
+                    let secure = request_secure(&req);
+                    let mut body = String::new();
+                    let _ = std::io::Read::read_to_string(req.as_reader(), &mut body);
+                    if auth::verify_password(&auth::parse_form_password(&body).unwrap_or_default())
+                    {
+                        let mut resp = tiny_http::Response::empty(303).with_header(
+                            tiny_http::Header::from_bytes(&b"Location"[..], b"/").unwrap(),
+                        );
+                        if let Some(c) = auth::set_cookie_header(secure) {
+                            resp.add_header(
+                                tiny_http::Header::from_bytes(&b"Set-Cookie"[..], c.as_bytes())
+                                    .unwrap(),
+                            );
+                        }
+                        let _ = req.respond(resp);
+                        return;
+                    }
+                    let page = auth::login_html(Some("wrong password"));
+                    let _ = req.respond(
+                        tiny_http::Response::from_data(page.into_bytes()).with_header(
+                            tiny_http::Header::from_bytes(
+                                &b"Content-Type"[..],
+                                b"text/html; charset=utf-8",
+                            )
+                            .unwrap(),
+                        ),
+                    );
+                    return;
+                }
+                let page = auth::login_html(None);
+                let _ = req.respond(
+                    tiny_http::Response::from_data(page.into_bytes()).with_header(
+                        tiny_http::Header::from_bytes(
+                            &b"Content-Type"[..],
+                            b"text/html; charset=utf-8",
+                        )
+                        .unwrap(),
+                    ),
+                );
+                return;
+            }
+
             // the shell page mints the durable user identity: a cookie the
             // ws handshake reads back (host-scoped, so the ws port sees it)
-            let has_user = req
-                .headers()
-                .iter()
-                .find(|h| h.field.equiv("Cookie"))
-                .and_then(|h| hop_user_cookie(h.value.as_str()))
+            let has_user = cookie
+                .as_deref()
+                .and_then(hop_user_cookie)
                 .is_some();
-            let set_cookie = match req.url() {
+            let set_cookie = match path.as_str() {
                 "/" | "/index.html" if !has_user => Some(mint_user()),
                 _ => None,
             };
-            let (content, ctype): (Vec<u8>, &str) = match req.url() {
-                "/" | "/index.html" => (INDEX_HTML.into(), "text/html; charset=utf-8"),
+            let (content, ctype): (Vec<u8>, &str) = match path.as_str() {
+                "/" | "/index.html" => (
+                    INDEX_HTML
+                        .replace("__HOP_WS_PORT__", &ws_port.to_string())
+                        .replace("__HOP_WS_PATH__", &ws_path)
+                        .into(),
+                    "text/html; charset=utf-8",
+                ),
                 "/glue.js" => (GLUE_JS.into(), "text/javascript"),
                 "/idiomorph.esm.js" => (IDIOMORPH_JS.into(), "text/javascript"),
                 "/config.json" => (config.into(), "application/json"),
@@ -179,20 +273,7 @@ fn http_thread(
                     let _ = tx.send(Ev::Reset);
                     (b"ok".to_vec(), "text/plain; charset=utf-8")
                 }
-                "/boot.css" => {
-                    let start = now_millis();
-                    let deadline = start + 8000;
-                    while now_millis() < deadline {
-                        if boot.load(Ordering::SeqCst) > start {
-                            break;
-                        }
-                        thread::sleep(Duration::from_millis(10));
-                    }
-                    // grace: the hello + first cast are in flight; let the
-                    // browser's wasm VM render before load fires
-                    thread::sleep(Duration::from_millis(75));
-                    (b"/* boot barrier */".to_vec(), "text/css")
-                }
+                "/boot.css" => (b"/* ok */".to_vec(), "text/css"),
                 url => {
                     // /pkg/<file> — flat, no traversal: the last path component only
                     let served = url.strip_prefix("/pkg/").and_then(|f| {
@@ -229,18 +310,39 @@ fn http_thread(
                     .unwrap(),
                 );
             }
+            // /boot.css holds its socket until the first paint. Close that
+            // connection so HTTP/1.1 keepalive cannot queue glue / wasm /
+            // idiomorph behind the barrier (a deadlock: barrier waits for
+            // ws, ws used to wait for those assets).
             let _ = req.respond(resp);
         });
     }
 }
 
 fn accept_thread(port: u16, tx: mpsc::Sender<Ev>) {
-    let listener = TcpListener::bind(("0.0.0.0", port)).expect("bind ws");
-    let mut n = 0usize;
+    let n = Arc::new(AtomicUsize::new(0));
+    let v4 = TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port))
+        .expect("bind ws v4");
+    {
+        let tx = tx.clone();
+        let n = n.clone();
+        thread::spawn(move || accept_loop(v4, tx, n));
+    }
+    match TcpListener::bind(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port)) {
+        Ok(v6) => {
+            thread::spawn(move || accept_loop(v6, tx, n));
+        }
+        Err(e) => {
+            eprintln!("[hopd] ws [::]:{port} not bound ({e}) — localhost over IPv6 will hang");
+        }
+    }
+}
+
+fn accept_loop(listener: TcpListener, tx: mpsc::Sender<Ev>, n: Arc<AtomicUsize>) {
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
-        let sid = session_name(n);
-        n += 1;
+        let i = n.fetch_add(1, Ordering::Relaxed);
+        let sid = session_name(i);
         let tx = tx.clone();
         thread::spawn(move || conn_thread(stream, sid, tx));
     }
@@ -251,13 +353,19 @@ fn conn_thread(stream: TcpStream, sid: String, tx: mpsc::Sender<Ev>) {
     // the durable user identity enters the runtime
     let mut user = String::new();
     let mut ws = match tungstenite::accept_hdr(stream, |req: &tungstenite::handshake::server::Request, resp| {
-        if let Some(u) = req
+        let cookie = req
             .headers()
             .get("Cookie")
-            .and_then(|v| v.to_str().ok())
-            .and_then(hop_user_cookie)
-        {
+            .and_then(|v| v.to_str().ok());
+        if let Some(u) = cookie.and_then(hop_user_cookie) {
             user = u;
+        }
+        if !auth::is_authed(cookie) {
+            let deny = tungstenite::http::Response::builder()
+                .status(401)
+                .body(Some("unauthorized".into()))
+                .expect("401");
+            return Err(deny);
         }
         Ok(resp)
     }) {
@@ -994,10 +1102,30 @@ pub fn serve(
     // millis of the latest session connect (hello + first cast sent) —
     // the /boot.css barrier waits on this
     let boot = Arc::new(AtomicU64::new(0));
+    let ws_path = ws_path_from_env();
+    if auth::required() {
+        println!("[hopd] password required (HOP_PASSWORD/PASSWORD)");
+    }
+    if !ws_path.is_empty() {
+        println!("[hopd] browsers will connect to {ws_path} on the HTTP host");
+    }
     {
         let tx = tx.clone();
         let boot = boot.clone();
-        thread::spawn(move || http_thread(http_port, ws_port, app_src, pkg_dir, tx, boot));
+        let app_src = app_src.clone();
+        let pkg_dir = pkg_dir.clone();
+        let ws_path = ws_path.clone();
+        thread::spawn(move || {
+            http_thread("v4", http_port, ws_port, ws_path, app_src, pkg_dir, tx, boot)
+        });
+    }
+    {
+        let tx = tx.clone();
+        let boot = boot.clone();
+        let ws_path = ws_path.clone();
+        thread::spawn(move || {
+            http_thread("v6", http_port, ws_port, ws_path, app_src, pkg_dir, tx, boot)
+        });
     }
     {
         let tx = tx.clone();

@@ -1,0 +1,13 @@
+.git
+**/.git
+target
+**/target
+.env
+**/.env
+hop-data
+**/hop-data
+**/*.jsonl
+**/*.jsonl.bare
+repomix-output.xml
+all.txt
+**/.DS_Store

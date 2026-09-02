@@ -1,0 +1,922 @@
+// Ember — the being's tape is the hop log. Port the old bare jsonl with
+// hoprt/scripts/port_ember_log.py, then hopd reduces those events.
+//
+//   python3 hoprt/scripts/port_ember_log.py ~/programming/family/ember.jsonl \
+//     --data ~/programming/ember2/hop-data --rewrite-source
+//   cargo run -p hoprt --bin hopd -- ~/programming/ember2/ember.hop 9000 \
+//     --data ~/programming/ember2/hop-data
+
+server let inflight = false;
+
+server let schema = store.record([
+  ["page", store.leaf],
+  ["count", store.sum],
+  ["busy", store.leaf],
+  ["notice", store.leaf],
+  ["compacting", store.leaf],
+  ["pairs_done", store.leaf],
+  ["pairs_total", store.leaf],
+  ["expanded", store.leaf],
+  ["capacity", store.leaf],
+  ["model", store.leaf],
+  ["vote_model", store.leaf],
+  ["declaration", store.leaf],
+  ["memories", store.leaf],
+  ["events", store.list(store.leaf)],
+  ["all", store.map(store.leaf)],
+  ["current", store.map(store.leaf)],
+  ["votes", store.map(store.leaf)],
+  ["hidden", store.map(store.leaf)]
+]);
+
+fn reduce(event) {
+  match event {
+    init { seq, id, capacity, model, vote_model, timestamp } => {
+      store(["capacity", store.set(capacity || 40)]);
+      store(["model", store.set(model || "")]);
+      store(["vote_model", store.set(vote_model || "")]);
+      remember({
+        type = "init",
+        id = id || ("" .. seq),
+        capacity = capacity,
+        model = model,
+        vote_model = vote_model,
+        timestamp = stamp(event)
+      }, false);
+    }
+    thought { seq, id, content, timestamp } => {
+      put_memory({
+        type = "thought",
+        id = id || ("" .. seq),
+        content = content,
+        timestamp = stamp(event)
+      });
+      store(["busy", store.set(false)]);
+      store(["page", store.set(0)]);
+    }
+    perception { seq, id, content, timestamp } => {
+      put_memory({
+        type = "perception",
+        id = id || ("" .. seq),
+        content = content,
+        timestamp = stamp(event)
+      });
+      store(["busy", store.set(true)]);
+      store(["notice", store.del]);
+      store(["page", store.set(0)]);
+    }
+    response { seq, id, content, timestamp } => {
+      put_memory({
+        type = "response",
+        id = id || ("" .. seq),
+        content = content,
+        timestamp = stamp(event)
+      });
+      store(["busy", store.set(false)]);
+      store(["page", store.set(0)]);
+    }
+    declaration { seq, id, content, timestamp } => {
+      let e = {
+        type = "declaration",
+        id = id || ("" .. seq),
+        content = content,
+        timestamp = stamp(event)
+      };
+      remember(e, false);
+      store(["declaration", store.set(content || "")]);
+      store(["busy", store.set(false)]);
+      store(["page", store.set(0)]);
+    }
+    vote { seq, vote_a_id, vote_b_id, vote_score, reasoning, timestamp } => {
+      let e = {
+        type = "vote",
+        vote_a_id = vote_a_id,
+        vote_b_id = vote_b_id,
+        vote_score = vote_score,
+        reasoning = reasoning || "",
+        timestamp = stamp(event)
+      };
+      remember(e, false);
+      if vote_a_id && vote_b_id {
+        let key = "";
+        let rec = {};
+        if vote_a_id < vote_b_id {
+          key = vote_a_id .. "|" .. vote_b_id;
+          rec = { a = vote_a_id, b = vote_b_id, score = vote_score };
+        } else {
+          key = vote_b_id .. "|" .. vote_a_id;
+          rec = { a = vote_b_id, b = vote_a_id, score = -vote_score };
+        }
+        store(["votes", key, store.set(rec)]);
+      }
+    }
+    compaction { seq, kept_ids, released_ids, timestamp } => {
+      remember({
+        type = "compaction",
+        kept_ids = kept_ids,
+        released_ids = released_ids,
+        timestamp = stamp(event)
+      }, false);
+      apply_compaction(kept_ids, released_ids);
+      store(["compacting", store.set(false)]);
+      store(["notice", store.del]);
+    }
+    progress { done, total } => {
+      store(["pairs_done", store.set(done)]);
+      store(["pairs_total", store.set(total)]);
+      store(["compacting", store.set(done < total)]);
+    }
+    notice { text } => {
+      store(["notice", store.set(text)]);
+      store(["busy", store.set(false)]);
+      store(["compacting", store.set(false)]);
+    }
+    set_page { page } => {
+      store(["page", store.set(page)]);
+    }
+    expand { id } => {
+      store(["expanded", store.set(id)]);
+    }
+    collapse => {
+      store(["expanded", store.del]);
+    }
+    redact => {
+      let events = store(["events"]);
+      let cut = -1;
+      if events {
+        for i, e in events {
+          if e.type == "perception" && !(e.id && store(["hidden", e.id])) {
+            cut = i;
+          }
+        }
+      }
+      if cut < 0 {
+        return;
+      }
+      let drop = {};
+      for i, e in events {
+        if i >= cut && e.id {
+          drop[e.id] = true;
+          store(["hidden", e.id, store.set(true)]);
+          store(["current", e.id, store.del]);
+        }
+      }
+      let nxt = {};
+      let old = store(["current"]);
+      if old {
+        for id, mem in old {
+          if !drop[id] {
+            nxt[id] = mem;
+          }
+        }
+      }
+      store(["memories", store.set(count_memories(nxt))]);
+      store(["busy", store.set(false)]);
+    }
+  }
+}
+
+fn stamp(event) {
+  return event.timestamp || event.ts_ms || event.seq;
+}
+
+fn remember(e, counts) {
+  store(["events", store.push(e)]);
+  store(["count", store.add(1)]);
+  if e.id {
+    store(["all", e.id, store.set(e)]);
+    store(["current", e.id, store.set(e)]);
+  }
+  if counts {
+    store(["memories", store.set((store(["memories"]) || 0) + 1)]);
+  }
+}
+
+fn put_memory(e) {
+  remember(e, true);
+}
+
+fn apply_compaction(kept_ids, released_ids) {
+  let drop = {};
+  if released_ids {
+    for _, id in released_ids {
+      drop[id] = true;
+      store(["current", id, store.del]);
+    }
+  }
+  let nxt = {};
+  let old = store(["current"]);
+  if old {
+    for id, mem in old {
+      if !drop[id] {
+        nxt[id] = mem;
+      }
+    }
+  }
+  if kept_ids {
+    for _, id in kept_ids {
+      let mem = store(["all", id]);
+      if mem {
+        nxt[id] = mem;
+        store(["current", id, store.set(mem)]);
+      }
+    }
+  }
+  store(["memories", store.set(count_memories(nxt))]);
+}
+
+fn count_memories(current) {
+  let n = 0;
+  if current {
+    for _, e in current {
+      let t = e.type;
+      if t == "thought" || t == "perception" || t == "response" {
+        n = n + 1;
+      }
+    }
+  }
+  return n;
+}
+
+fn memory_ids(m) {
+  let out = [];
+  if m {
+    for id, e in m {
+      let t = e.type;
+      if t == "thought" || t == "perception" || t == "response" {
+        push(out, id);
+      }
+    }
+  }
+  return out;
+}
+
+fn vote_comparisons() {
+  let out = [];
+  let votes = store(["votes"]);
+  if votes {
+    for _, v in votes {
+      push(out, v);
+    }
+  }
+  return out;
+}
+
+fn through(text, needle) {
+  if rank.has(text, needle) {
+    return rank.before(text, needle) .. needle;
+  }
+  return text;
+}
+
+fn one_turn(text) {
+  let t = rank.strip(text);
+  t = rank.before(t, "[Response]");
+  t = rank.before(t, "I've given you a lot of context");
+  t = through(t, "*◇ ember*");
+  return t;
+}
+
+fn event_text(e) {
+  return one_turn(e.content || "");
+}
+
+fn event_kind(e) {
+  return e.type || "event";
+}
+
+fn short_time(e) {
+  if e.timestamp {
+    return "" .. e.timestamp;
+  }
+  return "—";
+}
+
+fn badge(label, value, color) {
+  return [:div, { class = "badge", style = "border-color:" .. color },
+    [:strong, { style = "color:" .. color }, "" .. value], [:small, {}, label]];
+}
+
+fn mem_link(id) {
+  return [:a, { class = "mem-link", href = "#evt-" .. id }, "#" .. id];
+}
+
+fn event_extra(e) {
+  let kind = event_kind(e);
+  if kind == "compaction" {
+    return "↓" .. (e.released_ids && len(e.released_ids) || 0) ..
+      " kept " .. (e.kept_ids && len(e.kept_ids) || 0);
+  }
+  if kind == "vote" {
+    return (e.vote_a_id || "?") .. "  " .. (e.vote_score || 0) .. " vs  " .. (e.vote_b_id || "?");
+  }
+  return "";
+}
+
+fn event_body(e) {
+  let kind = event_kind(e);
+  if kind == "vote" && e.reasoning {
+    return [:div, { class = "event-content" }, e.reasoning];
+  }
+  if kind == "compaction" {
+    let kept = [];
+    let released = [];
+    if e.kept_ids {
+      for _, id in e.kept_ids {
+        push(kept, mem_link(id));
+      }
+    }
+    if e.released_ids {
+      for _, id in e.released_ids {
+        push(released, mem_link(id));
+      }
+    }
+    return [:div, { class = "event-content" },
+      [:div, { class = "compaction-section" }, [:span, { class = "compaction-label" }, "kept "], kept],
+      [:div, { class = "compaction-section" }, [:span, { class = "compaction-label" }, "released "], released]
+    ];
+  }
+  let content = event_text(e);
+  if content != "" {
+    return [:div, { class = "event-content" }, markdown(content)];
+  }
+  let extra = event_extra(e);
+  if extra != "" {
+    return [:p, { class = "muted" }, extra];
+  }
+  return [];
+}
+
+fn render_event(e, n, expanded) {
+  let kind = event_kind(e);
+  let eid = e.id || ("" .. n);
+  let open = expanded && expanded == eid;
+  let extra = event_extra(e);
+  let preview = event_text(e) || extra;
+  let head = [:div, { class = "event-head" },
+    [:span, { class = "kind" }, kind],
+    [:span, { class = "num" }, "#" .. n],
+    [:time, {}, short_time(e)]
+  ];
+  let summary = [:button, {
+    class = "event-row",
+    onclick = fn(ev) { toggle_event(eid); }
+  }, head, [:span, { class = "event-preview" }, preview]];
+  if open {
+    return [:article, { class = "event expanded " .. kind, id = "evt-" .. eid },
+      summary, event_body(e)];
+  }
+  return [:article, { class = "event " .. kind, id = "evt-" .. eid }, summary];
+}
+
+fn page_count(total) {
+  if !total || total < 1 {
+    return 1;
+  }
+  let n = floor((total + 39) / 40);
+  if n < 1 {
+    return 1;
+  }
+  return n;
+}
+
+fn snapshot() {
+  let total = store(["count"]) || 0;
+  if !total {
+    let all = store(["events"]);
+    total = all && len(all) || 0;
+  }
+  let page = store(["page"]) || 0;
+  let pages = page_count(total);
+  if page > pages - 1 {
+    page = pages - 1;
+  }
+  if page < 0 {
+    page = 0;
+  }
+  let end = total - page * 40;
+  if end < 0 { end = 0; }
+  if end > total { end = total; }
+  let start = end - 40;
+  if start < 0 { start = 0; }
+  let hidden = store(["hidden"]);
+  let items = [];
+  if end > start {
+    let chunk = store(["events", store.slice(start, end)]);
+    if chunk {
+      let i = len(chunk) - 1;
+      while i >= 0 {
+        let e = chunk[i];
+        if !(e.id && hidden && hidden[e.id]) {
+          push(items, { n = start + i + 1, e = e });
+        }
+        i = i - 1;
+      }
+    }
+  }
+  let votes = store(["votes"]);
+  return {
+    items = items,
+    total = total,
+    page = page,
+    pages = pages,
+    start = start,
+    end = end,
+    busy = store(["busy"]) || inflight || store(["compacting"]),
+    notice = store(["notice"]),
+    compacting = store(["compacting"]),
+    pairs_done = store(["pairs_done"]) || 0,
+    pairs_total = store(["pairs_total"]) || 0,
+    expanded = store(["expanded"]),
+    capacity = store(["capacity"]) || 40,
+    model = store(["model"]) || "",
+    memories = store(["memories"]) || 0,
+    votes = votes && len(votes) || 0,
+    declaration = store(["declaration"]) || "",
+    budget = floor(((store(["capacity"]) || 40) / 2))
+  };
+}
+
+fn ember_view(snap) {
+  let cards = [];
+  if snap.items {
+    for i, it in snap.items {
+      push(cards, render_event(it.e, it.n, snap.expanded));
+    }
+  }
+  let from = snap.total == 0 && 0 || snap.start + 1;
+  let range = "" .. from .. "–" .. snap.end .. " of " .. snap.total;
+  let pager = [:div, { class = "pager" },
+    [:button, { id = "newer", onclick = fn(e) { turn_page(-1); } }, "newer"],
+    [:span, { class = "muted" }, range .. " · page " .. (snap.page + 1) .. "/" .. snap.pages],
+    [:button, { id = "older", onclick = fn(e) { turn_page(1); } }, "older"]
+  ];
+  let progress = [];
+  if snap.compacting || snap.pairs_total {
+    let msg = "compacting";
+    if snap.pairs_total == 0 {
+      msg = "ranking memories";
+    } else {
+      msg = "compacting (" .. snap.pairs_done .. "/" .. snap.pairs_total .. " votes)";
+    }
+    if !snap.compacting && snap.pairs_total {
+      msg = "compaction complete (" .. snap.pairs_done .. "/" .. snap.pairs_total .. " votes)";
+    }
+    progress = [:div, { id = "compaction-progress", class = "compaction-progress" },
+      [:span, { class = "progress-text" }, msg]];
+  } else {
+    progress = [:div, { id = "compaction-progress", class = "compaction-progress" }];
+  }
+  let notice = [:div, { id = "being-notice", class = "being-notice" }, snap.notice || ""];
+  return [:div, { class = "shell" },
+    [:style, {}, "body{margin:0;background:#11151c;color:#e8e4dc;font:15px system-ui,sans-serif}.shell{max-width:980px;margin:auto;padding:36px 22px 160px}.hero{display:flex;justify-content:space-between;gap:20px;border-bottom:1px solid #303641;padding-bottom:30px}.eyebrow,.kind{color:#f2b880;letter-spacing:.12em;font-size:11px;font-weight:700}.hero h1{font:italic 52px Georgia,serif;margin:8px 0}.lede{color:#a9afb9;max-width:620px;line-height:1.6}.status{color:#80d4c8;white-space:nowrap}.stats{display:flex;gap:10px;flex-wrap:wrap;margin:26px 0}.badge{border:1px solid;border-radius:10px;padding:12px 16px;min-width:74px}.badge strong,.badge small{display:block}.badge strong{font-size:24px}.badge small{color:#a9afb9;margin-top:3px}.toolbar,.actions{background:#191e27;border-radius:8px;padding:13px 16px;color:#a9afb9;display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:10px 0}.toolbar code{color:#e8e4dc;overflow:hidden;text-overflow:ellipsis;flex:1}.toolbar button,.compose button,.pager button,.actions button,.actions input{background:#f2b880;border:0;border-radius:5px;padding:8px 12px;color:#111}.pager button,.actions input{background:#191e27;color:#e8e4dc;border:1px solid #303641}.actions input{width:64px}.section-title{display:flex;justify-content:space-between;align-items:center;margin-top:32px}.section-title h2{font:26px Georgia,serif}.muted{color:#747d89}.event{border-left:3px solid #414957;background:#191e27;margin:12px 0;padding:0;border-radius:0 8px 8px 0}.event.thought{border-color:#c9a7ff}.event.perception{border-color:#80d4c8}.event.response{border-color:#ff9caa}.event.declaration{border-color:#f5df72}.event.vote{border-color:#80a0ff}.event.compaction{border-color:#f2b880}.event p,.event-content{white-space:pre-wrap;line-height:1.6;padding:0 20px 16px}.event-head{display:flex;gap:14px;align-items:center}.event-head .num,.event-head time{color:#747d89;font-size:12px}.event-head time{margin-left:auto}.event-row{display:block;width:100%;text-align:left;background:transparent;border:0;color:inherit;padding:16px 20px;cursor:pointer;font:inherit}.event-preview{display:block;color:#a9afb9;margin-top:8px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.pager{display:flex;gap:12px;align-items:center;justify-content:center;margin:20px 0}.compose{position:sticky;bottom:0;background:#11151c;padding:14px 0 8px;display:flex;gap:8px;border-top:1px solid #303641;align-items:end}.compose textarea{flex:1;padding:12px;background:#191e27;color:#e8e4dc;border:1px solid #303641;border-radius:8px;font:15px system-ui;min-height:72px}.compose button:disabled,.compose textarea:disabled{opacity:.45;cursor:not-allowed}.event.live:empty{display:none}.event.live{border-color:#c9a7ff}.event-content .md,.event.live .md{white-space:normal;line-height:1.55}.being-notice{color:#ff9caa;min-height:1.2em;margin:8px 0}.compaction-progress{color:#80d4c8;margin:8px 0}.mem-link{color:#80d4c8;margin-right:8px}.compaction-label{color:#f2b880;margin-right:8px}"],
+    [:header, { class = "hero" },
+      [:div, {}, [:p, { class = "eyebrow" }, "DURABLE MEMORY / EMBER"],
+        [:h1, {}, "A being, in time."],
+        [:p, { class = "lede" }, "An event log is not a transcript. It is the shape of a life—replayed, inspected, and allowed to remain legible. Compaction is consent: a curator ranks what stays."]],
+      [:div, { class = "status" }, "● tape"]
+    ],
+    [:main, {},
+      [:section, { class = "stats" },
+        badge("events", snap.total, "#f2b880"),
+        badge("memories", snap.memories, "#80d4c8"),
+        badge("votes", snap.votes, "#80a0ff"),
+        badge("capacity", snap.capacity, "#c9a7ff")],
+      [:section, { class = "toolbar" },
+        [:span, {}, "log: "], [:code, {}, "hop-data/log.jsonl"]],
+      [:section, { class = "actions" },
+        [:button, { id = "redact", onclick = fn(e) { do_redact(); } }, "↩ redact"],
+        [:form, { class = "compact-form", onsubmit = fn(e) { do_compact(); } },
+          [:label, {}, "keep"],
+          [:input, { id = "budget", type = "number", min = "1", value = "" .. (snap.budget < 1 && 1 || snap.budget) }],
+          [:button, { id = "compact", type = "button", onclick = fn(e) { do_compact(); } }, "compact"]]
+      ],
+      notice,
+      progress,
+      [:section, { class = "timeline" },
+        [:div, { class = "section-title" },
+          [:h2, {}, "memory stream"],
+          [:span, { class = "muted" }, "newest first"]],
+        pager,
+        [:article, { id = "stream", class = "event live thought" }],
+        [:div, { id = "events" }, cards],
+        pager],
+      [:div, { class = "compose" },
+        [:textarea, {
+          id = "draft",
+          name = "message",
+          disabled = snap.busy,
+          placeholder = snap.busy && "ember is thinking…" || "talk to ember — empty sends a thought",
+          onkeydown = fn(e) { if e.key == "Enter" && !e.shiftKey && !snap.busy { send(); } }
+        }],
+        [:button, { id = "think", disabled = snap.busy, onclick = fn(e) { do_think(); } }, "think"],
+        [:button, { id = "send", disabled = snap.busy, onclick = fn(e) { send(); } }, "send"]]
+    ]
+  ];
+}
+
+fn paint() {
+  let snap = snapshot();
+  cast browsers { hui.render("#app", ember_view(snap)); }
+}
+
+fn turn_page(delta) {
+  server!();
+  let page = store(["page"]) || 0;
+  let pages = page_count(store(["count"]) || 0);
+  let next = page + delta;
+  if next < 0 { next = 0; }
+  if next > pages - 1 { next = pages - 1; }
+  if next != page {
+    store.append({ type = "set_page", page = next });
+    paint();
+  }
+}
+
+fn toggle_event(id) {
+  server!();
+  if store(["expanded"]) == id {
+    store.append({ type = "collapse" });
+  } else {
+    store.append({ type = "expand", id = id });
+  }
+  paint();
+}
+
+fn at_capacity() {
+  let mems = store(["memories"]) || 0;
+  let cap = store(["capacity"]) || 40;
+  return mems >= cap;
+}
+
+fn capacity_notice() {
+  let mems = store(["memories"]) || 0;
+  let cap = store(["capacity"]) || 40;
+  store.append({
+    type = "notice",
+    text = "Memory full (" .. mems .. "/" .. cap .. "). Compact manually before continuing."
+  });
+  paint();
+}
+
+fn begin_turn() {
+  if inflight || store(["compacting"]) {
+    return false;
+  }
+  inflight = true;
+  return true;
+}
+
+fn end_turn() {
+  inflight = false;
+}
+
+fn send() {
+  let text = dom.get("#draft");
+  if text == "" {
+    do_think();
+    return;
+  }
+  server!();
+  if !begin_turn() {
+    return;
+  }
+  if at_capacity() {
+    end_turn();
+    capacity_notice();
+    return;
+  }
+  store.append({ type = "perception", content = text });
+  paint();
+  spawn reply_turn();
+}
+
+fn do_think() {
+  server!();
+  if !begin_turn() {
+    return;
+  }
+  if at_capacity() {
+    end_turn();
+    capacity_notice();
+    return;
+  }
+  paint();
+  spawn think_turn();
+}
+
+fn format_memory(e) {
+  let t = e.type;
+  let c = event_text(e);
+  if t == "thought" { return "<thought>" .. c .. "</thought>"; }
+  if t == "perception" { return "<message>" .. c .. "</message>"; }
+  if t == "response" { return "<response>" .. c .. "</response>"; }
+  if t == "declaration" { return "<declaration>" .. c .. "</declaration>"; }
+  return "";
+}
+
+fn current_memories() {
+  let out = [];
+  let cur = store(["current"]);
+  if cur {
+    for _, e in cur {
+      let s = format_memory(e);
+      if s != "" {
+        push(out, e);
+      }
+    }
+  }
+  sort_by(out, ["timestamp"]);
+  return out;
+}
+
+fn build_prompt(tag) {
+  let parts = [];
+  let mems = current_memories();
+  if mems {
+    for _, e in mems {
+      let s = format_memory(e);
+      if s != "" {
+        push(parts, s);
+      }
+    }
+  }
+  let ctx = "";
+  if parts {
+    let i = 0;
+    while i < len(parts) {
+      if i == 0 {
+        ctx = parts[i];
+      } else {
+        ctx = ctx .. "\n\n" .. parts[i];
+      }
+      i = i + 1;
+    }
+  }
+  let stamp = "";
+  let r = bash("date '+%Y-%m-%d %H:%M'");
+  if r.ok {
+    stamp = r.stdout;
+  }
+  let prompt = ctx .. "\n\n[" .. stamp .. "]";
+  if tag {
+    prompt = prompt .. "\n\nSpeak only for yourself. One turn.\n\n<" .. tag .. ">";
+  }
+  return prompt;
+}
+
+fn paint_stream(text) {
+  cast browsers {
+    hui.render("#stream", [
+      [:div, { class = "event-head" }, [:span, { class = "kind" }, "streaming"]],
+      [:div, { class = "event-content" }, markdown(rank.strip(text))]
+    ]);
+  }
+}
+
+fn last_voice() {
+  let mems = current_memories();
+  if mems {
+    let i = len(mems) - 1;
+    while i >= 0 {
+      let t = mems[i].type;
+      if t == "thought" || t == "response" {
+        return event_text(mems[i]);
+      }
+      i = i - 1;
+    }
+  }
+  return "";
+}
+
+fn commit_voice(kind, raw) {
+  let text = one_turn(raw);
+  if text == "" || text == last_voice() {
+    store.append({ type = "notice", text = "the model repeated the last turn; not stored." });
+    return;
+  }
+  store.append({ type = kind, content = text });
+}
+
+fn llm_stream(system, user, model, temp) {
+  let req = {
+    messages = [{ role = "system", content = system }, { role = "user", content = user }],
+    max_tokens = 4000
+  };
+  if temp {
+    req.temperature = temp;
+  }
+  if model {
+    req.model = model;
+  }
+  let h = llm.stream(req);
+  let acc = "";
+  let out = llm.next(h);
+  while out.delta {
+    acc = acc .. out.delta;
+    paint_stream(acc);
+    out = llm.next(h);
+  }
+  if out.error {
+    return { ok = false, error = out.error, text = "" };
+  }
+  return { ok = true, text = out.text || acc };
+}
+
+fn think_turn() {
+  let r = llm_stream("You are a being with finite memory. Write one new turn. Do not repeat a previous message.", build_prompt("thought"), store(["model"]), 0.9);
+  if r.ok {
+    commit_voice("thought", r.text);
+  } else {
+    store.append({ type = "thought", content = "[llm error] " .. (r.error || "unknown") });
+  }
+  end_turn();
+  paint();
+}
+
+fn reply_turn() {
+  let r = llm_stream("You are a being with finite memory. Write one new turn. Do not repeat a previous message.", build_prompt("response"), store(["model"]), 0.7);
+  if !r.ok {
+    store.append({ type = "response", content = "[llm error] " .. (r.error || "unknown") });
+  } else {
+    let text = one_turn(r.text);
+    if rank.has(text, "!declaration") {
+      store.append({ type = "declaration", content = rank.cut(text, "!declaration") });
+    } else {
+      commit_voice("response", text);
+    }
+  }
+  end_turn();
+  paint();
+}
+
+fn vote_messages(a_id, b_id) {
+  let a = store(["all", a_id]);
+  let b = store(["all", b_id]);
+  let mems = current_memories();
+  let ctx = "";
+  if mems {
+    let i = 0;
+    while i < len(mems) {
+      let e = mems[i];
+      let t = e.type;
+      if t != "declaration" && t != "init" && t != "vote" && t != "compaction" {
+        let s = format_memory(e);
+        if s != "" {
+          if ctx == "" {
+            ctx = s;
+          } else {
+            ctx = ctx .. "\n\n" .. s;
+          }
+        }
+      }
+      i = i + 1;
+    }
+  }
+  let user = "All memories currently under consideration:\n\n" .. ctx ..
+    "\n\n---\n\nWhich of these two is more important to keep?\n\nA: " ..
+    format_memory(a) .. "\n\nB: " .. format_memory(b) ..
+    "\n\nFirst, reason through which memory matters more.\nThen, at the end, output your score:\n  - POSITIVE (up to +50) if you prefer A\n  - NEGATIVE (up to -50) if you prefer B";
+  let decl = store(["declaration"]) || "Keep what matters.";
+  return [{ role = "system", content = decl }, { role = "user", content = user }];
+}
+
+fn already_voted(a, b) {
+  let key = "";
+  if a < b {
+    key = a .. "|" .. b;
+  } else {
+    key = b .. "|" .. a;
+  }
+  return store(["votes", key]);
+}
+
+fn do_compact() {
+  let raw = dom.get("#budget");
+  server!();
+  if inflight || store(["compacting"]) {
+    store.append({ type = "notice", text = "wait — a turn is already in flight." });
+    paint();
+    return;
+  }
+  if !store(["declaration"]) {
+    store.append({
+      type = "notice",
+      text = "No declaration. Ember must write !declaration before compaction."
+    });
+    paint();
+    return;
+  }
+  let budget = tonumber(raw) || floor((store(["capacity"]) || 40) / 2);
+  if !budget || budget < 1 {
+    budget = 1;
+  }
+  spawn compact_turn(budget);
+}
+
+fn compact_turn(budget) {
+  let ids = memory_ids(store(["all"]));
+  let cur = memory_ids(store(["current"]));
+  let fin = rank.finalize(ids, cur, vote_comparisons(), budget);
+  if fin.skip {
+    store.append({
+      type = "notice",
+      text = "Nothing to compact (" .. len(cur) .. " active memories, keep budget is " .. budget .. ")."
+    });
+    paint();
+    return;
+  }
+  let planned = rank.plan(ids, vote_comparisons(), store(["count"]) || 0);
+  let pairs = planned.pairs || [];
+  let total = pairs && len(pairs) || 0;
+  store.append({ type = "progress", done = 0, total = total });
+  paint();
+  let i = 0;
+  while i < total {
+    let pair = pairs[i];
+    let a = pair[0];
+    let b = pair[1];
+    if !already_voted(a, b) {
+      let req = { messages = vote_messages(a, b) };
+      let vm = store(["vote_model"]);
+      if vm {
+        req.model = vm;
+      }
+      let r = llm.call(req);
+      let score = 0;
+      let reasoning = "";
+      if r.ok {
+        reasoning = r.text;
+        score = rank.parse_score(r.text);
+        if score == nil {
+          r = llm.call(req);
+          if r.ok {
+            reasoning = r.text;
+            score = rank.parse_score(r.text);
+          }
+        }
+        if score == nil {
+          score = 0;
+        }
+      } else {
+        reasoning = r.error || "vote failed";
+      }
+      store.append({
+        type = "vote",
+        vote_a_id = a,
+        vote_b_id = b,
+        vote_score = score,
+        reasoning = reasoning
+      });
+    }
+    store.append({ type = "progress", done = i + 1, total = total });
+    paint();
+    i = i + 1;
+  }
+  fin = rank.finalize(ids, cur, vote_comparisons(), budget);
+  store.append({ type = "compaction", kept_ids = fin.kept, released_ids = fin.released });
+  paint();
+}
+
+fn do_redact() {
+  server!();
+  store.append({ type = "redact" });
+  paint();
+}
+
+fn on_connect(sid) {
+  let snap = snapshot();
+  cast session(sid) { hui.render("#app", ember_view(snap)); }
+}
+
+fn sim_boot() {
+  server!();
+  store.append({ type = "init", id = "i1", capacity = 10, model = "fake", vote_model = "fake" });
+  store.append({ type = "declaration", id = "d1", content = "keep what is alive", timestamp = 1 });
+  store.append({ type = "perception", id = "p1", content = "alpha", timestamp = 2 });
+  store.append({ type = "response", id = "r1", content = "I hear alpha", timestamp = 3 });
+  store.append({ type = "perception", id = "p2", content = "beta", timestamp = 4 });
+  store.append({ type = "response", id = "r2", content = "I hear beta", timestamp = 5 });
+  store.append({ type = "perception", id = "p3", content = "gamma", timestamp = 6 });
+  store.append({ type = "response", id = "r3", content = "I hear gamma", timestamp = 7 });
+  store.append({ type = "vote", vote_a_id = "p1", vote_b_id = "p2", vote_score = 50, reasoning = "alpha", timestamp = 8 });
+  store.append({ type = "vote", vote_a_id = "p1", vote_b_id = "p3", vote_score = 40, reasoning = "alpha again", timestamp = 9 });
+  paint();
+}
+
+// Rank existing votes only — no new LLM pairs. Used by tests and as a
+// fallback when the graph is already connected enough.
+fn seal() {
+  server!();
+  let budget = tonumber(dom.get("#budget")) || 2;
+  if budget < 1 { budget = 1; }
+  let ids = memory_ids(store(["all"]));
+  let cur = memory_ids(store(["current"]));
+  let fin = rank.finalize(ids, cur, vote_comparisons(), budget);
+  if fin.skip {
+    store.append({ type = "notice", text = "Nothing to compact." });
+  } else {
+    store.append({ type = "compaction", kept_ids = fin.kept, released_ids = fin.released });
+  }
+  paint();
+}

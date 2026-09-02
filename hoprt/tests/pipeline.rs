@@ -248,6 +248,7 @@ fn module_natives_mount_as_globals() {
           print("json=" .. type(json) .. " first=" .. type(json.first));
           print("llm=" .. type(llm) .. " stream=" .. type(llm.stream) .. " call=" .. type(llm.call));
           print("bash=" .. type(bash) .. " markdown=" .. type(markdown));
+          print("rank=" .. type(rank) .. " score=" .. type(rank.score) .. " project=" .. type(rank.project));
         }
     "#;
     let mut host = Cluster::new(&["A"], src, false).expect("cluster");
@@ -257,6 +258,39 @@ fn module_natives_mount_as_globals() {
     assert!(all.contains("json=map first=native"), "{all}");
     assert!(all.contains("llm=map stream=native call=native"), "{all}");
     assert!(all.contains("bash=native markdown=native"), "{all}");
+    assert!(all.contains("rank=map score=native"), "{all}");
+    assert!(all.contains("project=native"), "{all}");
+}
+
+#[test]
+fn rank_natives_score_and_project() {
+    let src = r#"
+        fn go() {
+          let ranked = rank.score(["a", "b"], [{ a = "a", b = "b", score = 50 }]);
+          print("winner=" .. ranked[0].id);
+          let p = rank.project([
+            { type = "init", id = "i", capacity = 4, api_key = "SECRET" },
+            { type = "perception", id = "p1", content = "hi" }
+          ]);
+          print("mems=" .. p.memories);
+          print("key=" .. type(p.all.i.api_key));
+          print("score=" .. rank.parse_score("reason 12"));
+          print("before=" .. rank.before("aa [Response] bb", "[Response]"));
+          if rank.has("x !declaration y", "!declaration") {
+            print("decl=yes");
+          }
+        }
+    "#;
+    let mut host = Cluster::new(&["A"], src, false).expect("cluster");
+    host.fire("A", "go");
+    host.pump();
+    let all = host.log().join("\n");
+    assert!(all.contains("winner=a"), "{all}");
+    assert!(all.contains("mems=1"), "{all}");
+    assert!(all.contains("key=nil"), "{all}");
+    assert!(all.contains("score=12"), "{all}");
+    assert!(all.contains("before=aa"), "{all}");
+    assert!(all.contains("decl=yes"), "{all}");
 }
 
 #[test]
