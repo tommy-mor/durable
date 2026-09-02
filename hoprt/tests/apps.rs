@@ -1,11 +1,9 @@
 //! Simulated-cluster tests for the larger hop apps. These prove hopc +
 //! the durable store can run ranking (Sum edges + decay), microblog
-//! (fan-out-on-write timelines), chat (nested list under a map), the
-//! tournament bracket, and the ember compaction rig without a browser.
+//! (fan-out-on-write timelines), chat (nested list under a map), and
+//! the tournament bracket without a browser.
 //! Store reads go through the same natives the apps use; every scenario
 //! ends with replay verification.
-
-use std::path::PathBuf;
 
 use hoprt::harness::Cluster;
 use hoprt::value::Value;
@@ -297,59 +295,5 @@ fn chat_rooms_are_isolated_lists() {
     assert_eq!(arr_len(&lobby), 2);
     let random = host.store_get(arr(vec![s("rooms"), s("random"), s("messages")])).unwrap();
     assert_eq!(arr_len(&random), 1);
-    host.verify().unwrap();
-}
-
-fn ember_src() -> String {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../ember2/ember.hop");
-    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
-}
-
-#[test]
-fn ember_compaction_rig_projects_ranks_and_talks() {
-    let mut host = Cluster::new(&["A"], &ember_src(), false).unwrap();
-    host.fire("A", "sim_boot");
-    host.pump();
-    host.assert_quiescent();
-
-    assert_eq!(host.store_get(arr(vec![s("memories")])).unwrap(), i(6));
-    assert_eq!(
-        host.store_get(arr(vec![s("declaration")])).unwrap(),
-        s("keep what is alive")
-    );
-    let init = host.store_get(arr(vec![s("all"), s("i1")])).unwrap();
-    assert_eq!(init.get_field("api_key"), Value::Nil, "init must not keep the key");
-    assert_eq!(init.get_field("capacity"), i(10));
-
-    host.set_dom("A", "#budget", "2");
-    host.fire("A", "seal");
-    host.pump();
-    assert_eq!(
-        host.store_get(arr(vec![s("memories")])).unwrap(),
-        i(2),
-        "seal keeps the budget"
-    );
-    assert!(
-        !matches!(
-            host.store_get(arr(vec![s("current"), s("p1")])).unwrap(),
-            Value::Nil
-        ),
-        "p1 won both votes and should remain"
-    );
-
-    host.set_dom("A", "#draft", "hello ember");
-    host.fire("A", "send");
-    host.pump();
-    host.assert_quiescent();
-    assert_eq!(
-        host.store_get(arr(vec![s("memories")])).unwrap(),
-        i(4),
-        "perception + response after talk"
-    );
-    let html = host.dom("A", "#app");
-    assert!(html.contains("hello ember"), "perception painted: {html}");
-    assert!(html.contains("newest first"), "{html}");
-    assert!(html.contains("compact"), "{html}");
-
     host.verify().unwrap();
 }

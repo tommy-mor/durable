@@ -52,7 +52,15 @@ pub fn set_cookie_header(secure: bool) -> Option<String> {
     Some(c)
 }
 
+fn login_title() -> String {
+    std::env::var("HOP_LOGIN_TITLE")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "hop".into())
+}
+
 pub fn login_html(error: Option<&str>) -> String {
+    let title = login_title();
     let err = error
         .map(|e| format!(r#"<p class="err">{e}</p>"#))
         .unwrap_or_default();
@@ -62,7 +70,7 @@ pub fn login_html(error: Option<&str>) -> String {
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>ember — login</title>
+  <title>{title} — login</title>
   <style>
     body {{ margin:0; background:#11151c; color:#e8e4dc; font:16px system-ui,sans-serif;
            display:flex; min-height:100vh; align-items:center; justify-content:center; }}
@@ -79,7 +87,7 @@ pub fn login_html(error: Option<&str>) -> String {
 </head>
 <body>
   <form method="post" action="/login">
-    <h1>ember</h1>
+    <h1>{title}</h1>
     <p>password to enter.</p>
     {err}
     <input type="password" name="password" autofocus autocomplete="current-password">

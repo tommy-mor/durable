@@ -20,8 +20,6 @@ const TODO_HTTP: u16 = 19710;
 const TODO_WS: u16 = 19711;
 const AGENT_HTTP: u16 = 19712;
 const AGENT_WS: u16 = 19713;
-const EMBER_HTTP: u16 = 19714;
-const EMBER_WS: u16 = 19715;
 const ERR_HTTP: u16 = 19716;
 const ERR_WS: u16 = 19717;
 
@@ -174,45 +172,6 @@ async fn agent_first_paint_is_not_blank() {
     let (_pw, browser) = launch_chromium().await;
     let page = browser.new_page().await.expect("page");
     assert_fast_first_paint(&page, AGENT_HTTP, "agent").await;
-    browser.close().await.ok();
-}
-
-#[tokio::test]
-async fn ember_first_paint_is_not_blank() {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../ember2/ember.hop");
-    let src = std::fs::read_to_string(&path).unwrap_or_else(|e| {
-        panic!("need {} for this test: {e}", path.display())
-    });
-    spawn_hopd(src, EMBER_HTTP, EMBER_WS);
-    let (_pw, browser) = launch_chromium().await;
-    let page = browser.new_page().await.expect("page");
-    assert_fast_first_paint(&page, EMBER_HTTP, "A being, in time.").await;
-    if let Err(e) = expect(page.locator("#app"))
-        .to_contain_text("newest first")
-        .await
-    {
-        panic!("pager missing: {e}\npage: {}", dump(&page).await);
-    }
-    if let Err(e) = expect(page.locator("#draft"))
-        .with_timeout(Duration::from_secs(3))
-        .to_be_visible()
-        .await
-    {
-        panic!("compose box missing: {e}\npage: {}", dump(&page).await);
-    }
-    if let Err(e) = expect(page.locator("#budget"))
-        .with_timeout(Duration::from_secs(3))
-        .to_be_visible()
-        .await
-    {
-        panic!("compact budget missing: {e}\npage: {}", dump(&page).await);
-    }
-    if let Err(e) = expect(page.locator("#compact"))
-        .to_contain_text("compact")
-        .await
-    {
-        panic!("compact button missing: {e}\npage: {}", dump(&page).await);
-    }
     browser.close().await.ok();
 }
 
