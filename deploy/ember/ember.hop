@@ -506,8 +506,7 @@ fn ember_view(snap) {
           id = "draft",
           name = "message",
           disabled = snap.busy,
-          placeholder = snap.busy && "ember is thinking…" || "talk to ember — empty sends a thought",
-          onkeydown = fn(e) { if e.key == "Enter" && !e.shiftKey && !snap.busy { send(); } }
+          placeholder = snap.busy && "ember is thinking…" || "talk to ember — empty sends a thought"
         }],
         [:button, { id = "think", disabled = snap.busy, onclick = fn(e) { do_think(); } }, "think"],
         [:button, { id = "send", disabled = snap.busy, onclick = fn(e) { send(); } }, "send"]]
