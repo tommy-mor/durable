@@ -6,6 +6,11 @@
 // DOM writes go through window.__hopMorph: idiomorph merges the new tree
 // into the live one (focus, scroll, and the input you're typing in
 // survive a re-render), with innerHTML as the fallback.
+//
+// The socket is not the tab. Mobile browsers, laptop sleep, and idle
+// proxies (Fly, Caddy) close a quiet WebSocket the moment the tab is
+// backgrounded. A new connection gets a new session hello; BrowserVm
+// rebuilds and on_connect paints. Do not ask the human to reload.
 
 const status = document.getElementById('status');
 const say = (t) => { if (status) status.textContent = t; };
@@ -60,31 +65,89 @@ try {
   const inbound = [];
   const outbound = [];
   let deliver = (bytes) => { inbound.push(bytes); };
+  let ws = null;
+  let everOpened = false;
+  let reconnectTimer = null;
+  let attempt = 0;
+  let gen = 0;
 
-  say('connecting…');
   // hopd may be IPv4-only; `localhost` prefers ::1 and the handshake hangs
   const host = location.hostname === 'localhost' ? '127.0.0.1' : location.hostname;
   const wsUrl = wsPath
     ? `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}${wsPath.startsWith('/') ? wsPath : '/' + wsPath}`
     : `ws://${host}:${wsPort}`;
-  const ws = new WebSocket(wsUrl);
-  ws.binaryType = 'arraybuffer';
-  ws.onerror = () => say('ws error — is hopd listening on IPv6 localhost?');
-  ws.onopen = () => {
-    say('connected');
-    for (const b of outbound) ws.send(b);
-    outbound.length = 0;
+
+  const sendBytes = (bytes) => {
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send(bytes);
+    else if (!everOpened) outbound.push(bytes);
   };
-  ws.onclose = () => say('disconnected — restart hopd and reload');
-  ws.onmessage = (e) => deliver(new Uint8Array(e.data));
+
+  const openSocket = () => {
+    if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+      return;
+    }
+    const my = ++gen;
+    inbound.length = 0;
+    say(everOpened ? 'reconnecting…' : 'connecting…');
+    const socket = new WebSocket(wsUrl);
+    ws = socket;
+    socket.binaryType = 'arraybuffer';
+    socket.onerror = () => {
+      if (my !== gen) return;
+      if (!everOpened) say('ws error — is hopd listening on IPv6 localhost?');
+    };
+    socket.onopen = () => {
+      if (my !== gen) return;
+      attempt = 0;
+      say('connected');
+      if (!everOpened) {
+        for (const b of outbound) socket.send(b);
+      }
+      everOpened = true;
+      outbound.length = 0;
+    };
+    socket.onclose = () => {
+      if (my !== gen) return;
+      outbound.length = 0;
+      if (reconnectTimer) return;
+      if (document.visibilityState === 'hidden') {
+        say('disconnected — waiting for this tab');
+        return;
+      }
+      attempt = Math.min(attempt + 1, 6);
+      const delay = Math.min(500 * 2 ** (attempt - 1), 8000);
+      say(attempt === 1 ? 'disconnected — reconnecting…' : `disconnected — reconnecting… (${attempt})`);
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        openSocket();
+      }, delay);
+    };
+    socket.onmessage = (e) => {
+      if (my !== gen) return;
+      deliver(new Uint8Array(e.data));
+    };
+  };
+
+  const wake = () => {
+    if (document.visibilityState === 'hidden') return;
+    if (ws && ws.readyState === WebSocket.OPEN) return;
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+    attempt = 0;
+    openSocket();
+  };
+  document.addEventListener('visibilitychange', wake);
+  window.addEventListener('pageshow', wake);
+  window.addEventListener('online', wake);
+
+  openSocket();
 
   const { default: init, BrowserVm } = await hopWeb;
   await init();
   const src = await srcP;
-  const vm = new BrowserVm(src, (bytes) => {
-    if (ws.readyState === WebSocket.OPEN) ws.send(bytes);
-    else outbound.push(bytes);
-  });
+  const vm = new BrowserVm(src, sendBytes);
   window.__hopHandler = (id, ev) => vm.fire_handler(id, ev);
   deliver = (bytes) => {
     try {

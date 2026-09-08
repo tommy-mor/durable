@@ -28,7 +28,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tungstenite::Message;
 
@@ -385,12 +385,22 @@ fn conn_thread(stream: TcpStream, sid: String, tx: mpsc::Sender<Ev>) {
     if tx.send(Ev::Conn(sid.clone(), user, out_tx)).is_err() {
         return;
     }
+    // Fly / Caddy / phones drop a quiet WebSocket. Ping often enough that
+    // an idle tab is still a live TCP session when the human comes back.
+    let mut last_ping = Instant::now();
     loop {
         while let Ok(bytes) = out_rx.try_recv() {
             if ws.send(Message::Binary(bytes.into())).is_err() {
                 let _ = tx.send(Ev::Gone(sid));
                 return;
             }
+        }
+        if last_ping.elapsed() >= Duration::from_secs(20) {
+            if ws.send(Message::Ping(Vec::new().into())).is_err() {
+                let _ = tx.send(Ev::Gone(sid));
+                return;
+            }
+            last_ping = Instant::now();
         }
         match ws.read() {
             Ok(Message::Binary(b)) => {
@@ -400,7 +410,13 @@ fn conn_thread(stream: TcpStream, sid: String, tx: mpsc::Sender<Ev>) {
                 let _ = tx.send(Ev::Gone(sid));
                 return;
             }
-            Ok(_) => {}
+            Ok(Message::Ping(p)) => {
+                if ws.send(Message::Pong(p)).is_err() {
+                    let _ = tx.send(Ev::Gone(sid));
+                    return;
+                }
+            }
+            Ok(Message::Pong(_)) | Ok(_) => {}
             Err(tungstenite::Error::Io(e))
                 if matches!(
                     e.kind(),

@@ -168,6 +168,14 @@ impl BrowserVm {
         if pkt.get_field("kind").as_str() == Some("hello") {
             let sid = pkt.get_field("session");
             let sid = sid.as_str().unwrap_or("?").to_string();
+            // First hello: keep packets that raced the handshake. A later
+            // hello is a reconnect — the old session is dead.
+            let queued = if self.vm.is_some() {
+                self.pending.clear();
+                Vec::new()
+            } else {
+                std::mem::take(&mut self.pending)
+            };
             let mut platform = WebPlatform { send: &self.send };
             match Vm::new(self.prog.clone(), SideId::Browser(sid), &mut platform) {
                 Ok(mut vm) => {
@@ -177,7 +185,6 @@ impl BrowserVm {
                 }
                 Err(e) => web_sys::console::error_1(&format!("vm boot: {e}").into()),
             }
-            let queued = std::mem::take(&mut self.pending);
             if let Some(vm) = &mut self.vm {
                 let mut platform = WebPlatform { send: &self.send };
                 for p in queued {
