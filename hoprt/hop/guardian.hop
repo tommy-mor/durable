@@ -139,71 +139,6 @@ fn slug_rank_rows() {
   return rows;
 }
 
-// The replay endpoint (?v=history.json) — slug's own score history over
-// every vote event. Rendered here as SVG; refreshed every paint, so the
-// chart grows live as the guardian votes.
-fn slug_history_series(files) {
-  let url = slug_url .. "/r/" .. slug_room_web .. "/~/code-review?v=history.json";
-  let res = http.get(url, { Authorization = "Bearer " .. slug_token });
-  let series = [];
-  let steps = 0;
-  let y_max = 0.001;
-  if res.ok {
-    let d = json.decode(res.body);
-    if type(d) == "map" {
-      let hist = d.history;
-      if hist && type(hist) == "array" {
-        steps = len(hist);
-        let n_files = 0;
-        if files {
-          for i, f in files {
-            n_files = n_files + 1;
-          }
-        }
-        // pass 1: collect raw series (x by step index, score), find max
-        let raw = [];
-        let idx = 0;
-        for i, f in files {
-          let pts = [];
-          let xi = 0;
-          for j, step in hist {
-            let rs = step.current_rankings;
-            if rs {
-              for k, r in rs {
-                if str.has(r.item, f.url) {
-                  let x = 30 + xi * (560 / (steps - 1));
-                  if steps == 1 {
-                    x = 30;
-                  }
-                  push(pts, { x = x, s = r.score });
-                  if r.score > y_max {
-                    y_max = r.score;
-                  }
-                  xi = xi + 1;
-                }
-              }
-            }
-          }
-          if len(pts) > 0 {
-            let hue = (idx * 360) / n_files;
-            push(raw, { label = f.id, color = "hsl(" .. hue .. ", 70%, 50%)", pts = pts });
-          }
-          idx = idx + 1;
-        }
-        // pass 2: scale scores to y with the final max
-        for i, s in raw {
-          let out_pts = [];
-          for j, p in s.pts {
-            push(out_pts, { x = p.x, y = 205 - (p.s / y_max) * 190 });
-          }
-          push(series, { label = s.label, color = s.color, pts = out_pts });
-        }
-      }
-    }
-  }
-  return { series = series, steps = steps, y_max = y_max };
-}
-
 // ---- helpers ----
 
 fn rank_label(item, files) {
@@ -273,6 +208,7 @@ fn view_css() {
     .. ".vote-row { display: flex; gap: 12px; align-items: stretch; margin-bottom: 14px; } "
     .. ".vs { align-self: center; font-weight: bold; } "
     .. ".chart-svg { width: 100%; height: auto; border: 1px solid #ddd; background: #fff; } "
+    .. ".chart-frame { width: 100%; height: 440px; border: 1px solid #ddd; background: #fff; } "
     .. ".err { color: #a00; } "
     .. ".mono { font-family: monospace; font-size: 12px; } "
     .. ".num { text-align: right; font-family: monospace; } "
@@ -280,33 +216,27 @@ fn view_css() {
     .. "table.rank td { border-top: 1px solid #eee; padding: 2px 6px; font-size: 13px; }";
 }
 
-fn chart_block(chart) {
-  let els = [];
-  for i, s in chart.series {
-    let d = "";
-    let first = true;
-    for j, p in s.pts {
-      if first {
-        d = "M " .. p.x .. " " .. p.y;
-        first = false;
-      } else {
-        d = d .. " L " .. p.x .. " " .. p.y;
-      }
-    }
-    push(els, [:path, { d = d, style = "fill:none;stroke-width:2;stroke:" .. s.color }, ""]);
-    let lastx = 0;
-    let lasty = 0;
-    for j, p in s.pts {
-      lastx = p.x;
-      lasty = p.y;
-    }
-    push(els, [:circle, { cx = lastx, cy = lasty, r = "3", style = "fill:" .. s.color }, ""]);
-  }
-  let caption = "score history · " .. chart.steps .. " vote events · live from slug";
+// The graph is slug's graph — an iframe into the database's own replay view
+// (?v=history), not a local copy of its data. The iframe rides hopd's authed
+// /r/ proxy (same origin, bearer injected server-side by hopd). The URLs are
+// computed SERVER-side (fn graph_urls) and passed in: server lets like
+// slug_url and slug_room_web don't exist in the browser VM, where app_view
+// actually renders.
+fn chart_block(graph) {
   return [:div, { class = "chart" },
-    [:h3, {}, caption],
-    [:svg, { viewBox = "0 0 620 220", class = "chart-svg" }, els]
+    [:h3, {}, "score history · slug's own graph"],
+    [:iframe, { src = graph.src, class = "chart-frame", title = "slug score history" }],
+    [:p, { class = "meta" },
+      [:a, { href = graph.href, target = "_blank" }, "open the replay in slug →"]
+    ]
   ];
+}
+
+fn graph_urls() {
+  return {
+    src = "/r/" .. slug_room_web .. "/~/code-review?v=history",
+    href = slug_url .. "/r/" .. slug_room_web .. "/~/code-review?v=history"
+  };
 }
 
 fn pair_card(file, side) {
@@ -368,7 +298,7 @@ fn log_view(status, feed, stream_a, stream_b, stream_text, err) {
   return [:div, { class = "log-page" }, parts];
 }
 
-fn app_view(status, files, rank_rows, feed, stream_a, stream_b, stream_text, err, chart, view) {
+fn app_view(status, files, rank_rows, feed, stream_a, stream_b, stream_text, err, graph, view) {
   if view == "log" {
     return log_view(status, feed, stream_a, stream_b, stream_text, err);
   }
@@ -397,7 +327,7 @@ fn app_view(status, files, rank_rows, feed, stream_a, stream_b, stream_text, err
     [:div, { class = "vs" }, "vs"],
     (pair_card(pair.b, "b"))
   ]);
-  push(vote_col, (chart_block(chart)));
+  push(vote_col, (chart_block(graph)));
   push(vote_col, [:h2, {}, "slug ranking (the database)"]);
   let rank_rows_view = [];
   for i, r in rank_rows {
@@ -445,10 +375,10 @@ fn paint(stream_a, stream_b, stream_text) {
     status = "● running · tick " .. ticks;
   }
   let rank_rows = slug_rank_rows();
-  let chart = slug_history_series(files);
+  let graph = graph_urls();
   let view = store(["guardian", "view"]);
   cast browsers {
-    hui.render("#app", app_view(status, files, rank_rows, feed, stream_a, stream_b, stream_text, err, chart, view));
+    hui.render("#app", app_view(status, files, rank_rows, feed, stream_a, stream_b, stream_text, err, graph, view));
   }
 }
 
@@ -487,8 +417,28 @@ fn scan_repo() {
     return;
   }
   let base = "https://github.com/sortersocial/slug/blob/main/";
+  let doc = "~code-review { the slug codebase, judged file by file }\n";
   for i, r in rows {
     store.append({ type = "file", path = r.path, url = base .. r.path, lines = r.lines });
+    doc = doc .. base .. r.path .. " { " .. r.path .. " — " .. r.lines .. " lines }\n";
+  }
+  // Plant the claims that make each file a MEMBER of the ranked scope. The
+  // item lines alone are not enough: without `<: ~code-review` the file
+  // votes as a ghost — its vote lands in the global graph but the scope's
+  // rank table and the database's own garden never see it.
+  for i, r in rows {
+    doc = doc .. "{ part of the codebase }\n" .. base .. r.path .. " <: ~code-review\n";
+  }
+  let reg = slug_rpc({
+    Post = {
+      room = slug_room,
+      thread_tag = "files",
+      delegate = slug_delegate,
+      text = doc
+    }
+  });
+  if !reg.ok {
+    store.append({ type = "err", text = "slug registration failed: " .. reg.err });
   }
   store.append({ type = "note", text = "scanned repo: files registered" });
   paint("", "", "");
@@ -558,7 +508,7 @@ fn tick() {
   }
   let status = "● running · tick " .. ticks;
   let rank_rows = slug_rank_rows();
-  let chart = slug_history_series(files);
+  let graph = graph_urls();
   let h = llm.stream({ messages = [{ role = "user", content = prompt }] });
   let acc = "";
   let out = llm.next(h);
@@ -566,7 +516,7 @@ fn tick() {
     acc = acc .. out.delta;
     let view = store(["guardian", "view"]);
     cast browsers {
-      hui.render("#app", app_view(status, files, rank_rows, feed, pair.a.id, pair.b.id, acc, nil, chart, view));
+      hui.render("#app", app_view(status, files, rank_rows, feed, pair.a.id, pair.b.id, acc, nil, graph, view));
     }
     out = llm.next(h);
   }

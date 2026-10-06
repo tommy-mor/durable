@@ -195,6 +195,8 @@ fn http_thread(
         }
     };
     let config = format!(r#"{{"wsPort":{ws_port},"wsPath":"{ws_path}"}}"#);
+    let slug_proxy = std::env::var("HOP_SLUG_PROXY_URL").ok().filter(|s| !s.trim().is_empty());
+    let slug_token = std::env::var("HOP_SLUG_PROXY_TOKEN").ok().filter(|s| !s.trim().is_empty());
     for req in server.incoming_requests() {
         let (tx, config, app_src, pkg_dir, ws_path) = (
             tx.clone(),
@@ -203,6 +205,8 @@ fn http_thread(
             pkg_dir.clone(),
             ws_path.clone(),
         );
+        let slug_proxy = slug_proxy.clone();
+        let slug_token = slug_token.clone();
         thread::spawn(move || {
             let mut req = req;
             let path = request_path(req.url()).to_string();
@@ -279,6 +283,70 @@ fn http_thread(
                 }
                 "/boot.css" => (b"/* ok */".to_vec(), "text/css"),
                 url => {
+                    // Authed reverse proxy for slug's graph pages: the guardian
+                    // iframes /r/<room>?v=history, whose React page and its
+                    // same-origin data fetches both need the room bearer. An
+                    // iframe can't send an Authorization header, so hopd
+                    // injects it here and streams slug's answer verbatim.
+                    if url.starts_with("/r/") {
+                        if let (Some(proxy), Some(token)) = (&slug_proxy, &slug_token) {
+                            // full URL with query — the React page's ?v=history
+                            // and its data fetch ?v=history.json both need it
+                            let upstream = format!(
+                                "{}{}",
+                                proxy.trim_end_matches('/'),
+                                req.url()
+                            );
+                            let call = ureq::get(&upstream).set(
+                                "Authorization",
+                                &format!("Bearer {token}"),
+                            );
+                            let (status, ctype, bytes) = match call.call() {
+                                Ok(resp) => {
+                                    let ctype = resp
+                                        .header("content-type")
+                                        .unwrap_or("text/html; charset=utf-8")
+                                        .to_string();
+                                    let mut bytes = Vec::new();
+                                    let _ = std::io::Read::read_to_end(
+                                        &mut resp.into_reader(),
+                                        &mut bytes,
+                                    );
+                                    (200, ctype, bytes)
+                                }
+                                Err(ureq::Error::Status(code, resp)) => {
+                                    let ctype = resp
+                                        .header("content-type")
+                                        .unwrap_or("text/html; charset=utf-8")
+                                        .to_string();
+                                    let mut bytes = Vec::new();
+                                    let _ = std::io::Read::read_to_end(
+                                        &mut resp.into_reader(),
+                                        &mut bytes,
+                                    );
+                                    (code, ctype, bytes)
+                                }
+                                Err(e) => (
+                                    502,
+                                    "text/plain; charset=utf-8".to_string(),
+                                    format!("slug proxy: {e}").into_bytes(),
+                                ),
+                            };
+                            let _ = req
+                                .respond(
+                                    tiny_http::Response::from_data(bytes)
+                                        .with_status_code(status)
+                                        .with_header(
+                                            tiny_http::Header::from_bytes(
+                                                &b"Content-Type"[..],
+                                                ctype.as_bytes(),
+                                            )
+                                            .unwrap(),
+                                        ),
+                                );
+                            return;
+                        }
+                    }
                     // /pkg/<file> — flat, no traversal: the last path component only
                     let served = url.strip_prefix("/pkg/").and_then(|f| {
                         let name = Path::new(f).file_name()?;
