@@ -184,6 +184,96 @@ fn pick_pair(files) {
   return { a = a, b = b };
 }
 
+fn file_for_url(files, url) {
+  if !files || !url {
+    return nil;
+  }
+  for i, f in files {
+    if str.has(url, f.url) {
+      return f;
+    }
+  }
+  return nil;
+}
+
+// The database suggests the pair — slug's GetPair prefers unranked×ranked
+// bridges first, then unvoted edges, so every vote connects the vote graph.
+// The local pick_pair grinds the same two least-judged files forever, which
+// is how 240 votes left the garden as six disconnected islands. Falls back
+// to the local pick only when slug cannot answer.
+fn slug_next_pair(files) {
+  let empty = { a = nil, b = nil };
+  let res = slug_rpc({
+    GetPair = { room = slug_room, parent_path = "~code-review" }
+  });
+  if !res.ok {
+    return empty;
+  }
+  let results = res.data.results;
+  if !results || type(results) != "array" || len(results) == 0 {
+    return empty;
+  }
+  if !results[0].ok {
+    return empty;
+  }
+  let pair = results[0].result.Pair;
+  if !pair || type(pair) != "map" {
+    return empty;
+  }
+  // slug may suggest a member the local store doesn't know: the repo
+  // scanner only keeps the top 12 files by line count, but slug sees every
+  // registered member (scope_rank.rs, 433 lines, lives in the 13th slot).
+  // Silently falling back to the local pick here is how the vote graph
+  // stayed six disconnected islands — the bridge suggestions died unheard.
+  // Adopt the stranger from the repo on disk instead.
+  let a = file_for_url(files, pair.left);
+  if !a {
+    a = adopt_file(pair.left);
+  }
+  let b = file_for_url(files, pair.right);
+  if !b {
+    b = adopt_file(pair.right);
+  }
+  return { a = a, b = b };
+}
+
+// Register a slug-suggested item the local store hasn't met: pull its line
+// count from the repo on disk and file it like any scanned file.
+fn adopt_file(slug_url) {
+  if !slug_url {
+    return nil;
+  }
+  // slug's item URLs are double-wrapped: the slug.social room URL wrapping
+  // the github URL wrapping the repo path. Cut the FULL prefix, not just
+  // the marker — str.cut on "blob/main/" alone leaves both host prefixes
+  // in the "path" and wc -l starves on garbage.
+  let prefix = str.before(slug_url, "blob/main/");
+  let path = str.cut(slug_url, prefix .. "blob/main/");
+  if path == "" || !str.has(path, "/") || str.has(path, " ") || str.has(path, ":") {
+    return nil;
+  }
+  let out = bash("wc -l < '/Users/tommy/programming/slug-star/slug/" .. path .. "'");
+  if !out.ok {
+    return nil;
+  }
+  let lines = tonumber(str.strip(out.stdout));
+  if !lines {
+    return nil;
+  }
+  let github_url = "https://github.com/sortersocial/slug/blob/main/" .. path;
+  store.append({ type = "file", path = path, url = github_url, lines = lines });
+  store.append({ type = "note", text = "adopted slug-suggested file: " .. path });
+  return { id = path, url = github_url, lines = lines, judged = 0 };
+}
+
+fn next_pair(files) {
+  let pair = slug_next_pair(files);
+  if !pair.a || !pair.b {
+    pair = pick_pair(files);
+  }
+  return pair;
+}
+
 fn judge_prompt(a, b, bodies) {
   return "You are a code-health guardian. Judge which of these two source files MOST needs refactoring, using the actual file contents below as evidence (responsibilities, coupling, cohesion, size).\n\n"
     .. "a: " .. a.id .. " — " .. a.lines .. " lines\n"
@@ -331,7 +421,7 @@ fn prompt_view(prompt_text, status) {
   return [:div, { class = "log-page" }, parts];
 }
 
-fn app_view(status, files, rank_rows, feed, stream_a, stream_b, stream_text, err, graph, prompt_text, view) {
+fn app_view(status, files, rank_rows, feed, stream_a, stream_b, stream_text, err, graph, prompt_text, pair, view) {
   if view == "log" {
     return log_view(status, feed, stream_a, stream_b, stream_text, err);
   }
@@ -358,7 +448,8 @@ fn app_view(status, files, rank_rows, feed, stream_a, stream_b, stream_text, err
 
   let vote_col = [];
   push(vote_col, [:h2, {}, "vote screen"]);
-  let pair = pick_pair(files);
+  // pair is computed server-side (slug's GetPair suggestion, with a local
+  // fallback) and passed in — the store and RPC don't exist in this VM.
   push(vote_col, [:div, { class = "vote-row" },
     (pair_card(pair.a, "a")),
     [:div, { class = "vs" }, "vs"],
@@ -414,9 +505,10 @@ fn paint(stream_a, stream_b, stream_text) {
   let rank_rows = slug_rank_rows();
   let graph = graph_urls();
   let prompt_text = store(["guardian", "prompt"]);
+  let pair = next_pair(files);
   let view = store(["guardian", "view"]);
   cast browsers {
-    hui.render("#app", app_view(status, files, rank_rows, feed, stream_a, stream_b, stream_text, err, graph, prompt_text, view));
+    hui.render("#app", app_view(status, files, rank_rows, feed, stream_a, stream_b, stream_text, err, graph, prompt_text, pair, view));
   }
 }
 
@@ -488,7 +580,9 @@ fn manual_pick(side) {
     paint("", "", "");
     return;
   }
-  let pair = pick_pair(files);
+  // the human's override lands on the suggested pair — same bridge-building
+  // rule as the automatic loop
+  let pair = next_pair(files);
   if !pair.a || !pair.b {
     paint("", "", "");
     return;
@@ -529,7 +623,7 @@ fn tick() {
   if !files {
     return;
   }
-  let pair = pick_pair(files);
+  let pair = next_pair(files);
   if !pair.a || !pair.b {
     return;
   }
@@ -565,7 +659,7 @@ fn tick() {
     acc = acc .. out.delta;
     let view = store(["guardian", "view"]);
     cast browsers {
-      hui.render("#app", app_view(status, files, rank_rows, feed, pair.a.id, pair.b.id, acc, nil, graph, prompt_text, view));
+      hui.render("#app", app_view(status, files, rank_rows, feed, pair.a.id, pair.b.id, acc, nil, graph, prompt_text, pair, view));
     }
     out = llm.next(h);
   }
