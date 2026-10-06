@@ -77,6 +77,10 @@ enum Ev {
     /// GET /reset — the app's `on_reset` hook decides what reset means
     /// (typically: append a reset event to the log, re-render browsers).
     Reset,
+    /// Guardian heartbeat: fired by the scheduler thread every
+    /// `tick_every_ms` when the app declares it and defines `fn tick()`.
+    /// Runs as a normal server flow — store and effects, no browser.
+    Tick,
     /// An effect reply (encoded packet) minted by the effects executor —
     /// delivered straight to the server VM, never identity-stamped.
     Effect(Vec<u8>),
@@ -1170,6 +1174,27 @@ pub fn serve(
     let llm_cfg = LlmCfg::from_env();
     println!("[hopd] serving http://localhost:{http_port}  (ws on :{ws_port}, CBOR binary)");
 
+    // Guardian scheduler: an app that declares `tick_every_ms` (int, ms)
+    // and defines `fn tick()` gets tick fired as a plain server flow on
+    // that interval — the play/pausable heartbeat for guardian agents.
+    // Play/pause lives in the app's own store; the ticker fires blindly
+    // and tick early-returns when paused. No browser is ever required.
+    let tick_defined = !matches!(vm.globals.get("tick"), Value::Nil);
+    let tick_ms = match vm.globals.get("tick_every_ms") {
+        Value::Int(n) if n > 0 => Some(n as u64),
+        _ => None,
+    };
+    if tick_defined {
+        if let Some(ms) = tick_ms {
+            let tx = tx.clone();
+            thread::spawn(move || loop {
+                thread::sleep(std::time::Duration::from_millis(ms));
+                let _ = tx.send(Ev::Tick);
+            });
+            println!("[hopd] guardian tick every {ms}ms");
+        }
+    }
+
     for ev in rx {
         match ev {
             Ev::Conn(sid, user, out) => {
@@ -1242,6 +1267,13 @@ pub fn serve(
                 if !matches!(vm.globals.get("on_reset"), Value::Nil) {
                     vm.fire(&mut platform, "on_reset", Vec::new());
                 }
+            }
+            Ev::Tick => {
+                let mut platform = ServePlatform {
+                    outbox: &mut outbox,
+                    store: binding.as_mut(),
+                };
+                vm.fire(&mut platform, "tick", Vec::new());
             }
             Ev::Effect(bytes) => {
                 let pkt = match decode(&bytes) {

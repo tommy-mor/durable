@@ -102,11 +102,24 @@ All of these live in [`hoprt/hop/`](hoprt/hop/). Run any of them with
 - **`ranking.hop`**: pairwise votes stored as a weighted graph. Decay is an event on the tape.
 - **`tournament.hop`**: collaborative brackets in three formats. Reopening a match cascades the result change through later rounds.
 - **`agent.hop`**: a coding agent in one file. It streams LLM replies, asks for approval before each `bash` command, and keeps per-user threads. The transcript is on the tape, so it survives restarts.
+- **`guardian.hop`**: a play/pausable guardian agent over a sorted file index — judges pairs on its own scheduler heartbeat, streams every verdict live to all tabs.
 - **`demo.hop`**: no UI. It exercises round trips, a remote error, chained hops, and nested casts in the simulated cluster.
 
 `agent.hop` needs `OPENAI_API_KEY`. `OPENAI_BASE_URL` (any OpenAI-compatible
 endpoint) and `HOP_LLM_MODEL` are optional. `hopd` reads a `.env` file in the
 working directory, and real environment variables override it.
+
+## Guardians (server-scheduled flows)
+
+An app that declares `tick_every_ms` (int, milliseconds) and defines `fn
+tick()` gets `tick` fired as a plain server flow on that interval — no
+browser required. Guardians are the third flow kind: not browser-initiated,
+not reducers, just ordinary server flows with full store and effect access
+(`llm.*`, `bash`, `store.append`, casts). Play/pause lives in the app's own
+store (`guardian.running` in the demo), so the loop is durable and
+replayable; the ticker fires blindly and `tick` early-returns when paused.
+A guardian's non-determinism stays at the edge exactly like a browser tab's:
+the tape records the events it appends, never its reasoning loop.
 
 ## `hopd`
 

@@ -1,0 +1,239 @@
+// guardian.hop — a play/pausable guardian agent over a sorted file index.
+//
+// hopd's scheduler fires `tick` every tick_every_ms as a plain server flow
+// (no browser required). Play/pause lives on the tape as a store flag, so
+// the loop is durable, replayable, and controllable from any tab. Every
+// judgment — the guardian's or a human's — streams live to every browser.
+//
+//   cargo run -p hoprt --bin hopd -- hoprt/hop/guardian.hop
+
+server let schema = store.record([
+  ["guardian", store.record([
+    ["running", store.leaf],
+    ["ticks", store.sum]
+  ])],
+  ["files", store.map(store.record([
+    ["lines", store.leaf],
+    ["wins", store.sum]
+  ]))],
+  ["edges", store.map(store.sum)],
+  ["votes", store.sum],
+  ["feed", store.list(store.leaf)]
+]);
+
+server let tick_every_ms = 2000;
+
+fn reduce(event) {
+  match event {
+    add_file { path, lines } => {
+      store(["files", path, store.set({ lines = lines, wins = 0 })]);
+    }
+    play {} => {
+      store(["guardian", "running", store.set(true)]);
+    }
+    pause {} => {
+      store(["guardian", "running", store.set(false)]);
+    }
+    tick_mark {} => {
+      store(["guardian", "ticks", store.add(1)]);
+    }
+    judge { winner, loser, why, auto } => {
+      let key = winner .. ">" .. loser;
+      store(["edges", key, store.add(1)]);
+      store(["votes", store.add(1)]);
+      store(["files", winner, "wins", store.add(1)]);
+      let who = "human";
+      if auto {
+        who = "guardian";
+      }
+      store(["feed", store.push(who .. ": " .. winner .. " > " .. loser .. " — " .. why)]);
+    }
+  }
+}
+
+// ---- reads ----
+
+fn guardian_running() {
+  let r = store(["guardian", "running"]);
+  if !r {
+    return false;
+  }
+  return r;
+}
+
+// The two files with the fewest wins — they need judgments most.
+// Returns { a, b } where either may be false when too few files exist.
+fn pick_pair(files) {
+  let a = false;
+  let b = false;
+  for i, f in files {
+    if !a {
+      b = a;
+      a = f;
+    } else {
+      if f.wins < a.wins {
+        b = a;
+        a = f;
+      } else {
+        if !b {
+          b = f;
+        } else {
+          if f.wins < b.wins {
+            b = f;
+          }
+        }
+      }
+    }
+  }
+  return { a = a, b = b };
+}
+
+// ---- view ----
+
+fn guardian_view(files, votes, feed, ticks, running) {
+  let status = "⏸ paused";
+  if running {
+    status = "● running";
+  }
+  let file_rows = [];
+  if files {
+    for i, f in files {
+      push(file_rows, [:li, {}, f.id .. " — " .. f.lines .. " lines · wins " .. f.wins]);
+    }
+  }
+  let feed_rows = [];
+  if feed {
+    for i, j in feed {
+      push(feed_rows, [:li, {}, j]);
+    }
+  }
+  return [:div, {},
+    [:h1, {}, "guardian"],
+    [:p, { class = "meta" }, status .. " · tick " .. ticks .. " · " .. votes .. " judgments"],
+    [:div, { class = "row" },
+      [:button, { id = "play", onclick = fn(e) { play(); } }, "play"],
+      [:button, { id = "pause", onclick = fn(e) { pause(); } }, "pause"],
+      [:button, { id = "once", onclick = fn(e) { judge_once(); } }, "judge once"]
+    ],
+    [:div, { class = "row" },
+      [:input, { id = "fpath", placeholder = "file path" }],
+      [:input, { id = "flines", placeholder = "lines" }],
+      [:button, { id = "add", onclick = fn(e) { add_from_form(); } }, "add file"]
+    ],
+    [:h2, {}, "judgment feed"],
+    [:ul, { id = "feed" }, feed_rows],
+    [:h2, {}, "files by wins"],
+    [:ul, { id = "files" }, file_rows]
+  ];
+}
+
+fn render_app() {
+  let files = store.items(["files"]);
+  let votes = store(["votes"]);
+  if !votes {
+    votes = 0;
+  }
+  let feed = store(["feed"]);
+  if !feed {
+    feed = [];
+  }
+  let ticks = store(["guardian", "ticks"]);
+  if !ticks {
+    ticks = 0;
+  }
+  let running = guardian_running();
+  cast browsers {
+    hui.render("#app", guardian_view(files, votes, feed, ticks, running));
+  }
+}
+
+// ---- flows ----
+
+fn add_from_form() {
+  let path = dom.get("#fpath");
+  let lines = dom.get("#flines");
+  server!();
+  if path != "" {
+    store.append({ type = "add_file", path = path, lines = lines });
+    render_app();
+  }
+}
+
+fn play() {
+  server!();
+  store.append({ type = "play" });
+  render_app();
+}
+
+fn pause() {
+  server!();
+  store.append({ type = "pause" });
+  render_app();
+}
+
+fn judge_once() {
+  server!();
+  let files = store.items(["files"]);
+  if files {
+    let pair = pick_pair(files);
+    if pair.a && pair.b {
+      store.append({
+        type = "judge",
+        winner = pair.a.id,
+        loser = pair.b.id,
+        why = "manual judge",
+        auto = false
+      });
+    }
+  }
+  render_app();
+}
+
+// Fired by hopd's scheduler as a plain server flow. Early-returns when
+// paused; otherwise marks the tick and casts one judgment into the graph.
+fn tick() {
+  if !guardian_running() {
+    return;
+  }
+  let files = store.items(["files"]);
+  if !files {
+    return;
+  }
+  let pair = pick_pair(files);
+  if !pair.a || !pair.b {
+    return;
+  }
+  let ticks = store(["guardian", "ticks"]);
+  if !ticks {
+    ticks = 0;
+  }
+  store.append({ type = "tick_mark" });
+  store.append({
+    type = "judge",
+    winner = pair.a.id,
+    loser = pair.b.id,
+    why = "guardian tick " .. ticks,
+    auto = true
+  });
+  render_app();
+}
+
+fn on_connect(sid) {
+  let files = store.items(["files"]);
+  let votes = store(["votes"]);
+  if !votes {
+    votes = 0;
+  }
+  let feed = store(["feed"]);
+  if !feed {
+    feed = [];
+  }
+  let ticks = store(["guardian", "ticks"]);
+  if !ticks {
+    ticks = 0;
+  }
+  let running = guardian_running();
+  cast session(sid) {
+    hui.render("#app", guardian_view(files, votes, feed, ticks, running));
+  }
+}
