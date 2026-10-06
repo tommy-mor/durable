@@ -85,16 +85,16 @@ struct Parked {
     on_complete: Complete,
 }
 
-/// Browser-side hiccup handler registry (hui). Handlers register under
-/// STABLE keys (render-tree position + attr name): every render of the
-/// same position overwrites the closure under the same id, so the registry
-/// always holds the newest closure for a button and a DOM that lags a
-/// render still fires the right thing. Stale is stale — nothing lingers.
+/// Browser-side hiccup handler registry (hui). Per-render mint: every
+/// render releases the previous generation and registers fresh ids. The
+/// morph delivers the new attrs with every paint, so the DOM carries
+/// current ids except within a single dispatch — the click-lost-in-transit
+/// bug was the megabyte wire flood, not this registry.
 #[derive(Default)]
 pub struct HuiState {
     handlers: HashMap<i64, Value>,
-    keys: HashMap<String, i64>,
     seq: i64,
+    root_ids: HashMap<String, Vec<i64>>,
 }
 
 pub struct Vm {
@@ -581,20 +581,16 @@ impl Host for StepHost<'_> {
 
 // hui internals live in builtins.rs but operate on HuiState
 impl HuiState {
-    /// Register a handler closure under a stable key (the render-tree
-    /// position plus the attr name). The first render of a position mints
-    /// the id; every later render of the same position overwrites the
-    /// closure under the SAME id — the registry never holds a dead handler,
-    /// and a DOM that lags a render still fires the current one.
-    pub(crate) fn register(&mut self, sel: &str, key: &str, h: Value) -> i64 {
-        let full = format!("{sel}#{key}");
-        if let Some(&id) = self.keys.get(&full) {
-            self.handlers.insert(id, h);
-            return id;
-        }
+    pub(crate) fn register(&mut self, sel: &str, h: Value) -> i64 {
         self.seq += 1;
         self.handlers.insert(self.seq, h);
-        self.keys.insert(full, self.seq);
+        self.root_ids.entry(sel.to_string()).or_default().push(self.seq);
         self.seq
+    }
+
+    pub(crate) fn release_root(&mut self, sel: &str) {
+        for id in self.root_ids.remove(sel).unwrap_or_default() {
+            self.handlers.remove(&id);
+        }
     }
 }
