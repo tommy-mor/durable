@@ -9,6 +9,7 @@
 server let schema = store.record([
   ["guardian", store.record([
     ["running", store.leaf],
+    ["judging", store.leaf],
     ["ticks", store.sum],
     ["err", store.leaf]
   ])],
@@ -20,7 +21,7 @@ server let schema = store.record([
   ["feed", store.list(store.leaf)]
 ]);
 
-server let tick_every_ms = 6000;
+server let tick_every_ms = 800;
 server let slug_url = "http://localhost:8080";
 server let slug_room = "gt7dc9y/code-review";
 server let slug_room_web = "gt7dc9ycode-review";
@@ -42,10 +43,13 @@ fn reduce(event) {
     file { path, url, lines } => {
       store(["files", path, store.set({ url = url, lines = lines, judged = 0 })]);
     }
-    judged { winner, loser, why } => {
+    judged { winner, loser, full } => {
       store(["files", winner, "judged", store.add(1)]);
       store(["files", loser, "judged", store.add(1)]);
-      store(["feed", store.push("guardian: " .. winner .. " > " .. loser .. " — " .. why)]);
+      store(["feed", store.push("guardian: " .. winner .. " > " .. loser .. "\n" .. full)]);
+    }
+    judging { flag } => {
+      store(["guardian", "judging", store.set(flag)]);
     }
     manual { winner, loser } => {
       store(["files", winner, "judged", store.add(1)]);
@@ -118,6 +122,71 @@ fn slug_rank_rows() {
   return rows;
 }
 
+// The replay endpoint (?v=history.json) — slug's own score history over
+// every vote event. Rendered here as SVG; refreshed every paint, so the
+// chart grows live as the guardian votes.
+fn slug_history_series(files) {
+  let url = slug_url .. "/r/" .. slug_room_web .. "/~/code-review?v=history.json";
+  let res = http.get(url, { Authorization = "Bearer " .. slug_token });
+  let series = [];
+  let steps = 0;
+  let y_max = 0.001;
+  if res.ok {
+    let d = json.decode(res.body);
+    if type(d) == "map" {
+      let hist = d.history;
+      if hist && type(hist) == "array" {
+        steps = len(hist);
+        let n_files = 0;
+        if files {
+          for i, f in files {
+            n_files = n_files + 1;
+          }
+        }
+        // pass 1: collect raw series (x by step index, score), find max
+        let raw = [];
+        let idx = 0;
+        for i, f in files {
+          let pts = [];
+          let xi = 0;
+          for j, step in hist {
+            let rs = step.current_rankings;
+            if rs {
+              for k, r in rs {
+                if str.has(r.item, f.url) {
+                  let x = 30 + xi * (560 / (steps - 1));
+                  if steps == 1 {
+                    x = 30;
+                  }
+                  push(pts, { x = x, s = r.score });
+                  if r.score > y_max {
+                    y_max = r.score;
+                  }
+                  xi = xi + 1;
+                }
+              }
+            }
+          }
+          if len(pts) > 0 {
+            let hue = (idx * 360) / n_files;
+            push(raw, { label = f.id, color = "hsl(" .. hue .. ", 70%, 50%)", pts = pts });
+          }
+          idx = idx + 1;
+        }
+        // pass 2: scale scores to y with the final max
+        for i, s in raw {
+          let out_pts = [];
+          for j, p in s.pts {
+            push(out_pts, { x = p.x, y = 205 - (p.s / y_max) * 190 });
+          }
+          push(series, { label = s.label, color = s.color, pts = out_pts });
+        }
+      }
+    }
+  }
+  return { series = series, steps = steps, y_max = y_max };
+}
+
 // ---- helpers ----
 
 fn rank_label(item, files) {
@@ -165,6 +234,61 @@ fn judge_prompt(a, b) {
 
 // ---- view ----
 
+fn arr_len(a) {
+  let n = 0;
+  for i, x in a {
+    n = n + 1;
+  }
+  return n;
+}
+
+fn view_css() {
+  return ".guardian-grid { display: flex; gap: 18px; align-items: flex-start; } "
+    .. ".vote-col { flex: 1.2; min-width: 0; } "
+    .. ".log-col { flex: 1; min-width: 0; } "
+    .. ".judge-log { max-height: 62vh; overflow-y: auto; border: 1px solid #ccc; padding: 8px; background: #fafafa; } "
+    .. ".judge-entry { white-space: pre-wrap; font-family: monospace; font-size: 12px; margin: 0 0 8px; padding: 6px; border-bottom: 1px solid #eee; } "
+    .. ".stream-entry { background: #fff8d6; border: 1px solid #e0cf7a; } "
+    .. ".pair-card { border: 1px solid #bbb; padding: 10px; flex: 1; background: white; } "
+    .. ".vote-row { display: flex; gap: 12px; align-items: stretch; margin-bottom: 14px; } "
+    .. ".vs { align-self: center; font-weight: bold; } "
+    .. ".chart-svg { width: 100%; height: auto; border: 1px solid #ddd; background: #fff; } "
+    .. ".err { color: #a00; } "
+    .. ".mono { font-family: monospace; font-size: 12px; } "
+    .. ".num { text-align: right; font-family: monospace; } "
+    .. "table.rank { border-collapse: collapse; width: 100%; } "
+    .. "table.rank td { border-top: 1px solid #eee; padding: 2px 6px; font-size: 13px; }";
+}
+
+fn chart_block(chart) {
+  let els = [];
+  for i, s in chart.series {
+    let d = "";
+    let first = true;
+    for j, p in s.pts {
+      if first {
+        d = "M " .. p.x .. " " .. p.y;
+        first = false;
+      } else {
+        d = d .. " L " .. p.x .. " " .. p.y;
+      }
+    }
+    push(els, [:path, { d = d, style = "fill:none;stroke-width:2;stroke:" .. s.color }, ""]);
+    let lastx = 0;
+    let lasty = 0;
+    for j, p in s.pts {
+      lastx = p.x;
+      lasty = p.y;
+    }
+    push(els, [:circle, { cx = lastx, cy = lasty, r = "3", style = "fill:" .. s.color }, ""]);
+  }
+  let caption = "score history · " .. chart.steps .. " vote events · live from slug";
+  return [:div, { class = "chart" },
+    [:h3, {}, caption],
+    [:svg, { viewBox = "0 0 620 220", class = "chart-svg" }, els]
+  ];
+}
+
 fn pair_card(file, side) {
   let cls = "pair-card pair-" .. side;
   if !file {
@@ -184,13 +308,11 @@ fn pair_card(file, side) {
   ];
 }
 
-fn app_view(status, files, rank_rows, feed, stream_a, stream_b, stream_text, err, replay_url) {
+fn app_view(status, files, rank_rows, feed, stream_a, stream_b, stream_text, err, chart) {
   let parts = [];
+  push(parts, [:style, {}, view_css()]);
   push(parts, [:h1, {}, "guardian"]);
-  push(parts, [:p, { class = "meta" },
-    status .. " · ",
-    [:a, { href = replay_url }, "slug replay ↗"]
-  ]);
+  push(parts, [:p, { class = "meta" }, status]);
   if err {
     push(parts, [:p, { class = "err" }, err]);
   }
@@ -199,20 +321,17 @@ fn app_view(status, files, rank_rows, feed, stream_a, stream_b, stream_text, err
     [:button, { onclick = fn(e) { pause(); } }, "pause"],
     [:button, { onclick = fn(e) { scan_repo(); } }, "scan repo"]
   ]);
-  push(parts, [:h2, {}, "vote screen"]);
+
+  let vote_col = [];
+  push(vote_col, [:h2, {}, "vote screen"]);
   let pair = pick_pair(files);
-  push(parts, [:div, { class = "vote-row" },
+  push(vote_col, [:div, { class = "vote-row" },
     (pair_card(pair.a, "a")),
     [:div, { class = "vs" }, "vs"],
     (pair_card(pair.b, "b"))
   ]);
-  if stream_text != "" {
-    push(parts, [:div, { class = "stream" },
-      [:h3, {}, "guardian thinking: " .. stream_a .. " vs " .. stream_b],
-      [:pre, { class = "stream-tokens" }, stream_text]
-    ]);
-  }
-  push(parts, [:h2, {}, "slug ranking (the database)"]);
+  push(vote_col, (chart_block(chart)));
+  push(vote_col, [:h2, {}, "slug ranking (the database)"]);
   let rank_rows_view = [];
   for i, r in rank_rows {
     push(rank_rows_view, [:tr, {},
@@ -220,18 +339,32 @@ fn app_view(status, files, rank_rows, feed, stream_a, stream_b, stream_text, err
       [:td, { class = "num" }, "" .. r.score]
     ]);
   }
-  push(parts, [:table, { class = "rank" },
+  push(vote_col, [:table, { class = "rank" },
     [:tr, {}, [:th, {}, "file"], [:th, {}, "score"]],
     rank_rows_view
   ]);
-  push(parts, [:h2, {}, "judgment feed"]);
-  let feed_rows = [];
+
+  let log_col = [];
+  push(log_col, [:h2, {}, "judgment log"]);
+  let entries = [];
   if feed {
     for i, j in feed {
-      push(feed_rows, [:li, {}, j]);
+      push(entries, [:pre, { class = "judge-entry" }, j]);
     }
   }
-  push(parts, [:ul, { id = "feed" }, feed_rows]);
+  if stream_text != "" {
+    push(entries, [:pre, { class = "judge-entry stream-entry" },
+      "guardian thinking: " .. stream_a .. " vs " .. stream_b .. "\n" .. stream_text
+    ]);
+  }
+  push(entries, [:a, { id = "latest" }, ""]);
+  push(log_col, [:div, { class = "judge-log" }, entries]);
+  push(log_col, [:p, {}, [:a, { href = "#latest" }, "↓ latest"]]);
+
+  push(parts, [:div, { class = "guardian-grid" },
+    [:div, { class = "vote-col" }, vote_col],
+    [:div, { class = "log-col" }, log_col]
+  ]);
   return [:div, {}, parts];
 }
 
@@ -251,10 +384,9 @@ fn paint(stream_a, stream_b, stream_text) {
     status = "● running · tick " .. ticks;
   }
   let rank_rows = slug_rank_rows();
-  // server lets only evaluate on the server; ship URL strings as data.
-  let replay_url = slug_url .. "/r/" .. slug_room_web .. "/~/code-review?v=history";
+  let chart = slug_history_series(files);
   cast browsers {
-    hui.render("#app", app_view(status, files, rank_rows, feed, stream_a, stream_b, stream_text, err, replay_url));
+    hui.render("#app", app_view(status, files, rank_rows, feed, stream_a, stream_b, stream_text, err, chart));
   }
 }
 
@@ -320,10 +452,14 @@ fn manual_pick(side) {
   paint("", "", "");
 }
 
-// Fired by hopd's scheduler. Picks the least-judged pair, streams the LLM's
-// reasoning live into the vote screen, then posts the verdict to slug.
+// Fired by hopd's scheduler (every 800ms). The judging flag makes the loop
+// sequential with no overlap and no downtime: while a judgment is in flight
+// ticks return instantly; the moment it lands, the next one can start.
 fn tick() {
   if !store(["guardian", "running"]) {
+    return;
+  }
+  if store(["guardian", "judging"]) {
     return;
   }
   let files = store.items(["files"]);
@@ -334,6 +470,7 @@ fn tick() {
   if !pair.a || !pair.b {
     return;
   }
+  store.append({ type = "judging", flag = true });
   store.append({ type = "tick_mark" });
   let prompt = judge_prompt(pair.a, pair.b);
   let ticks = store(["guardian", "ticks"]);
@@ -346,25 +483,27 @@ fn tick() {
   }
   let status = "● running · tick " .. ticks;
   let rank_rows = slug_rank_rows();
-  let replay_url = slug_url .. "/r/" .. slug_room_web .. "/~/code-review?v=history";
+  let chart = slug_history_series(files);
   let h = llm.stream({ messages = [{ role = "user", content = prompt }] });
   let acc = "";
   let out = llm.next(h);
   while out.delta {
     acc = acc .. out.delta;
     cast browsers {
-      hui.render("#app", app_view(status, files, rank_rows, feed, pair.a.id, pair.b.id, acc, nil, replay_url));
+      hui.render("#app", app_view(status, files, rank_rows, feed, pair.a.id, pair.b.id, acc, nil, chart));
     }
     out = llm.next(h);
   }
   if out.error {
     store.append({ type = "err", text = "llm: " .. out.error });
+    store.append({ type = "judging", flag = false });
     paint("", "", "");
     return;
   }
   let verdict = json.first(out.text);
   if type(verdict) != "map" {
     store.append({ type = "err", text = "guardian could not parse a verdict" });
+    store.append({ type = "judging", flag = false });
     paint("", "", "");
     return;
   }
@@ -378,8 +517,9 @@ fn tick() {
   if !res.ok {
     store.append({ type = "err", text = res.err });
   } else {
-    store.append({ type = "judged", winner = w.id, loser = l.id, why = verdict.why });
+    store.append({ type = "judged", winner = w.id, loser = l.id, full = out.text });
   }
+  store.append({ type = "judging", flag = false });
   paint("", "", "");
 }
 
