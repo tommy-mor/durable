@@ -19,7 +19,7 @@
 //! are scheduled and run when the current segment finishes (arguments are
 //! evaluated eagerly at the spawn site).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 
 use crate::interp::{self, Exec, Globals, Host, NativeOut, Outcome};
@@ -91,6 +91,12 @@ pub struct HuiState {
     handlers: HashMap<i64, Value>,
     seq: i64,
     root_ids: HashMap<String, Vec<i64>>,
+    /// Released generations, bounded: a detached node's click can arrive
+    /// after its render was replaced (fast paints re-render every few
+    /// seconds) — the id it names was released, but the closure is from the
+    /// previous generation and semantically identical. Honor it; the oldest
+    /// entries fall off so long sessions stay bounded.
+    graveyard: VecDeque<(i64, Value)>,
 }
 
 pub struct Vm {
@@ -216,7 +222,22 @@ impl Vm {
     /// the DOM event as a value (a map with e.g. `key` for keyboard
     /// events), or Nil where no event exists (the harness).
     pub fn fire_handler(&mut self, platform: &mut dyn Platform, id: i64, ev: Value) {
-        if let Some(h) = self.hui.handlers.get(&id).cloned() {
+        let h = self
+            .hui
+            .handlers
+            .get(&id)
+            .cloned()
+            .or_else(|| {
+                // a stale click from a detached node — its generation was
+                // replaced but the closure still means what it meant
+                self.hui
+                    .graveyard
+                    .iter()
+                    .rev()
+                    .find(|(gid, _)| *gid == id)
+                    .map(|(_, v)| v.clone())
+            });
+        if let Some(h) = h {
             self.start_flow(platform, h, vec![ev]);
         }
     }
@@ -586,7 +607,12 @@ impl HuiState {
 
     pub(crate) fn release_root(&mut self, sel: &str) {
         for id in self.root_ids.remove(sel).unwrap_or_default() {
-            self.handlers.remove(&id);
+            if let Some(h) = self.handlers.remove(&id) {
+                self.graveyard.push_back((id, h));
+                while self.graveyard.len() > 4096 {
+                    self.graveyard.pop_front();
+                }
+            }
         }
     }
 }
