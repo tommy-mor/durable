@@ -62,6 +62,7 @@ fn builtin_modules() -> Vec<Module> {
         http_module(),
         llm_module(),
         str_module(),
+        time_module(),
     ]
 }
 
@@ -342,6 +343,29 @@ fn str_module() -> Module {
             NativeDef { name: "str.strip", kind: NativeKind::Pure(str_strip) },
         ],
     }
+}
+
+// ---------------------------------------------------------------------------
+// time — a wall clock for flows (never legal in reducers would be the rule,
+// but time.now is Pure: flows freeze it into events, keeping replay honest)
+// ---------------------------------------------------------------------------
+
+fn time_module() -> Module {
+    Module {
+        name: "time",
+        natives: vec![NativeDef {
+            name: "time.now",
+            kind: NativeKind::Pure(time_now),
+        }],
+    }
+}
+
+fn time_now(_args: Vec<Value>) -> Result<Value, String> {
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_millis() as i64;
+    Ok(Value::Int(ms))
 }
 
 fn two_strings(args: &[Value], name: &str) -> Result<(String, String), String> {

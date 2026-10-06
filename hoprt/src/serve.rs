@@ -599,7 +599,8 @@ fn llm_post(cfg: &LlmCfg, body: &str) -> Result<Box<dyn std::io::Read + Send + S
     let url = format!("{}/chat/completions", cfg.base.trim_end_matches('/'));
     let req = ureq::post(&url)
         .set("Authorization", &format!("Bearer {key}"))
-        .set("Content-Type", "application/json");
+        .set("Content-Type", "application/json")
+        .timeout(std::time::Duration::from_secs(300));
     match req.send_string(body) {
         Ok(resp) => Ok(resp.into_reader()),
         Err(ureq::Error::Status(code, resp)) => {
@@ -684,6 +685,9 @@ fn http_run(method: &str, url: &str, body: &str, headers: Vec<(String, String)>)
         }
         req = req.set(k, v);
     }
+    // No infinite parks: a stalled socket must return an error so flows
+    // (and their cleanup paths) can run.
+    req = req.timeout(std::time::Duration::from_secs(120));
     // Agents speak JSON; default the content type when they don't say so.
     if !has_content_type && method != "GET" && method != "DELETE" {
         req = req.set("Content-Type", "application/json");

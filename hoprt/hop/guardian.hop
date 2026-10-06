@@ -10,6 +10,7 @@ server let schema = store.record([
   ["guardian", store.record([
     ["running", store.leaf],
     ["judging", store.leaf],
+    ["judging_at", store.leaf],
     ["ticks", store.sum],
     ["err", store.leaf]
   ])],
@@ -48,8 +49,9 @@ fn reduce(event) {
       store(["files", loser, "judged", store.add(1)]);
       store(["feed", store.push("guardian: " .. winner .. " > " .. loser .. "\n" .. full)]);
     }
-    judging { flag } => {
+    judging { flag, at } => {
       store(["guardian", "judging", store.set(flag)]);
+      store(["guardian", "judging_at", store.set(at)]);
     }
     manual { winner, loser } => {
       store(["files", winner, "judged", store.add(1)]);
@@ -459,8 +461,15 @@ fn tick() {
   if !store(["guardian", "running"]) {
     return;
   }
+  // Watchdog: a judging flag older than two minutes means the judgment
+  // flow died mid-flight (hung effect, hard error) — recover and move on.
   if store(["guardian", "judging"]) {
-    return;
+    let at = store(["guardian", "judging_at"]);
+    if at {
+      if time.now() - at < 120000 {
+        return;
+      }
+    }
   }
   let files = store.items(["files"]);
   if !files {
@@ -470,7 +479,7 @@ fn tick() {
   if !pair.a || !pair.b {
     return;
   }
-  store.append({ type = "judging", flag = true });
+  store.append({ type = "judging", flag = true, at = time.now() });
   store.append({ type = "tick_mark" });
   let prompt = judge_prompt(pair.a, pair.b);
   let ticks = store(["guardian", "ticks"]);
@@ -496,14 +505,14 @@ fn tick() {
   }
   if out.error {
     store.append({ type = "err", text = "llm: " .. out.error });
-    store.append({ type = "judging", flag = false });
+    store.append({ type = "judging", flag = false, at = nil });
     paint("", "", "");
     return;
   }
   let verdict = json.first(out.text);
   if type(verdict) != "map" {
     store.append({ type = "err", text = "guardian could not parse a verdict" });
-    store.append({ type = "judging", flag = false });
+    store.append({ type = "judging", flag = false, at = nil });
     paint("", "", "");
     return;
   }
@@ -519,7 +528,7 @@ fn tick() {
   } else {
     store.append({ type = "judged", winner = w.id, loser = l.id, full = out.text });
   }
-  store.append({ type = "judging", flag = false });
+  store.append({ type = "judging", flag = false, at = nil });
   paint("", "", "");
 }
 
