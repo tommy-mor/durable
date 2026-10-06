@@ -1,33 +1,35 @@
-// guardian.hop — a play/pausable guardian agent over a sorted file index.
+// guardian.hop — a play/pausable LLM guardian over a sorted index held by
+// slug-as-a-database. Pair selection and run state live here; every vote
+// and the whole ranking live on slug via RPC (http effect). LLM judgments
+// stream live into the vote screen; humans can override with their own.
 //
-// hopd's scheduler fires `tick` every tick_every_ms as a plain server flow
-// (no browser required). Play/pause lives on the tape as a store flag, so
-// the loop is durable, replayable, and controllable from any tab. Every
-// judgment — the guardian's or a human's — streams live to every browser.
-//
+//   SLUG: dev server at http://localhost:8080, room gt7dc9y/code-review.
 //   cargo run -p hoprt --bin hopd -- hoprt/hop/guardian.hop
 
 server let schema = store.record([
   ["guardian", store.record([
     ["running", store.leaf],
-    ["ticks", store.sum]
+    ["ticks", store.sum],
+    ["err", store.leaf]
   ])],
   ["files", store.map(store.record([
+    ["url", store.leaf],
     ["lines", store.leaf],
-    ["wins", store.sum]
+    ["judged", store.sum]
   ]))],
-  ["edges", store.map(store.sum)],
-  ["votes", store.sum],
   ["feed", store.list(store.leaf)]
 ]);
 
-server let tick_every_ms = 2000;
+server let tick_every_ms = 6000;
+server let slug_url = "http://localhost:8080";
+server let slug_room = "gt7dc9y/code-review";
+server let slug_room_web = "gt7dc9ycode-review";
+server let slug_token = "slug_erosdev_erosdevsecret";
+server let slug_delegate = "99565dd4-6ce9-4aeb-8da5-7641317de958:eros:moonshotai/kimi-k3";
+server let repo_scanner = "python3 /Users/tommy/eros/scan_slug_repo.py";
 
 fn reduce(event) {
   match event {
-    add_file { path, lines } => {
-      store(["files", path, store.set({ lines = lines, wins = 0 })]);
-    }
     play {} => {
       store(["guardian", "running", store.set(true)]);
     }
@@ -37,32 +39,98 @@ fn reduce(event) {
     tick_mark {} => {
       store(["guardian", "ticks", store.add(1)]);
     }
-    judge { winner, loser, why, auto } => {
-      let key = winner .. ">" .. loser;
-      store(["edges", key, store.add(1)]);
-      store(["votes", store.add(1)]);
-      store(["files", winner, "wins", store.add(1)]);
-      let who = "human";
-      if auto {
-        who = "guardian";
-      }
-      store(["feed", store.push(who .. ": " .. winner .. " > " .. loser .. " — " .. why)]);
+    file { path, url, lines } => {
+      store(["files", path, store.set({ url = url, lines = lines, judged = 0 })]);
+    }
+    judged { winner, loser, why } => {
+      store(["files", winner, "judged", store.add(1)]);
+      store(["files", loser, "judged", store.add(1)]);
+      store(["feed", store.push("guardian: " .. winner .. " > " .. loser .. " — " .. why)]);
+    }
+    manual { winner, loser } => {
+      store(["files", winner, "judged", store.add(1)]);
+      store(["files", loser, "judged", store.add(1)]);
+      store(["feed", store.push("human: " .. winner .. " > " .. loser)]);
+    }
+    note { text } => {
+      store(["feed", store.push("note: " .. text)]);
+    }
+    err { text } => {
+      store(["guardian", "err", store.set(text)]);
     }
   }
 }
 
-// ---- reads ----
+// ---- slug (the database) ----
 
-fn guardian_running() {
-  let r = store(["guardian", "running"]);
-  if !r {
-    return false;
+fn slug_rpc(cmd) {
+  let res = http.post(slug_url .. "/api/v0/rpc", json.encode([cmd]), {
+    Authorization = "Bearer " .. slug_token
+  });
+  if !res.ok {
+    let msg = "slug rpc transport error";
+    if res.error {
+      msg = msg .. ": " .. res.error;
+    }
+    return { ok = false, err = msg };
   }
-  return r;
+  if res.status >= 400 {
+    return { ok = false, err = "slug rpc HTTP " .. res.status .. ": " .. res.body };
+  }
+  return { ok = true, data = json.decode(res.body) };
 }
 
-// The two files with the fewest wins — they need judgments most.
-// Returns { a, b } where either may be false when too few files exist.
+fn slug_post_vote(winner_url, loser_url, why) {
+  let text = "{ " .. why .. " }\n" .. winner_url .. " 2:1 " .. loser_url .. "\n";
+  return slug_rpc({
+    Post = {
+      room = slug_room,
+      thread_tag = "judgments",
+      delegate = slug_delegate,
+      text = text
+    }
+  });
+}
+
+fn slug_rank_rows() {
+  let rows = [];
+  let res = slug_rpc({
+    GetGardenRank = { room = slug_room, parent_path = "~code-review" }
+  });
+  if res.ok {
+    if type(res.data) == "array" {
+      if len(res.data) > 0 {
+        let rank = res.data[0].result.GardenRank;
+        if type(rank) == "map" {
+          let comps = rank.components;
+          if comps && len(comps) > 0 {
+            let ranking = comps[0].ranking;
+            if ranking {
+              for i, r in ranking {
+                push(rows, { item = r.item, score = r.score });
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  return rows;
+}
+
+// ---- helpers ----
+
+fn rank_label(item, files) {
+  if files {
+    for i, f in files {
+      if str.has(item, f.url) {
+        return f.id;
+      }
+    }
+  }
+  return item;
+}
+
 fn pick_pair(files) {
   let a = false;
   let b = false;
@@ -71,14 +139,14 @@ fn pick_pair(files) {
       b = a;
       a = f;
     } else {
-      if f.wins < a.wins {
+      if f.judged < a.judged {
         b = a;
         a = f;
       } else {
         if !b {
           b = f;
         } else {
-          if f.wins < b.wins {
+          if f.judged < b.judged {
             b = f;
           }
         }
@@ -88,111 +156,174 @@ fn pick_pair(files) {
   return { a = a, b = b };
 }
 
+fn judge_prompt(a, b) {
+  return "You are a code-health guardian. Judge which of these two source files MOST needs refactoring, using the path and size as evidence (responsibility implied by the path; larger files with broad names are usually worse offenders).\n\n"
+    .. "a: " .. a.id .. " — " .. a.lines .. " lines\n"
+    .. "b: " .. b.id .. " — " .. b.lines .. " lines\n\n"
+    .. "Give one short paragraph of reasoning, then a final line that is ONLY this JSON: {\"winner\":\"a\",\"why\":\"one sentence\"} or {\"winner\":\"b\",\"why\":\"one sentence\"}.";
+}
+
 // ---- view ----
 
-fn guardian_view(files, votes, feed, ticks, running) {
-  let status = "⏸ paused";
-  if running {
-    status = "● running";
+fn pair_card(file, side) {
+  let cls = "pair-card pair-" .. side;
+  if !file {
+    return [:div, { class = cls }, [:p, { class = "muted" }, "…"]];
   }
-  let file_rows = [];
-  if files {
-    for i, f in files {
-      push(file_rows, [:li, {}, f.id .. " — " .. f.lines .. " lines · wins " .. f.wins]);
-    }
+  return [:div, { class = cls },
+    [:h3, {}, side],
+    [:p, { class = "mono" }, file.id],
+    [:p, { class = "muted" }, file.lines .. " lines"],
+    [:button, {
+      class = "pick",
+      onclick = fn(e) {
+        server!();
+        manual_pick(side);
+      }
+    }, side .. " wins"]
+  ];
+}
+
+fn app_view(status, files, rank_rows, feed, stream_a, stream_b, stream_text, err, replay_url) {
+  let parts = [];
+  push(parts, [:h1, {}, "guardian"]);
+  push(parts, [:p, { class = "meta" },
+    status .. " · ",
+    [:a, { href = replay_url }, "slug replay ↗"]
+  ]);
+  if err {
+    push(parts, [:p, { class = "err" }, err]);
   }
+  push(parts, [:div, { class = "row" },
+    [:button, { onclick = fn(e) { play(); } }, "play"],
+    [:button, { onclick = fn(e) { pause(); } }, "pause"],
+    [:button, { onclick = fn(e) { scan_repo(); } }, "scan repo"]
+  ]);
+  push(parts, [:h2, {}, "vote screen"]);
+  let pair = pick_pair(files);
+  push(parts, [:div, { class = "vote-row" },
+    (pair_card(pair.a, "a")),
+    [:div, { class = "vs" }, "vs"],
+    (pair_card(pair.b, "b"))
+  ]);
+  if stream_text != "" {
+    push(parts, [:div, { class = "stream" },
+      [:h3, {}, "guardian thinking: " .. stream_a .. " vs " .. stream_b],
+      [:pre, { class = "stream-tokens" }, stream_text]
+    ]);
+  }
+  push(parts, [:h2, {}, "slug ranking (the database)"]);
+  let rank_rows_view = [];
+  for i, r in rank_rows {
+    push(rank_rows_view, [:tr, {},
+      [:td, { class = "mono" }, rank_label(r.item, files)],
+      [:td, { class = "num" }, "" .. r.score]
+    ]);
+  }
+  push(parts, [:table, { class = "rank" },
+    [:tr, {}, [:th, {}, "file"], [:th, {}, "score"]],
+    rank_rows_view
+  ]);
+  push(parts, [:h2, {}, "judgment feed"]);
   let feed_rows = [];
   if feed {
     for i, j in feed {
       push(feed_rows, [:li, {}, j]);
     }
   }
-  return [:div, {},
-    [:h1, {}, "guardian"],
-    [:p, { class = "meta" }, status .. " · tick " .. ticks .. " · " .. votes .. " judgments"],
-    [:div, { class = "row" },
-      [:button, { id = "play", onclick = fn(e) { play(); } }, "play"],
-      [:button, { id = "pause", onclick = fn(e) { pause(); } }, "pause"],
-      [:button, { id = "once", onclick = fn(e) { judge_once(); } }, "judge once"]
-    ],
-    [:div, { class = "row" },
-      [:input, { id = "fpath", placeholder = "file path" }],
-      [:input, { id = "flines", placeholder = "lines" }],
-      [:button, { id = "add", onclick = fn(e) { add_from_form(); } }, "add file"]
-    ],
-    [:h2, {}, "judgment feed"],
-    [:ul, { id = "feed" }, feed_rows],
-    [:h2, {}, "files by wins"],
-    [:ul, { id = "files" }, file_rows]
-  ];
+  push(parts, [:ul, { id = "feed" }, feed_rows]);
+  return [:div, {}, parts];
 }
 
-fn render_app() {
+fn paint(stream_a, stream_b, stream_text) {
   let files = store.items(["files"]);
-  let votes = store(["votes"]);
-  if !votes {
-    votes = 0;
+  let ticks = store(["guardian", "ticks"]);
+  if !ticks {
+    ticks = 0;
   }
   let feed = store(["feed"]);
   if !feed {
     feed = [];
   }
-  let ticks = store(["guardian", "ticks"]);
-  if !ticks {
-    ticks = 0;
+  let err = store(["guardian", "err"]);
+  let status = "⏸ paused · tick " .. ticks;
+  if store(["guardian", "running"]) {
+    status = "● running · tick " .. ticks;
   }
-  let running = guardian_running();
+  let rank_rows = slug_rank_rows();
+  // server lets only evaluate on the server; ship URL strings as data.
+  let replay_url = slug_url .. "/r/" .. slug_room_web .. "/~/code-review?v=history";
   cast browsers {
-    hui.render("#app", guardian_view(files, votes, feed, ticks, running));
+    hui.render("#app", app_view(status, files, rank_rows, feed, stream_a, stream_b, stream_text, err, replay_url));
   }
 }
 
 // ---- flows ----
 
-fn add_from_form() {
-  let path = dom.get("#fpath");
-  let lines = dom.get("#flines");
-  server!();
-  if path != "" {
-    store.append({ type = "add_file", path = path, lines = lines });
-    render_app();
-  }
-}
-
 fn play() {
   server!();
   store.append({ type = "play" });
-  render_app();
+  paint("", "", "");
 }
 
 fn pause() {
   server!();
   store.append({ type = "pause" });
-  render_app();
+  paint("", "", "");
 }
 
-fn judge_once() {
+fn scan_repo() {
   server!();
-  let files = store.items(["files"]);
-  if files {
-    let pair = pick_pair(files);
-    if pair.a && pair.b {
-      store.append({
-        type = "judge",
-        winner = pair.a.id,
-        loser = pair.b.id,
-        why = "manual judge",
-        auto = false
-      });
-    }
+  let out = bash(repo_scanner);
+  if !out.ok {
+    store.append({ type = "err", text = "scan failed: " .. out.stderr });
+    paint("", "", "");
+    return;
   }
-  render_app();
+  let rows = json.decode(out.stdout);
+  if type(rows) != "array" {
+    store.append({ type = "err", text = "scan produced no files" });
+    paint("", "", "");
+    return;
+  }
+  let base = "https://github.com/sortersocial/slug/blob/main/";
+  for i, r in rows {
+    store.append({ type = "file", path = r.path, url = base .. r.path, lines = r.lines });
+  }
+  store.append({ type = "note", text = "scanned repo: files registered" });
+  paint("", "", "");
 }
 
-// Fired by hopd's scheduler as a plain server flow. Early-returns when
-// paused; otherwise marks the tick and casts one judgment into the graph.
+fn manual_pick(side) {
+  let files = store.items(["files"]);
+  if !files {
+    paint("", "", "");
+    return;
+  }
+  let pair = pick_pair(files);
+  if !pair.a || !pair.b {
+    paint("", "", "");
+    return;
+  }
+  let w = pair.a;
+  let l = pair.b;
+  if side == "b" {
+    w = pair.b;
+    l = pair.a;
+  }
+  let res = slug_post_vote(w.url, l.url, "manual review by human");
+  if !res.ok {
+    store.append({ type = "err", text = res.err });
+  } else {
+    store.append({ type = "manual", winner = w.id, loser = l.id });
+  }
+  paint("", "", "");
+}
+
+// Fired by hopd's scheduler. Picks the least-judged pair, streams the LLM's
+// reasoning live into the vote screen, then posts the verdict to slug.
 fn tick() {
-  if !guardian_running() {
+  if !store(["guardian", "running"]) {
     return;
   }
   let files = store.items(["files"]);
@@ -203,37 +334,55 @@ fn tick() {
   if !pair.a || !pair.b {
     return;
   }
+  store.append({ type = "tick_mark" });
+  let prompt = judge_prompt(pair.a, pair.b);
   let ticks = store(["guardian", "ticks"]);
   if !ticks {
     ticks = 0;
-  }
-  store.append({ type = "tick_mark" });
-  store.append({
-    type = "judge",
-    winner = pair.a.id,
-    loser = pair.b.id,
-    why = "guardian tick " .. ticks,
-    auto = true
-  });
-  render_app();
-}
-
-fn on_connect(sid) {
-  let files = store.items(["files"]);
-  let votes = store(["votes"]);
-  if !votes {
-    votes = 0;
   }
   let feed = store(["feed"]);
   if !feed {
     feed = [];
   }
-  let ticks = store(["guardian", "ticks"]);
-  if !ticks {
-    ticks = 0;
+  let status = "● running · tick " .. ticks;
+  let rank_rows = slug_rank_rows();
+  let replay_url = slug_url .. "/r/" .. slug_room_web .. "/~/code-review?v=history";
+  let h = llm.stream({ messages = [{ role = "user", content = prompt }] });
+  let acc = "";
+  let out = llm.next(h);
+  while out.delta {
+    acc = acc .. out.delta;
+    cast browsers {
+      hui.render("#app", app_view(status, files, rank_rows, feed, pair.a.id, pair.b.id, acc, nil, replay_url));
+    }
+    out = llm.next(h);
   }
-  let running = guardian_running();
-  cast session(sid) {
-    hui.render("#app", guardian_view(files, votes, feed, ticks, running));
+  if out.error {
+    store.append({ type = "err", text = "llm: " .. out.error });
+    paint("", "", "");
+    return;
   }
+  let verdict = json.first(out.text);
+  if type(verdict) != "map" {
+    store.append({ type = "err", text = "guardian could not parse a verdict" });
+    paint("", "", "");
+    return;
+  }
+  let w = pair.a;
+  let l = pair.b;
+  if verdict.winner == "b" {
+    w = pair.b;
+    l = pair.a;
+  }
+  let res = slug_post_vote(w.url, l.url, verdict.why);
+  if !res.ok {
+    store.append({ type = "err", text = res.err });
+  } else {
+    store.append({ type = "judged", winner = w.id, loser = l.id, why = verdict.why });
+  }
+  paint("", "", "");
+}
+
+fn on_connect(sid) {
+  paint("", "", "");
 }

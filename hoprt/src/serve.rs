@@ -667,6 +667,50 @@ fn llm_read_stream(
     Ok((acc, calls))
 }
 
+/// One outbound HTTP request for the `http` effect. Replies
+/// { ok, status, body } for any HTTP response (status errors included —
+/// the body is where APIs explain), { ok: false, error } on transport failure.
+fn http_run(method: &str, url: &str, body: &str, headers: Vec<(String, String)>) -> Value {
+    let mut req = match method {
+        "POST" => ureq::post(url),
+        "PUT" => ureq::put(url),
+        "DELETE" => ureq::delete(url),
+        _ => ureq::get(url),
+    };
+    let mut has_content_type = false;
+    for (k, v) in &headers {
+        if k.eq_ignore_ascii_case("content-type") {
+            has_content_type = true;
+        }
+        req = req.set(k, v);
+    }
+    // Agents speak JSON; default the content type when they don't say so.
+    if !has_content_type && method != "GET" && method != "DELETE" {
+        req = req.set("Content-Type", "application/json");
+    }
+    let res = if method == "GET" || method == "DELETE" {
+        req.call()
+    } else {
+        req.send_string(body)
+    };
+    let finish = |code: u16, resp: ureq::Response, ok: bool| {
+        let body = resp.into_string().unwrap_or_default();
+        result_map(vec![
+            ("ok", Value::Bool(ok)),
+            ("status", Value::Int(code as i64)),
+            ("body", Value::str(body)),
+        ])
+    };
+    match res {
+        Ok(resp) => finish(resp.status(), resp, true),
+        Err(ureq::Error::Status(code, resp)) => finish(code, resp, false),
+        Err(e) => result_map(vec![
+            ("ok", Value::Bool(false)),
+            ("error", Value::str(e.to_string())),
+        ]),
+    }
+}
+
 impl Effects {
     /// Handle a call packet addressed to "@effects": spawn the work,
     /// reply through the Ev channel. Never blocks the VM thread.
@@ -675,6 +719,24 @@ impl Effects {
         let hop = pkt.get_field("hop");
         let vars = pkt.get_field("vars");
         match hop.as_str().unwrap_or("") {
+            "http" => {
+                let method = crate::value::coerce_str(&vars.get_field("method"));
+                let url = crate::value::coerce_str(&vars.get_field("url"));
+                let body = crate::value::coerce_str(&vars.get_field("body"));
+                let mut header_pairs: Vec<(String, String)> = Vec::new();
+                if let Value::Map(hs) = &vars.get_field("headers") {
+                    for (k, v) in hs.borrow().iter() {
+                        if let (Some(k), Some(v)) = (k.as_str(), v.as_str()) {
+                            header_pairs.push((k.to_string(), v.to_string()));
+                        }
+                    }
+                }
+                let tx = tx.clone();
+                thread::spawn(move || {
+                    let value = http_run(&method, &url, &body, header_pairs);
+                    let _ = tx.send(Ev::Effect(effect_reply(&flow, value)));
+                });
+            }
             "bash" => {
                 let cmd = crate::value::coerce_str(&vars.get_field("cmd"));
                 let dir = vars.get_field("dir");

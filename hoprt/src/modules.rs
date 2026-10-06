@@ -59,6 +59,7 @@ fn builtin_modules() -> Vec<Module> {
         json_module(),
         markdown_module(),
         bash_module(),
+        http_module(),
         llm_module(),
         str_module(),
     ]
@@ -216,6 +217,61 @@ fn bash_vars(args: Vec<Value>) -> Result<Value, String> {
         if !dir.is_empty() {
             m.insert(Value::str("dir"), Value::str(dir));
         }
+    }
+    Ok(Value::map(m))
+}
+
+// ---------------------------------------------------------------------------
+// http — outbound requests as a first-class effect: agents talk to services
+// (webhooks, RPC, slug-as-a-database) without shelling out.
+// ---------------------------------------------------------------------------
+
+fn http_module() -> Module {
+    Module {
+        name: "http",
+        natives: vec![
+            NativeDef {
+                name: "http.get",
+                kind: NativeKind::Effect { hop: "http", vars: http_get_vars },
+            },
+            NativeDef {
+                name: "http.post",
+                kind: NativeKind::Effect { hop: "http", vars: http_post_vars },
+            },
+        ],
+    }
+}
+
+/// http.get(url) or http.get(url, headers)
+fn http_get_vars(args: Vec<Value>) -> Result<Value, String> {
+    let url = args
+        .first()
+        .and_then(Value::as_str)
+        .ok_or("http.get(url) expects a url string")?;
+    let mut m = BTreeMap::new();
+    m.insert(Value::str("method"), Value::str("GET"));
+    m.insert(Value::str("url"), Value::str(url));
+    if let Some(headers) = args.get(1) {
+        m.insert(Value::str("headers"), headers.clone());
+    }
+    Ok(Value::map(m))
+}
+
+/// http.post(url, body) or http.post(url, body, headers)
+fn http_post_vars(args: Vec<Value>) -> Result<Value, String> {
+    let url = args
+        .first()
+        .and_then(Value::as_str)
+        .ok_or("http.post(url, body) expects a url string")?;
+    let body = args
+        .get(1)
+        .ok_or("http.post(url, body) expects a body")?;
+    let mut m = BTreeMap::new();
+    m.insert(Value::str("method"), Value::str("POST"));
+    m.insert(Value::str("url"), Value::str(url));
+    m.insert(Value::str("body"), body.clone());
+    if let Some(headers) = args.get(2) {
+        m.insert(Value::str("headers"), headers.clone());
     }
     Ok(Value::map(m))
 }
