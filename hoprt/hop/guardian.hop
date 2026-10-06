@@ -107,21 +107,32 @@ fn slug_rank_rows() {
   let res = slug_rpc({
     GetGardenRank = { room = slug_room, parent_path = "~code-review" }
   });
-  if res.ok {
-    if type(res.data) == "array" {
-      if len(res.data) > 0 {
-        let rank = res.data[0].result.GardenRank;
-        if type(rank) == "map" {
-          let comps = rank.components;
-          if comps && len(comps) > 0 {
-            let ranking = comps[0].ranking;
-            if ranking {
-              for i, r in ranking {
-                push(rows, { item = r.item, score = r.score });
-              }
-            }
-          }
-        }
+  if !res.ok {
+    return rows;
+  }
+  // The RPC body wraps the batch in a map: { results: [ { ok, result: ... } ] }.
+  let results = res.data.results;
+  if !results || type(results) != "array" || len(results) == 0 {
+    return rows;
+  }
+  if !results[0].ok {
+    return rows;
+  }
+  let rank = results[0].result.GardenRank;
+  if !rank || type(rank) != "map" {
+    return rows;
+  }
+  // Rank centrality can split the vote graph into several components, each
+  // with its own ranking — collect every one, not just the first.
+  let comps = rank.components;
+  if !comps || len(comps) == 0 {
+    return rows;
+  }
+  for ci, comp in comps {
+    let ranking = comp.ranking;
+    if ranking {
+      for i, r in ranking {
+        push(rows, { item = r.item, score = r.score });
       }
     }
   }
