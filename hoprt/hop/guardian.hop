@@ -11,6 +11,7 @@ server let schema = store.record([
     ["running", store.leaf],
     ["judging", store.leaf],
     ["judging_at", store.leaf],
+    ["view", store.leaf],
     ["ticks", store.sum],
     ["err", store.leaf]
   ])],
@@ -52,6 +53,9 @@ fn reduce(event) {
     judging { flag, at } => {
       store(["guardian", "judging", store.set(flag)]);
       store(["guardian", "judging_at", store.set(at)]);
+    }
+    view { mode } => {
+      store(["guardian", "view", store.set(mode)]);
     }
     manual { winner, loser } => {
       store(["files", winner, "judged", store.add(1)]);
@@ -248,6 +252,9 @@ fn view_css() {
   return ".guardian-grid { display: flex; gap: 18px; align-items: flex-start; } "
     .. ".vote-col { flex: 1.2; min-width: 0; } "
     .. ".log-col { flex: 1; min-width: 0; } "
+    .. ".log-page { display: flex; flex-direction: column; height: 100vh; margin: 0; } "
+    .. ".log-topbar { padding: 8px 12px; border-bottom: 1px solid #ccc; background: white; } "
+    .. ".log-pane { flex: 1; overflow-y: auto; padding: 10px; background: #fafafa; } "
     .. ".judge-log { max-height: 62vh; overflow-y: auto; border: 1px solid #ccc; padding: 8px; background: #fafafa; } "
     .. ".judge-entry { white-space: pre-wrap; font-family: monospace; font-size: 12px; margin: 0 0 8px; padding: 6px; border-bottom: 1px solid #eee; } "
     .. ".stream-entry { background: #fff8d6; border: 1px solid #e0cf7a; } "
@@ -310,11 +317,58 @@ fn pair_card(file, side) {
   ];
 }
 
-fn app_view(status, files, rank_rows, feed, stream_a, stream_b, stream_text, err, chart) {
+// Newest first: the live edge pins to the top of the log — no autoscroll
+// needed, no JavaScript. (feed is pushed oldest-first; we render it reversed.)
+fn rev_entries(feed) {
+  let entries = [];
+  let n = 0;
+  for i, j in feed {
+    n = n + 1;
+  }
+  let k = n - 1;
+  while k >= 0 {
+    push(entries, [:pre, { class = "judge-entry" }, feed[k]]);
+    k = k - 1;
+  }
+  return entries;
+}
+
+// The fullscreen agent tail: back button on top, the entire lower pane is
+// the live judgment log.
+fn log_view(status, feed, stream_a, stream_b, stream_text, err) {
+  let entries = rev_entries(feed);
+  let live = [];
+  if stream_text != "" {
+    push(live, [:pre, { class = "judge-entry stream-entry" },
+      "guardian thinking: " .. stream_a .. " vs " .. stream_b .. "\n" .. stream_text
+    ]);
+  }
+  let parts = [];
+  push(parts, [:style, {}, view_css()]);
+  push(parts, [:div, { class = "log-topbar" },
+    [:button, { onclick = fn(e) { set_view("normal"); } }, "← back"],
+    " · ",
+    status
+  ]);
+  if err {
+    push(parts, [:p, { class = "err" }, err]);
+  }
+  push(parts, [:div, { class = "log-pane" }, live, entries]);
+  return [:div, { class = "log-page" }, parts];
+}
+
+fn app_view(status, files, rank_rows, feed, stream_a, stream_b, stream_text, err, chart, view) {
+  if view == "log" {
+    return log_view(status, feed, stream_a, stream_b, stream_text, err);
+  }
   let parts = [];
   push(parts, [:style, {}, view_css()]);
   push(parts, [:h1, {}, "guardian"]);
-  push(parts, [:p, { class = "meta" }, status]);
+  push(parts, [:p, { class = "meta" },
+    status,
+    " · ",
+    [:button, { onclick = fn(e) { set_view("log"); } }, "⤢ log"]
+  ]);
   if err {
     push(parts, [:p, { class = "err" }, err]);
   }
@@ -348,20 +402,14 @@ fn app_view(status, files, rank_rows, feed, stream_a, stream_b, stream_text, err
 
   let log_col = [];
   push(log_col, [:h2, {}, "judgment log"]);
-  let entries = [];
-  if feed {
-    for i, j in feed {
-      push(entries, [:pre, { class = "judge-entry" }, j]);
-    }
-  }
+  let entries = rev_entries(feed);
+  let live = [];
   if stream_text != "" {
-    push(entries, [:pre, { class = "judge-entry stream-entry" },
+    push(live, [:pre, { class = "judge-entry stream-entry" },
       "guardian thinking: " .. stream_a .. " vs " .. stream_b .. "\n" .. stream_text
     ]);
   }
-  push(entries, [:a, { id = "latest" }, ""]);
-  push(log_col, [:div, { class = "judge-log" }, entries]);
-  push(log_col, [:p, {}, [:a, { href = "#latest" }, "↓ latest"]]);
+  push(log_col, [:div, { class = "judge-log" }, live, entries]);
 
   push(parts, [:div, { class = "guardian-grid" },
     [:div, { class = "vote-col" }, vote_col],
@@ -387,8 +435,9 @@ fn paint(stream_a, stream_b, stream_text) {
   }
   let rank_rows = slug_rank_rows();
   let chart = slug_history_series(files);
+  let view = store(["guardian", "view"]);
   cast browsers {
-    hui.render("#app", app_view(status, files, rank_rows, feed, stream_a, stream_b, stream_text, err, chart));
+    hui.render("#app", app_view(status, files, rank_rows, feed, stream_a, stream_b, stream_text, err, chart, view));
   }
 }
 
@@ -403,6 +452,12 @@ fn play() {
 fn pause() {
   server!();
   store.append({ type = "pause" });
+  paint("", "", "");
+}
+
+fn set_view(mode) {
+  server!();
+  store.append({ type = "view", mode = mode });
   paint("", "", "");
 }
 
@@ -498,8 +553,9 @@ fn tick() {
   let out = llm.next(h);
   while out.delta {
     acc = acc .. out.delta;
+    let view = store(["guardian", "view"]);
     cast browsers {
-      hui.render("#app", app_view(status, files, rank_rows, feed, pair.a.id, pair.b.id, acc, nil, chart));
+      hui.render("#app", app_view(status, files, rank_rows, feed, pair.a.id, pair.b.id, acc, nil, chart, view));
     }
     out = llm.next(h);
   }
