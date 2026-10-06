@@ -41,6 +41,23 @@ try {
   window.__hopMorph = (sel, html) => {
     const el = document.querySelector(sel);
     if (!el) return;
+    // A view switch swaps in a structurally different tree (vote screen →
+    // fullscreen log/prompt). Morphing across those let idiomorph hoist
+    // old-tree nodes into new positions — a vote-screen `play` button once
+    // surfaced as the prompt view's back button, handler id and all. When
+    // the incoming root's first element differs from the current one,
+    // replace wholesale instead of merging.
+    const rootClass = (node) => {
+      const first = node && node.firstElementChild;
+      return first ? first.tagName + '.' + (first.className || '') : '';
+    };
+    const probe = document.createElement('div');
+    probe.innerHTML = html;
+    if (el.firstElementChild && probe.firstElementChild &&
+        rootClass(el) !== rootClass(probe)) {
+      el.innerHTML = html;
+      return;
+    }
     if (Idiomorph) {
       try {
         Idiomorph.morph(el, html, { morphStyle: 'innerHTML', ignoreActiveValue: true });
