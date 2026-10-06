@@ -359,14 +359,21 @@ fn pair_card(file, side) {
 
 // Newest first: the live edge pins to the top of the log — no autoscroll
 // needed, no JavaScript. (feed is pushed oldest-first; we render it reversed.)
+// The wire carries only the last 40 entries: the full record lives in the
+// durable log, and an unbounded feed made every paint megabytes — the
+// websocket died under its own weight and reconnects ate the clicks.
 fn rev_entries(feed) {
   let entries = [];
   let n = 0;
   for i, j in feed {
     n = n + 1;
   }
+  let start = n - 40;
+  if start < 0 {
+    start = 0;
+  }
   let k = n - 1;
-  while k >= 0 {
+  while k >= start {
     push(entries, [:pre, { class = "judge-entry" }, feed[k]]);
     k = k - 1;
   }

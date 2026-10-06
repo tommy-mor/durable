@@ -19,7 +19,7 @@
 //! are scheduled and run when the current segment finishes (arguments are
 //! evaluated eagerly at the spawn site).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::interp::{self, Exec, Globals, Host, NativeOut, Outcome};
@@ -85,18 +85,16 @@ struct Parked {
     on_complete: Complete,
 }
 
-/// Browser-side hiccup handler registry (hui).
+/// Browser-side hiccup handler registry (hui). Handlers register under
+/// STABLE keys (render-tree position + attr name): every render of the
+/// same position overwrites the closure under the same id, so the registry
+/// always holds the newest closure for a button and a DOM that lags a
+/// render still fires the right thing. Stale is stale — nothing lingers.
 #[derive(Default)]
 pub struct HuiState {
     handlers: HashMap<i64, Value>,
+    keys: HashMap<String, i64>,
     seq: i64,
-    root_ids: HashMap<String, Vec<i64>>,
-    /// Released generations, bounded: a detached node's click can arrive
-    /// after its render was replaced (fast paints re-render every few
-    /// seconds) — the id it names was released, but the closure is from the
-    /// previous generation and semantically identical. Honor it; the oldest
-    /// entries fall off so long sessions stay bounded.
-    graveyard: VecDeque<(i64, Value)>,
 }
 
 pub struct Vm {
@@ -222,22 +220,7 @@ impl Vm {
     /// the DOM event as a value (a map with e.g. `key` for keyboard
     /// events), or Nil where no event exists (the harness).
     pub fn fire_handler(&mut self, platform: &mut dyn Platform, id: i64, ev: Value) {
-        let h = self
-            .hui
-            .handlers
-            .get(&id)
-            .cloned()
-            .or_else(|| {
-                // a stale click from a detached node — its generation was
-                // replaced but the closure still means what it meant
-                self.hui
-                    .graveyard
-                    .iter()
-                    .rev()
-                    .find(|(gid, _)| *gid == id)
-                    .map(|(_, v)| v.clone())
-            });
-        if let Some(h) = h {
+        if let Some(h) = self.hui.handlers.get(&id).cloned() {
             self.start_flow(platform, h, vec![ev]);
         }
     }
@@ -598,21 +581,20 @@ impl Host for StepHost<'_> {
 
 // hui internals live in builtins.rs but operate on HuiState
 impl HuiState {
-    pub(crate) fn register(&mut self, sel: &str, h: Value) -> i64 {
+    /// Register a handler closure under a stable key (the render-tree
+    /// position plus the attr name). The first render of a position mints
+    /// the id; every later render of the same position overwrites the
+    /// closure under the SAME id — the registry never holds a dead handler,
+    /// and a DOM that lags a render still fires the current one.
+    pub(crate) fn register(&mut self, sel: &str, key: &str, h: Value) -> i64 {
+        let full = format!("{sel}#{key}");
+        if let Some(&id) = self.keys.get(&full) {
+            self.handlers.insert(id, h);
+            return id;
+        }
         self.seq += 1;
         self.handlers.insert(self.seq, h);
-        self.root_ids.entry(sel.to_string()).or_default().push(self.seq);
+        self.keys.insert(full, self.seq);
         self.seq
-    }
-
-    pub(crate) fn release_root(&mut self, sel: &str) {
-        for id in self.root_ids.remove(sel).unwrap_or_default() {
-            if let Some(h) = self.handlers.remove(&id) {
-                self.graveyard.push_back((id, h));
-                while self.graveyard.len() > 4096 {
-                    self.graveyard.pop_front();
-                }
-            }
-        }
     }
 }

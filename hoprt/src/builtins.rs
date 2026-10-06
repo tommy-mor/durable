@@ -17,7 +17,7 @@
 //! never reused. Handlers run as flows — a handler body may hop.
 
 use crate::rt::HuiState;
-use crate::value::{coerce_str, NativeId, Value};
+use crate::value::{coerce_str, ClosureVal, NativeId, Value};
 
 /// The store module: fields resolved on the callable `store` native.
 /// Shape constructors, the tape, view sugar, and the path vocabulary —
@@ -40,6 +40,9 @@ pub fn store_field(name: &str) -> Option<Value> {
         "append" => Value::Native(NativeId::StoreAppend),
         "items" => Value::Native(NativeId::StoreItems),
         "verify" => Value::Native(NativeId::StoreVerify),
+        // presence: "is any leaf at or under this path non-null?" — the only
+        // honest existence check in an auto-vivifying keyspace
+        "has" => Value::Native(NativeId::StoreHas),
         // collecting navigators: a path containing one is a select
         "all" | "keys" | "vals" | "first" | "last" | "entries" => {
             Value::tagged("nav", Value::str(name))
@@ -172,8 +175,16 @@ fn esc(s: &str) -> String {
 }
 
 pub fn hui_render(state: &mut HuiState, sel: &str, node: &Value) -> Result<String, String> {
-    state.release_root(sel);
     render_node(state, sel, node)
+}
+
+/// A handler's stable identity: which function it invokes plus what it
+/// captured, in diagnostic notation. Same fn and same captures mean the
+/// same behavior — so the same handler id — across re-renders and list
+/// reorders. Rendered with Display, which is deterministic per platform.
+fn closure_key(c: &ClosureVal) -> String {
+    let caps = c.caps.iter().map(|v| format!("{v}")).collect::<Vec<_>>().join(",");
+    format!("fn{}({})", c.fn_idx, caps)
 }
 
 fn render_node(state: &mut HuiState, sel: &str, node: &Value) -> Result<String, String> {
@@ -209,8 +220,15 @@ fn render_node(state: &mut HuiState, sel: &str, node: &Value) -> Result<String, 
                         other => return Err(format!("attr name must be a string, got {}", other.kind())),
                     };
                     match v {
-                        Value::Closure(_) => {
-                            let id = state.register(sel, v.clone());
+                        Value::Closure(c) => {
+                            // the key is the closure's IDENTITY — which fn it
+                            // invokes plus what it captured. Same fn and same
+                            // captures mean the same behavior, so the id is
+                            // stable across re-renders and list reorders: the
+                            // registry always holds the current closure and
+                            // no id ever goes dead.
+                            let key = closure_key(c);
+                            let id = state.register(sel, &key, v.clone());
                             attrs.push_str(&format!(" {name}=\"__hopHandler({id}, event)\""));
                         }
                         Value::Bool(true) => attrs.push_str(&format!(" {name}")),

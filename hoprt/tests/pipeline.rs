@@ -81,10 +81,11 @@ fn todo_app_runs_on_simulated_cluster() {
     host.fire("A", "sim_demo");
     host.pump();
 
-    // Renders go to #app. After two adds the first item's onclick is
-    // handler 4 (render 1 mints button=1, milk=2; render 2 mints button=3,
-    // milk=4, compiler=5).
-    host.fire_handler("A", 4);
+    // Renders go to #app. Handlers register under their closure identity:
+    // the add button (no captures) is id 1 forever, milk's toggle (captures
+    // id 0) is id 2 forever, and the second render only MINTS compiler's
+    // toggle (captures id 1) as id 3 — re-renders never re-mint or orphan.
+    host.fire_handler("A", 2);
     host.pump();
     host.assert_quiescent();
 
@@ -105,7 +106,9 @@ fn lambda_with_marks_ships_only_its_captures() {
     let mut host = Cluster::new(&["A"], src, false).expect("cluster");
     host.fire("A", "sim_demo");
     host.pump();
-    host.fire_handler("A", 4);
+    // milk's toggle is registered under its closure identity (fn + capture
+    // id 0) — the same id on every render
+    host.fire_handler("A", 2);
     host.pump();
     host.assert_quiescent();
 

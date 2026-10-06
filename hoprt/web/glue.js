@@ -96,7 +96,11 @@ try {
 
   const sendBytes = (bytes) => {
     if (ws && ws.readyState === WebSocket.OPEN) ws.send(bytes);
-    else if (!everOpened) outbound.push(bytes);
+    // NEVER silently discard: a click sent while the socket reconnects is
+    // the human's intent. Queue (bounded) and flush on open. The old code
+    // dropped these — under a flood of megabyte paints the socket reconnected
+    // constantly and ate every click in the gaps.
+    else if (outbound.length < 64) outbound.push(bytes);
   };
 
   const openSocket = () => {
@@ -117,15 +121,14 @@ try {
       if (my !== gen) return;
       attempt = 0;
       say('connected');
-      if (!everOpened) {
-        for (const b of outbound) socket.send(b);
-      }
+      // flush whatever queued during the gap — clicks are intent; a stale
+      // queued paint is harmless (the next paint supersedes it)
+      for (const b of outbound) socket.send(b);
       everOpened = true;
       outbound.length = 0;
     };
     socket.onclose = () => {
       if (my !== gen) return;
-      outbound.length = 0;
       if (reconnectTimer) return;
       if (document.visibilityState === 'hidden') {
         say('disconnected — waiting for this tab');
