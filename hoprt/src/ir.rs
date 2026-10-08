@@ -93,6 +93,23 @@ pub struct Function {
     pub n_params: u8,
     pub n_locals: u16,
     pub code: Vec<Instr>,
+    /// slot → source name for the runtime trace (blank for hidden slots)
+    pub locals_dbg: Vec<String>,
+}
+
+/// What crosses one hop, recorded at compile time (hopc --explain):
+/// the vars a piece expects coming in, and the locals it replies with
+/// when the caller's continuation still needs them.
+#[derive(Clone, Debug)]
+pub struct HopExplain {
+    /// hop id of the piece (`add_todo:1`, `f:c1` for casts)
+    pub hop: String,
+    /// "server", "browser", or "cast"
+    pub side: String,
+    /// the vars map the piece expects, in wire order
+    pub ship: Vec<String>,
+    /// locals the piece replies with (almost always empty)
+    pub reply: Vec<String>,
 }
 
 #[derive(Clone, Default)]
@@ -106,6 +123,10 @@ pub struct Program {
     /// `server let` initializers: (global name, thunk fn) — run on the
     /// server VM only, in declaration order.
     pub server_lets: Vec<(String, usize)>,
+    /// per-hop shipping, in creation order (hopc --explain)
+    pub explain: Vec<HopExplain>,
+    /// non-fatal compile warnings (hopc prints them to stderr)
+    pub warnings: Vec<String>,
 }
 
 impl Program {
@@ -118,6 +139,23 @@ impl Program {
             Value::Str(s) => s,
             other => panic!("const {k} is not a string: {other}"),
         }
+    }
+
+    /// hopc --explain: what crosses each hop, one line per hop function.
+    pub fn explain_listing(&self) -> String {
+        use std::fmt::Write;
+        let mut out = String::new();
+        for e in &self.explain {
+            let _ = writeln!(
+                out,
+                "{}  side={}  ship={{{}}}  reply={{{}}}",
+                e.hop,
+                e.side,
+                e.ship.join(", "),
+                e.reply.join(", ")
+            );
+        }
+        out
     }
 
     /// Human-readable listing (hopc --dump, log mode).

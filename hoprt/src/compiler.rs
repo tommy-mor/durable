@@ -24,27 +24,30 @@
 //!        | "fn" "(" params ")" block               lambda; may contain marks
 //! ```
 //!
-//! Compilation of a marked function: the body splits into segments at the
-//! marks; segment 0 becomes the origin function; each later segment is
-//! compiled as a separate IR function registered under a stable hop id
-//! (`name:i`) and chained via the `At` instruction. What crosses each hop
-//! is computed here, statically: the variables referenced by the remainder
-//! that are in scope before the mark. Cast bodies compile the same way
-//! under `name:cN` ids with their own captured-vars set.
+//! Compilation of a marked function: the body lowers to a control-flow
+//! graph of basic blocks (see the CFG pipeline below). A placement mark is
+//! a call edge — the current piece parks at `At` and resumes when the far
+//! piece replies — so marks are legal anywhere a flow body reaches:
+//! branches, loops, match arms. What crosses each hop is LiveIn of the far
+//! piece's entry block, computed by backwards liveness over the graph;
+//! what comes back in a reply is the continuation's live vars the far
+//! piece defined. Hop functions register under stable hop ids
+//! (`name:N` in textual mark order). Cast bodies compile the same way
+//! under `name:cN` ids with their own captured-vars set (marks stay
+//! illegal inside casts — a fire-and-forget message cannot hop).
 //!
-//! Lambdas may contain marks. A lambda's segment 0 becomes a closure whose
+//! Lambdas may contain marks. A lambda's piece 0 becomes a closure whose
 //! captures are copied from the enclosing frame at the `Closure`
 //! instruction — closures never cross the wire. Only the marked remainder
 //! ships, under `enclosing:lN:i` hop ids. This is what makes hiccup
 //! attributes like `onclick = fn(e) { server!(); ... }` work.
 //!
-//! v0 restrictions (deliberate): marks only at the top level of a function
-//! or lambda body; flows originate on the browser; no
+//! Remaining restrictions (deliberate): flows originate on the browser; no
 //! try/catch (errors still propagate — they surface at the flow origin).
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use crate::ir::{BinOp, Function, Instr, Program, UnOp};
+use crate::ir::{BinOp, Function, HopExplain, Instr, Program, UnOp};
 use crate::value::Value;
 
 // ---------------------------------------------------------------------------
@@ -220,11 +223,13 @@ enum CastTarget {
 }
 
 /// One `match` arm: `tag { field, ... } => block`. `tag == None` is the
-/// `else` arm (no fields, always matches).
+/// `else` arm (no fields, always matches). Fields are (key, local): the
+/// map key to extract and the local it binds — the renamer rewrites the
+/// local, never the key.
 #[derive(Debug, Clone)]
 struct MatchArm {
     tag: Option<String>,
-    fields: Vec<String>,
+    fields: Vec<(String, String)>,
     body: Vec<Stmt>,
 }
 
@@ -496,7 +501,8 @@ impl Parser {
                 if matches!(self.peek(), Some(Tok::LBrace)) {
                     self.pos += 1;
                     while !matches!(self.peek(), Some(Tok::RBrace)) {
-                        fields.push(self.ident()?);
+                        let f = self.ident()?;
+                        fields.push((f.clone(), f));
                         if matches!(self.peek(), Some(Tok::Comma)) {
                             self.pos += 1;
                         }
@@ -778,65 +784,55 @@ fn refs_stmts(ss: &[Stmt], out: &mut BTreeSet<String>) {
     }
 }
 
-fn toplevel_lets(ss: &[Stmt]) -> Vec<String> {
-    ss.iter()
-        .filter_map(|s| match s {
-            Stmt::Let(n, _) => Some(n.clone()),
-            _ => None,
-        })
-        .collect()
-}
-
-/// Marks are only legal at the top level of a (fn or lambda) body — not in
-/// branches, loops, or cast bodies. Lambda bodies are separate flow bodies
-/// and are checked when the lambda itself is compiled.
-fn check_no_nested_marks(ss: &[Stmt]) -> Result<(), String> {
-    let reject = |body: &[Stmt], what: &str| -> Result<(), String> {
+/// Marks are legal anywhere a flow body reaches — branches, loops, match
+/// arms — EXCEPT cast bodies: a cast is a fire-and-forget message whose
+/// body already runs on the target, so a hop inside it has no meaning.
+/// Lambda bodies are separate flow bodies, checked when they compile.
+fn check_no_cast_marks(ss: &[Stmt]) -> Result<(), String> {
+    /// Inside a cast: no mark at any depth.
+    fn reject_in(body: &[Stmt]) -> Result<(), String> {
         for st in body {
             if matches!(st, Stmt::Mark(_)) {
-                return Err(format!("v0: placement marks are not allowed inside {what}"));
+                return Err("placement marks are not allowed inside cast bodies".into());
+            }
+            match st {
+                Stmt::If(_, t, e) => {
+                    reject_in(t)?;
+                    if let Some(e) = e {
+                        reject_in(e)?;
+                    }
+                }
+                Stmt::Match(_, arms) => {
+                    for a in arms {
+                        reject_in(&a.body)?;
+                    }
+                }
+                Stmt::For(_, _, _, b) | Stmt::While(_, b) => reject_in(b)?,
+                Stmt::Cast(_, b) => reject_in(b)?,
+                _ => {}
             }
         }
-        check_no_nested_marks(body)
-    };
+        Ok(())
+    }
     for s in ss {
         match s {
+            Stmt::Cast(_, body) => reject_in(body)?,
             Stmt::If(_, t, e) => {
-                reject(t, "branches; marks must be at the top level of a function body")?;
+                check_no_cast_marks(t)?;
                 if let Some(e) = e {
-                    reject(e, "branches; marks must be at the top level of a function body")?;
+                    check_no_cast_marks(e)?;
                 }
             }
             Stmt::Match(_, arms) => {
-                for arm in arms {
-                    reject(&arm.body, "match arms; marks must be at the top level of a function body")?;
+                for a in arms {
+                    check_no_cast_marks(&a.body)?;
                 }
             }
-            Stmt::For(_, _, _, body) | Stmt::While(_, body) => {
-                reject(body, "loop bodies; marks must be at the top level of a function body")?
-            }
-            Stmt::Cast(_, body) => reject(body, "cast bodies")?,
+            Stmt::For(_, _, _, b) | Stmt::While(_, b) => check_no_cast_marks(b)?,
             _ => {}
         }
     }
     Ok(())
-}
-
-/// Split a flow body at its top-level marks.
-fn split_segments(body: &[Stmt], name: &str) -> Result<Vec<(Side, Vec<Stmt>)>, String> {
-    let mut segs: Vec<(Side, Vec<Stmt>)> = vec![(Side::Browser, Vec::new())];
-    for s in body {
-        if let Stmt::Mark(side) = s {
-            let (cur, _) = segs.last().unwrap();
-            if *cur == *side {
-                return Err(format!("{name}: mark to the side already executing"));
-            }
-            segs.push((*side, Vec::new()));
-        } else {
-            segs.last_mut().unwrap().1.push(s.clone());
-        }
-    }
-    Ok(segs)
 }
 
 // ---------------------------------------------------------------------------
@@ -858,6 +854,8 @@ struct Cg {
     hops: HashMap<String, usize>,
     named: HashMap<String, usize>,
     server_lets: Vec<(String, usize)>,
+    explain: Vec<HopExplain>,
+    warnings: Vec<String>,
 }
 
 impl Cg {
@@ -915,6 +913,9 @@ struct Fb {
     n_caps: u8,
     n_params: u8,
     code: Vec<Instr>,
+    /// slot → source name, append-only, never truncated — the runtime
+    /// trace's name table (hidden slots stay blank)
+    dbg_names: Vec<String>,
 }
 
 impl Fb {
@@ -926,12 +927,14 @@ impl Fb {
             n_caps: 0,
             n_params: 0,
             code: Vec::new(),
+            dbg_names: Vec::new(),
         }
     }
 
     fn def_local(&mut self, name: &str) -> u16 {
         let slot = self.n_locals;
         self.n_locals += 1;
+        self.dbg_names.push(name.to_string());
         self.scope.push((name.to_string(), slot));
         slot
     }
@@ -939,15 +942,12 @@ impl Fb {
     fn hidden_local(&mut self) -> u16 {
         let slot = self.n_locals;
         self.n_locals += 1;
+        self.dbg_names.push(String::new());
         slot
     }
 
     fn lookup(&self, name: &str) -> Option<u16> {
         self.scope.iter().rev().find(|(n, _)| n == name).map(|(_, s)| *s)
-    }
-
-    fn scope_names(&self) -> Vec<String> {
-        self.scope.iter().map(|(n, _)| n.clone()).collect()
     }
 
     fn emit(&mut self, i: Instr) {
@@ -962,7 +962,12 @@ impl Fb {
 
     /// Patch a placeholder to jump to the current end of code.
     fn patch_to_here(&mut self, at: usize) {
-        let d = self.code.len() as i32 - (at as i32 + 1);
+        self.patch_to(at, self.code.len());
+    }
+
+    /// Patch a placeholder to jump to a known code position.
+    fn patch_to(&mut self, at: usize, target: usize) {
+        let d = target as i32 - (at as i32 + 1);
         self.code[at] = match self.code[at] {
             Instr::Jump(_) => Instr::Jump(d),
             Instr::JumpIfFalse(_) => Instr::JumpIfFalse(d),
@@ -978,6 +983,7 @@ impl Fb {
             n_params: self.n_params,
             n_locals: self.n_locals.max((self.n_caps as u16) + (self.n_params as u16)),
             code: self.code,
+            locals_dbg: self.dbg_names,
         }
     }
 }
@@ -1195,12 +1201,625 @@ fn compile_segment(
     }
     let fn_idx = cg.add_fn(fb.into_function());
     cg.hops.insert(id.to_string(), fn_idx);
+    cg.explain.push(HopExplain {
+        hop: id.to_string(),
+        side: "cast".to_string(),
+        ship: ship.iter().cloned().collect(),
+        reply: Vec::new(),
+    });
     Ok(())
 }
 
-/// Emit a flow body into `fb` (a named fn or a lambda's segment 0): the
-/// segment-0 code plus the chain into segment 1 when marks are present.
-/// Later segments are compiled as separate hop functions.
+// ---------------------------------------------------------------------------
+// CFG pipeline: AST → basic blocks → liveness → IR
+//
+// A body compiles to a graph of basic blocks, each tagged with the piece
+// (same-side region) it belongs to. A placement mark is a CALL edge: the
+// current piece parks at `At` and resumes when the far piece replies, so
+// the frame — iterators, hidden slots, everything — never crosses the
+// wire. Each far-side piece is a hop function (`prefix:N`) entered with
+// exactly LiveIn(entry) as its vars map. A piece's exit replies with the
+// caller-continuation's live vars that the piece itself defined (almost
+// always none: cross-side state belongs in the store, and a flow's
+// locals die with their frame).
+//
+// Marks alternate sides and nest like calls: a mark to the side of the
+// piece that parked us ends the current piece (its reply resumes the
+// parked frame); any other mark pushes a new piece. A piece's lexical
+// extent is the rest of the enclosing block — when a block ends with
+// pieces still open, they exit in LIFO order.
+// ---------------------------------------------------------------------------
+
+/// Alpha-rename a body: every binding (params, lets, loop k/v, match
+/// field locals, lambda params) gets a unique name, so liveness and scope
+/// analysis never confuse shadowed variables. Names are stable: the first
+/// binding keeps its source name, later bindings of the same source name
+/// get `#2`, `#3`, ... in preorder — programs without shadowing compile
+/// to byte-identical wire maps. Match field KEYS are never renamed (they
+/// name map fields, not variables).
+struct Renamer {
+    env: Vec<HashMap<String, String>>,
+    seen: HashMap<String, usize>,
+}
+
+impl Renamer {
+    fn new() -> Renamer {
+        Renamer { env: vec![HashMap::new()], seen: HashMap::new() }
+    }
+
+    fn bind(&mut self, name: &str) -> String {
+        let n = self.seen.entry(name.to_string()).or_insert(0);
+        *n += 1;
+        let fresh = if *n == 1 { name.to_string() } else { format!("{name}#{n}") };
+        self.env
+            .last_mut()
+            .expect("base scope")
+            .insert(name.to_string(), fresh.clone());
+        fresh
+    }
+
+    fn resolve(&self, name: &str) -> String {
+        for scope in self.env.iter().rev() {
+            if let Some(f) = scope.get(name) {
+                return f.clone();
+            }
+        }
+        name.to_string() // unbound: a global (store, json, hui, ...)
+    }
+
+    fn push(&mut self) {
+        self.env.push(HashMap::new());
+    }
+
+    fn pop(&mut self) {
+        self.env.pop();
+    }
+
+    fn expr(&mut self, e: &Expr) -> Expr {
+        match e {
+            Expr::Num(_) | Expr::Str(_) | Expr::Bool(_) | Expr::Nil => e.clone(),
+            Expr::Ident(n) => Expr::Ident(self.resolve(n)),
+            Expr::Field(b, f) => Expr::Field(Box::new(self.expr(b)), f.clone()),
+            Expr::Index(a, i) => Expr::Index(Box::new(self.expr(a)), Box::new(self.expr(i))),
+            Expr::Call(f, args) => Expr::Call(
+                Box::new(self.expr(f)),
+                args.iter().map(|a| self.expr(a)).collect(),
+            ),
+            Expr::Unary(op, a) => Expr::Unary(op, Box::new(self.expr(a))),
+            Expr::Binary(op, a, b) => {
+                Expr::Binary(op, Box::new(self.expr(a)), Box::new(self.expr(b)))
+            }
+            Expr::Table(fs) => Expr::Table(
+                fs.iter().map(|(k, v)| (k.clone(), self.expr(v))).collect(),
+            ),
+            Expr::Array(items) => Expr::Array(items.iter().map(|v| self.expr(v)).collect()),
+            Expr::Fn(params, body) => {
+                self.push();
+                let params: Vec<String> = params.iter().map(|p| self.bind(p)).collect();
+                let body = self.stmts(body);
+                self.pop();
+                Expr::Fn(params, body)
+            }
+        }
+    }
+
+    fn stmts(&mut self, ss: &[Stmt]) -> Vec<Stmt> {
+        ss.iter().map(|s| self.stmt(s)).collect()
+    }
+
+    fn stmt(&mut self, s: &Stmt) -> Stmt {
+        match s {
+            Stmt::Let(n, e) => {
+                let e = self.expr(e);
+                let n = self.bind(n);
+                Stmt::Let(n, e)
+            }
+            Stmt::Assign(l, r) => Stmt::Assign(self.expr(l), self.expr(r)),
+            Stmt::Return(e) => Stmt::Return(e.as_ref().map(|e| self.expr(e))),
+            Stmt::If(c, t, els) => {
+                let c = self.expr(c);
+                self.push();
+                let t = self.stmts(t);
+                self.pop();
+                let els = els.as_ref().map(|es| {
+                    self.push();
+                    let es = self.stmts(es);
+                    self.pop();
+                    es
+                });
+                Stmt::If(c, t, els)
+            }
+            Stmt::Match(subject, arms) => {
+                let subject = self.expr(subject);
+                let arms = arms
+                    .iter()
+                    .map(|arm| {
+                        self.push();
+                        let fields = arm
+                            .fields
+                            .iter()
+                            .map(|(key, _)| (key.clone(), self.bind(key)))
+                            .collect();
+                        let body = self.stmts(&arm.body);
+                        self.pop();
+                        MatchArm { tag: arm.tag.clone(), fields, body }
+                    })
+                    .collect();
+                Stmt::Match(subject, arms)
+            }
+            Stmt::For(k, v, e, body) => {
+                let e = self.expr(e);
+                self.push();
+                let k = self.bind(k);
+                let v = self.bind(v);
+                let body = self.stmts(body);
+                self.pop();
+                Stmt::For(k, v, e, body)
+            }
+            Stmt::While(c, body) => {
+                let c = self.expr(c);
+                self.push();
+                let body = self.stmts(body);
+                self.pop();
+                Stmt::While(c, body)
+            }
+            Stmt::Mark(side) => Stmt::Mark(*side),
+            Stmt::Cast(target, body) => {
+                let target = match target {
+                    CastTarget::Browsers => CastTarget::Browsers,
+                    CastTarget::Server => CastTarget::Server,
+                    CastTarget::Session(e) => CastTarget::Session(self.expr(e)),
+                    CastTarget::User(e) => CastTarget::User(self.expr(e)),
+                };
+                self.push();
+                let body = self.stmts(body);
+                self.pop();
+                Stmt::Cast(target, body)
+            }
+            Stmt::Spawn(e) => Stmt::Spawn(self.expr(e)),
+            Stmt::Expr(e) => Stmt::Expr(self.expr(e)),
+        }
+    }
+}
+
+/// A straight-line statement inside a basic block: no control flow, no
+/// marks. Loop/match machinery whose hidden slots must be allocated at
+/// emission time is spelled out symbolically by id.
+#[derive(Debug, Clone)]
+enum Simple {
+    Let(String, Expr),
+    Assign(Expr, Expr),
+    Expr(Expr),
+    Spawn(Expr),
+    Cast(CastTarget, Vec<Stmt>),
+    /// evaluate the collection, IterNew, zero the index (loop id-keyed)
+    ForInit(usize, Expr),
+    /// evaluate the subject into hidden subj/tag slots (match id-keyed)
+    MatchHead(usize, Expr),
+    /// destructure an arm's (key, local) fields from the hidden subject
+    MatchFields(usize, Vec<(String, String)>),
+}
+
+#[derive(Debug, Clone)]
+enum Term {
+    /// builder's unsealed tail (never emitted: sealed or dead)
+    Open,
+    Jump(usize),
+    Branch(Expr, usize, usize),
+    ForNext {
+        loop_id: usize,
+        k: String,
+        v: String,
+        body: usize,
+        end: usize,
+    },
+    /// arms are (tag, entry block) in source order; `fall` catches a miss
+    Match {
+        id: usize,
+        arms: Vec<(Option<String>, usize)>,
+        fall: usize,
+    },
+    /// a placement mark: call the far piece, resume at `cont`
+    Mark { side: Side, piece: usize, cont: usize },
+    Return(Option<Expr>),
+    /// piece tail: reply to the parked caller (or end the flow)
+    Exit,
+}
+
+#[derive(Debug)]
+struct Block {
+    piece: usize,
+    stmts: Vec<Simple>,
+    term: Term,
+}
+
+#[derive(Debug)]
+struct Piece {
+    side: Side,
+    entry: usize,
+    hop_id: String,
+}
+
+#[derive(Debug)]
+struct Cfg {
+    blocks: Vec<Block>,
+    pieces: Vec<Piece>, // pieces[0] is the origin function
+}
+
+struct CfgBuilder {
+    blocks: Vec<Block>,
+    pieces: Vec<Piece>,
+    prefix: String,
+    piece_n: usize,
+    loop_n: usize,
+    match_n: usize,
+    /// (piece, resume block) parked by each open mark, innermost last
+    stack: Vec<(usize, usize)>,
+}
+
+impl CfgBuilder {
+    fn new(prefix: &str) -> CfgBuilder {
+        CfgBuilder {
+            blocks: vec![Block { piece: 0, stmts: vec![], term: Term::Open }],
+            pieces: vec![Piece {
+                side: Side::Browser,
+                entry: 0,
+                hop_id: String::new(),
+            }],
+            prefix: prefix.to_string(),
+            piece_n: 0,
+            loop_n: 0,
+            match_n: 0,
+            stack: vec![],
+        }
+    }
+
+    fn block(&mut self, piece: usize) -> usize {
+        self.blocks.push(Block { piece, stmts: vec![], term: Term::Open });
+        self.blocks.len() - 1
+    }
+
+    fn seal(&mut self, b: usize, t: Term) {
+        if matches!(self.blocks[b].term, Term::Open) {
+            self.blocks[b].term = t;
+        }
+    }
+
+    fn build(mut self, body: &[Stmt]) -> Result<Cfg, String> {
+        let tail = self.stmts(body, 0, 0)?;
+        self.seal(tail, Term::Exit);
+        // dead tails (code after `return`) seal Exit too; reachability
+        // skips them at emission
+        for i in 0..self.blocks.len() {
+            self.seal(i, Term::Exit);
+        }
+        Ok(Cfg { blocks: self.blocks, pieces: self.pieces })
+    }
+
+    /// Build stmts into block `cur` (in piece `p`); returns the open tail.
+    /// When this lexical block ends, pieces opened inside it exit in LIFO
+    /// order and control resumes in the caller's piece.
+    fn stmts(&mut self, ss: &[Stmt], cur0: usize, p0: usize) -> Result<usize, String> {
+        let depth = self.stack.len();
+        let mut cur = cur0;
+        let mut p = p0;
+        for s in ss {
+            match s {
+                Stmt::Let(n, e) => self.blocks[cur].stmts.push(Simple::Let(n.clone(), e.clone())),
+                Stmt::Assign(l, r) => {
+                    self.blocks[cur].stmts.push(Simple::Assign(l.clone(), r.clone()))
+                }
+                Stmt::Expr(e) => self.blocks[cur].stmts.push(Simple::Expr(e.clone())),
+                Stmt::Spawn(e) => self.blocks[cur].stmts.push(Simple::Spawn(e.clone())),
+                Stmt::Cast(t, body) => {
+                    self.blocks[cur].stmts.push(Simple::Cast(t.clone(), body.clone()))
+                }
+                Stmt::Return(e) => {
+                    self.blocks[cur].term = Term::Return(e.clone());
+                    cur = self.block(p); // dead continuation, never reached
+                }
+                Stmt::If(c, t, els) => {
+                    let then_b = self.block(p);
+                    let join = self.block(p);
+                    let else_b = if els.is_some() { self.block(p) } else { join };
+                    self.blocks[cur].term = Term::Branch(c.clone(), then_b, else_b);
+                    let t = self.stmts(t, then_b, p)?;
+                    self.seal(t, Term::Jump(join));
+                    if let Some(els) = els {
+                        let e = self.stmts(els, else_b, p)?;
+                        self.seal(e, Term::Jump(join));
+                    }
+                    cur = join;
+                }
+                Stmt::While(c, body) => {
+                    let header = self.block(p);
+                    self.seal(cur, Term::Jump(header));
+                    let body_b = self.block(p);
+                    let end = self.block(p);
+                    self.blocks[header].term = Term::Branch(c.clone(), body_b, end);
+                    let t = self.stmts(body, body_b, p)?;
+                    self.seal(t, Term::Jump(header));
+                    cur = end;
+                }
+                Stmt::For(k, v, e, body) => {
+                    let loop_id = self.loop_n;
+                    self.loop_n += 1;
+                    self.blocks[cur].stmts.push(Simple::ForInit(loop_id, e.clone()));
+                    let header = self.block(p);
+                    self.seal(cur, Term::Jump(header));
+                    let body_b = self.block(p);
+                    let end = self.block(p);
+                    self.blocks[header].term = Term::ForNext {
+                        loop_id,
+                        k: k.clone(),
+                        v: v.clone(),
+                        body: body_b,
+                        end,
+                    };
+                    let t = self.stmts(body, body_b, p)?;
+                    self.seal(t, Term::Jump(header));
+                    cur = end;
+                }
+                Stmt::Match(subject, arms) => {
+                    let id = self.match_n;
+                    self.match_n += 1;
+                    self.blocks[cur].stmts.push(Simple::MatchHead(id, subject.clone()));
+                    let join = self.block(p);
+                    let mut arm_entries = Vec::new();
+                    for arm in arms {
+                        let entry = self.block(p);
+                        if !arm.fields.is_empty() {
+                            self.blocks[entry]
+                                .stmts
+                                .push(Simple::MatchFields(id, arm.fields.clone()));
+                        }
+                        let t = self.stmts(&arm.body, entry, p)?;
+                        self.seal(t, Term::Jump(join));
+                        arm_entries.push((arm.tag.clone(), entry));
+                    }
+                    self.blocks[cur].term = Term::Match { id, arms: arm_entries, fall: join };
+                    cur = join;
+                }
+                Stmt::Mark(side) => {
+                    let (c2, p2) = self.mark(*side, cur, p)?;
+                    cur = c2;
+                    p = p2;
+                }
+            }
+        }
+        // block boundary: pieces opened inside exit, innermost first
+        while self.stack.len() > depth {
+            let (_, cont) = self.stack.pop().expect("depth");
+            self.seal(cur, Term::Exit);
+            cur = cont;
+        }
+        Ok(cur)
+    }
+
+    /// A placement mark. Marks alternate sides: a mark to the side of the
+    /// piece that parked us ends this piece (its reply resumes the parked
+    /// frame); any other mark parks the current piece and opens a new one.
+    fn mark(&mut self, side: Side, cur: usize, p: usize) -> Result<(usize, usize), String> {
+        if side == self.pieces[p].side {
+            return Err(format!("{}: mark to the side already executing", self.prefix));
+        }
+        if let Some(&(parent, cont)) = self.stack.last() {
+            if self.pieces[parent].side == side {
+                self.stack.pop();
+                self.seal(cur, Term::Exit);
+                return Ok((cont, parent));
+            }
+        }
+        let cont = self.block(p);
+        let idx = self.pieces.len();
+        self.blocks[cur].term = Term::Mark { side, piece: idx, cont };
+        self.piece_n += 1;
+        self.pieces.push(Piece {
+            side,
+            entry: 0, // fixed up just below
+            hop_id: format!("{}:{}", self.prefix, self.piece_n),
+        });
+        let entry = self.block(idx);
+        self.pieces[idx].entry = entry;
+        self.stack.push((p, cont));
+        Ok((entry, idx))
+    }
+}
+
+fn term_succs(cfg: &Cfg, t: &Term) -> Vec<usize> {
+    match t {
+        Term::Open => vec![],
+        Term::Jump(t) => vec![*t],
+        Term::Branch(_, a, b) => vec![*a, *b],
+        Term::ForNext { body, end, .. } => vec![*body, *end],
+        Term::Match { arms, fall, .. } => {
+            let mut v: Vec<usize> = arms.iter().map(|(_, e)| *e).collect();
+            v.push(*fall);
+            v
+        }
+        // the call edge to the far piece AND the resume edge both matter:
+        // what the far piece needs must be live here
+        Term::Mark { piece, cont, .. } => vec![cfg.pieces[*piece].entry, *cont],
+        Term::Return(_) | Term::Exit => vec![],
+    }
+}
+
+fn preds(cfg: &Cfg) -> Vec<Vec<usize>> {
+    let mut p = vec![Vec::new(); cfg.blocks.len()];
+    for (i, b) in cfg.blocks.iter().enumerate() {
+        for s in term_succs(cfg, &b.term) {
+            p[s].push(i);
+        }
+    }
+    p
+}
+
+/// Blocks of one piece in reverse postorder from its entry — unreachable
+/// (dead) blocks are absent. Deterministic, so hop ids and layouts are
+/// stable byte for byte.
+fn rpo(cfg: &Cfg, piece: usize) -> Vec<usize> {
+    let mut seen = vec![false; cfg.blocks.len()];
+    let mut post = Vec::new();
+    let mut stack = vec![(cfg.pieces[piece].entry, false)];
+    while let Some((b, expanded)) = stack.pop() {
+        if expanded {
+            post.push(b);
+            continue;
+        }
+        if seen[b] {
+            continue;
+        }
+        seen[b] = true;
+        stack.push((b, true));
+        for s in term_succs(cfg, &cfg.blocks[b].term) {
+            if cfg.blocks[s].piece == piece && !seen[s] {
+                stack.push((s, false));
+            }
+        }
+    }
+    post.reverse();
+    post
+}
+
+/// Backwards liveness over the whole graph, pieces included: for any
+/// block, the exact set of variables that must exist when it runs.
+struct Liveness {
+    live_in: Vec<BTreeSet<String>>,
+    defs: Vec<BTreeSet<String>>,
+}
+
+fn note_uses(e: &Expr, def: &BTreeSet<String>, use_: &mut BTreeSet<String>) {
+    let mut r = BTreeSet::new();
+    refs_expr(e, &mut r);
+    for v in r {
+        if !def.contains(&v) {
+            use_.insert(v);
+        }
+    }
+}
+
+/// Use = read before any write in the block; Def = written anywhere in
+/// the block. Statements walk in order; mutation through a shared
+/// reference (push, field/index writes) reads the binding, never rebinds
+/// it — it counts as a use. Shipping is call-by-copy, so a mutated copy
+/// rides the reply home: the reply set is LiveIn(resume) ∩ (defs ∪ ship).
+fn block_use_def(b: &Block, use_: &mut BTreeSet<String>, def: &mut BTreeSet<String>) {
+    for st in &b.stmts {
+        match st {
+            Simple::Let(n, e) => {
+                note_uses(e, def, use_);
+                def.insert(n.clone());
+            }
+            Simple::Assign(l, r) => {
+                match l {
+                    Expr::Ident(_) => {}
+                    Expr::Field(base, _) => note_uses(base, def, use_),
+                    Expr::Index(a, i) => {
+                        note_uses(a, def, use_);
+                        note_uses(i, def, use_);
+                    }
+                    _ => {}
+                }
+                note_uses(r, def, use_);
+                if let Expr::Ident(n) = l {
+                    def.insert(n.clone());
+                }
+            }
+            Simple::Expr(e) | Simple::Spawn(e) | Simple::ForInit(_, e) | Simple::MatchHead(_, e) => {
+                note_uses(e, def, use_)
+            }
+            Simple::Cast(t, body) => {
+                if let CastTarget::Session(e) | CastTarget::User(e) = t {
+                    note_uses(e, def, use_);
+                }
+                // captured vars are read here, at the send site
+                let mut r = BTreeSet::new();
+                refs_stmts(body, &mut r);
+                for v in r {
+                    if !def.contains(&v) {
+                        use_.insert(v);
+                    }
+                }
+            }
+            Simple::MatchFields(_, fields) => {
+                for (_, local) in fields {
+                    def.insert(local.clone());
+                }
+            }
+        }
+    }
+    match &b.term {
+        Term::Branch(c, _, _) => note_uses(c, def, use_),
+        Term::Return(Some(e)) => note_uses(e, def, use_),
+        Term::ForNext { k, v, .. } => {
+            def.insert(k.clone());
+            def.insert(v.clone());
+        }
+        _ => {}
+    }
+}
+
+fn liveness(cfg: &Cfg) -> Liveness {
+    let n = cfg.blocks.len();
+    let mut uses: Vec<BTreeSet<String>> = vec![BTreeSet::new(); n];
+    let mut defs: Vec<BTreeSet<String>> = vec![BTreeSet::new(); n];
+    for (i, b) in cfg.blocks.iter().enumerate() {
+        block_use_def(b, &mut uses[i], &mut defs[i]);
+    }
+    let mut live_in: Vec<BTreeSet<String>> = vec![BTreeSet::new(); n];
+    let mut live_out: Vec<BTreeSet<String>> = vec![BTreeSet::new(); n];
+    loop {
+        let mut changed = false;
+        for i in (0..n).rev() {
+            let mut out = BTreeSet::new();
+            for s in term_succs(cfg, &cfg.blocks[i].term) {
+                out.extend(live_in[s].iter().cloned());
+            }
+            let mut inn = uses[i].clone();
+            for v in out.difference(&defs[i]) {
+                inn.insert(v.clone());
+            }
+            if inn != live_in[i] || out != live_out[i] {
+                live_in[i] = inn;
+                live_out[i] = out;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    Liveness { live_in, defs }
+}
+
+/// Per-piece emission state, shared so hop ids and consts stay stable.
+struct Px<'a> {
+    cg: &'a mut Cg,
+    ctr: &'a mut Counters,
+    cfg: &'a Cfg,
+    live_in: &'a [BTreeSet<String>],
+    /// all names defined anywhere in the piece (reply must carry them home)
+    piece_defs: Vec<BTreeSet<String>>,
+    /// every locally-bound name in the whole function (warning analysis)
+    all_defs: BTreeSet<String>,
+    reply_vars: Vec<BTreeSet<String>>,
+    /// vars map each hop piece expects, recorded when its mark is emitted
+    ship: Vec<BTreeSet<String>>,
+    preds: Vec<Vec<usize>>,
+    loop_slots: HashMap<usize, (u16, u16)>,
+    match_slots: HashMap<usize, (u16, u16)>,
+    /// every local's slot in the piece currently emitting (reply wraps
+    /// load by slot, past the arm/branch scopes that defined them)
+    slots: HashMap<String, u16>,
+    addr: HashMap<usize, usize>,
+    fixups: Vec<(usize, usize)>,
+}
+
+/// Emit a flow body into `fb` (a named fn or a lambda's piece 0): build
+/// the CFG, run liveness, then emit each piece — piece 0 into `fb`, hop
+/// pieces as separate functions registered under their hop ids. Pieces
+/// emit in creation order, so a piece's vars map is always recorded (at
+/// its mark, in the parent) before its prologue runs.
 fn emit_flow_body(
     cg: &mut Cg,
     fb: &mut Fb,
@@ -1208,50 +1827,455 @@ fn emit_flow_body(
     prefix: &str,
     body: &[Stmt],
 ) -> Result<(), String> {
-    check_no_nested_marks(body)?;
-    let segs = split_segments(body, prefix)?;
-    let n = segs.len();
-
-    if n == 1 {
-        return emit_stmts(cg, fb, ctr, &segs[0].1);
-    }
-
-    // ship set for each hop i (into segment i):
-    //   refs(segments i..end) ∩ scope at the end of segment i-1
-    let base_scope = fb.scope_names();
-    let mut ship: Vec<BTreeSet<String>> = vec![BTreeSet::new(); n];
-    let mut scope_end: Vec<Vec<String>> = vec![Vec::new(); n];
-    scope_end[0] = base_scope;
-    scope_end[0].extend(toplevel_lets(&segs[0].1));
-    for i in 1..n {
-        let mut refs = BTreeSet::new();
-        for (_, seg) in &segs[i..] {
-            refs_stmts(seg, &mut refs);
+    check_no_cast_marks(body)?;
+    let cfg = CfgBuilder::new(prefix).build(body)?;
+    let la = liveness(&cfg);
+    let mut piece_defs: Vec<BTreeSet<String>> = vec![BTreeSet::new(); cfg.pieces.len()];
+    let mut all_defs: BTreeSet<String> = BTreeSet::new();
+    for (i, b) in cfg.blocks.iter().enumerate() {
+        for v in &la.defs[i] {
+            piece_defs[b.piece].insert(v.clone());
+            all_defs.insert(v.clone());
         }
-        ship[i] = refs.into_iter().filter(|r| scope_end[i - 1].contains(r)).collect();
-        scope_end[i] = ship[i].iter().cloned().collect();
-        scope_end[i].extend(toplevel_lets(&segs[i].1));
     }
-
-    // segment 0 plus the chain into segment 1
-    emit_stmts(cg, fb, ctr, &segs[0].1)?;
-    emit_hop_target(cg, fb, segs[1].0);
-    emit_vars_map(cg, fb, &ship[1])?;
-    let k = cg.k_str(&format!("{prefix}:1"));
-    fb.emit(Instr::At(k));
-    fb.emit(Instr::Return);
-
-    // segments 1..n-1 as hop functions
-    for i in 1..n {
-        let chain = if i + 1 < n {
-            Some((segs[i + 1].0, format!("{prefix}:{}", i + 1), ship[i + 1].clone()))
+    // reply vars are computed at each mark, where the ship set exists:
+    // LiveIn(resume) ∩ (defs of the piece ∪ what crossed into it)
+    let mut px = Px {
+        cg,
+        ctr,
+        cfg: &cfg,
+        live_in: &la.live_in,
+        piece_defs,
+        all_defs,
+        reply_vars: vec![BTreeSet::new(); cfg.pieces.len()],
+        ship: vec![BTreeSet::new(); cfg.pieces.len()],
+        preds: preds(&cfg),
+        loop_slots: HashMap::new(),
+        match_slots: HashMap::new(),
+        slots: HashMap::new(),
+        addr: HashMap::new(),
+        fixups: Vec::new(),
+    };
+    for pi in 0..cfg.pieces.len() {
+        if pi == 0 {
+            emit_piece(&mut px, fb, 0)?;
         } else {
-            None
-        };
-        compile_segment(cg, ctr, &format!("{prefix}:{i}"), &ship[i], &segs[i].1, chain)?;
+            let hop_id = cfg.pieces[pi].hop_id.clone();
+            let mut pfb = Fb::new(&hop_id);
+            emit_piece(&mut px, &mut pfb, pi)?;
+            let fn_idx = px.cg.add_fn(pfb.into_function());
+            px.cg.hops.insert(hop_id, fn_idx);
+        }
+    }
+    // the lamp: record what crosses each hop, in textual mark order
+    for (pi, p) in cfg.pieces.iter().enumerate().skip(1) {
+        px.cg.explain.push(HopExplain {
+            hop: p.hop_id.clone(),
+            side: match p.side {
+                Side::Server => "server",
+                Side::Browser => "browser",
+            }
+            .to_string(),
+            ship: px.ship[pi].iter().cloned().collect(),
+            reply: px.reply_vars[pi].iter().cloned().collect(),
+        });
     }
     Ok(())
 }
+
+fn emit_piece(px: &mut Px, fb: &mut Fb, pi: usize) -> Result<(), String> {
+    px.loop_slots.clear();
+    px.match_slots.clear();
+    px.slots.clear();
+    px.addr.clear();
+    px.fixups.clear();
+
+    let mut entry_scope: BTreeMap<String, u16> = BTreeMap::new();
+    for (n, s) in &fb.scope {
+        entry_scope.insert(n.clone(), *s);
+        px.slots.insert(n.clone(), *s);
+    }
+    if pi > 0 {
+        // hop function: one `__vars` parameter, destructured in the
+        // prologue — exactly what the mark's At shipped
+        fb.n_params = 1;
+        let vars_slot = fb.def_local("__vars");
+        let ship = px.ship[pi].clone();
+        for v in &ship {
+            fb.emit(Instr::LoadLocal(vars_slot));
+            let k = px.cg.k_str(v);
+            fb.emit(Instr::GetField(k));
+            let slot = fb.def_local(v);
+            fb.emit(Instr::StoreLocal(slot));
+            entry_scope.insert(v.clone(), slot);
+            px.slots.insert(v.clone(), slot);
+        }
+    }
+
+    let mut scope_out: HashMap<usize, BTreeMap<String, u16>> = HashMap::new();
+    for b in rpo(px.cfg, pi) {
+        // scope in = meet of the piece's emitted forward predecessors;
+        // back edges are ignored, which is exactly the old scope-truncate
+        // semantics (loop-body lets never reach the header)
+        let mut sc: Option<BTreeMap<String, u16>> = None;
+        for pred in &px.preds[b] {
+            if px.cfg.blocks[*pred].piece != pi {
+                continue;
+            }
+            if let Some(so) = scope_out.get(pred) {
+                sc = Some(match sc {
+                    None => so.clone(),
+                    Some(mut acc) => {
+                        acc.retain(|n, s| so.get(n) == Some(s));
+                        acc
+                    }
+                });
+            }
+        }
+        let mut sc = if b == px.cfg.pieces[pi].entry {
+            entry_scope.clone()
+        } else {
+            sc.unwrap_or_default()
+        };
+        fb.scope = sc.iter().map(|(n, s)| (n.clone(), *s)).collect();
+        px.addr.insert(b, fb.code.len());
+        let stmts = px.cfg.blocks[b].stmts.clone();
+        for st in &stmts {
+            emit_simple(px, fb, st, &mut sc)?;
+        }
+        emit_term(px, fb, b, &mut sc)?;
+        scope_out.insert(b, sc);
+    }
+    let fixups = std::mem::take(&mut px.fixups);
+    for (at, target) in fixups {
+        let t = px.addr[&target];
+        fb.patch_to(at, t);
+    }
+    Ok(())
+}
+
+fn emit_simple(
+    px: &mut Px,
+    fb: &mut Fb,
+    st: &Simple,
+    scope: &mut BTreeMap<String, u16>,
+) -> Result<(), String> {
+    match st {
+        Simple::Let(n, e) => {
+            emit_expr(px.cg, fb, px.ctr, e)?;
+            let slot = fb.def_local(n);
+            fb.emit(Instr::StoreLocal(slot));
+            scope.insert(n.clone(), slot);
+            px.slots.insert(n.clone(), slot);
+        }
+        Simple::Assign(l, r) => match l {
+            Expr::Ident(n) => {
+                emit_expr(px.cg, fb, px.ctr, r)?;
+                match fb.lookup(n) {
+                    Some(slot) => fb.emit(Instr::StoreLocal(slot)),
+                    None => {
+                        let k = px.cg.k_str(n);
+                        fb.emit(Instr::StoreGlobal(k));
+                    }
+                }
+            }
+            Expr::Field(b, f) => {
+                emit_expr(px.cg, fb, px.ctr, b)?;
+                emit_expr(px.cg, fb, px.ctr, r)?;
+                let k = px.cg.k_str(f);
+                fb.emit(Instr::SetField(k));
+            }
+            Expr::Index(a, i) => {
+                emit_expr(px.cg, fb, px.ctr, a)?;
+                emit_expr(px.cg, fb, px.ctr, i)?;
+                emit_expr(px.cg, fb, px.ctr, r)?;
+                fb.emit(Instr::SetIndex);
+            }
+            _ => return Err("invalid assignment target".into()),
+        },
+        Simple::Expr(e) => {
+            emit_expr(px.cg, fb, px.ctr, e)?;
+            fb.emit(Instr::Pop);
+        }
+        Simple::Spawn(e) => {
+            let Expr::Call(f, args) = e else {
+                return Err("spawn expects a function call".into());
+            };
+            emit_expr(px.cg, fb, px.ctr, f)?;
+            for a in args {
+                emit_expr(px.cg, fb, px.ctr, a)?;
+            }
+            fb.emit(Instr::MakeArray(args.len() as u16));
+            fb.emit(Instr::Spawn);
+        }
+        Simple::Cast(target, body) => {
+            px.ctr.cast_n += 1;
+            let id = format!("{}:c{}", px.ctr.fn_name, px.ctr.cast_n);
+            // captured = referenced by body ∩ in scope here
+            let mut refs = BTreeSet::new();
+            refs_stmts(body, &mut refs);
+            let captured: BTreeSet<String> = refs
+                .into_iter()
+                .filter(|n| fb.lookup(n).is_some())
+                .collect();
+            compile_segment(px.cg, px.ctr, &id, &captured, body, None)?;
+            match target {
+                CastTarget::Browsers => {
+                    let k = px.cg.k_str("browsers");
+                    fb.emit(Instr::Const(k));
+                }
+                CastTarget::Server => {
+                    let k = px.cg.k_str("server");
+                    fb.emit(Instr::Const(k));
+                }
+                CastTarget::Session(e) => emit_expr(px.cg, fb, px.ctr, e)?,
+                CastTarget::User(e) => {
+                    let k = px.cg.k_str("user:");
+                    fb.emit(Instr::Const(k));
+                    emit_expr(px.cg, fb, px.ctr, e)?;
+                    fb.emit(Instr::BinOp(BinOp::Concat));
+                }
+            }
+            emit_vars_map(px.cg, fb, &captured)?;
+            let k = px.cg.k_str(&id);
+            fb.emit(Instr::Cast(k));
+        }
+        Simple::ForInit(id, e) => {
+            emit_expr(px.cg, fb, px.ctr, e)?;
+            fb.emit(Instr::IterNew);
+            let iter = fb.hidden_local();
+            fb.emit(Instr::StoreLocal(iter));
+            let zero = px.cg.k_int(0);
+            fb.emit(Instr::Const(zero));
+            let idx = fb.hidden_local();
+            fb.emit(Instr::StoreLocal(idx));
+            px.loop_slots.insert(*id, (iter, idx));
+        }
+        Simple::MatchHead(id, e) => {
+            emit_expr(px.cg, fb, px.ctr, e)?;
+            let subj = fb.hidden_local();
+            fb.emit(Instr::StoreLocal(subj));
+            fb.emit(Instr::LoadLocal(subj));
+            let type_k = px.cg.k_str("type");
+            fb.emit(Instr::GetField(type_k));
+            let tag = fb.hidden_local();
+            fb.emit(Instr::StoreLocal(tag));
+            px.match_slots.insert(*id, (subj, tag));
+        }
+        Simple::MatchFields(id, fields) => {
+            let (subj, _) = px.match_slots[id];
+            for (key, local) in fields {
+                fb.emit(Instr::LoadLocal(subj));
+                let fk = px.cg.k_str(key);
+                fb.emit(Instr::GetField(fk));
+                let slot = fb.def_local(local);
+                fb.emit(Instr::StoreLocal(slot));
+                scope.insert(local.clone(), slot);
+                px.slots.insert(local.clone(), slot);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The reply of a reply-carrying piece: `{ value, vars }` where vars are
+/// the caller-continuation's live locals this piece defined. The value is
+/// already on the stack.
+fn emit_reply_wrap(px: &mut Px, fb: &mut Fb, pi: usize) -> Result<(), String> {
+    let h = fb.hidden_local();
+    fb.emit(Instr::StoreLocal(h));
+    let value_k = px.cg.k_str("value");
+    fb.emit(Instr::Const(value_k));
+    fb.emit(Instr::LoadLocal(h));
+    let vars_k = px.cg.k_str("vars");
+    fb.emit(Instr::Const(vars_k));
+    let rv = px.reply_vars[pi].clone();
+    for v in &rv {
+        let vk = px.cg.k_str(v);
+        fb.emit(Instr::Const(vk));
+        match px.slots.get(v) {
+            Some(&s) => fb.emit(Instr::LoadLocal(s)),
+            // defined on a path that didn't run: absent is nil, per the
+            // value model
+            None => fb.emit(Instr::Nil),
+        }
+    }
+    fb.emit(Instr::MakeMap(rv.len() as u16));
+    fb.emit(Instr::MakeMap(2));
+    Ok(())
+}
+
+fn emit_term(
+    px: &mut Px,
+    fb: &mut Fb,
+    b: usize,
+    scope: &mut BTreeMap<String, u16>,
+) -> Result<(), String> {
+    let pi = px.cfg.blocks[b].piece;
+    match px.cfg.blocks[b].term.clone() {
+        Term::Open => unreachable!("the builder seals every tail"),
+        Term::Jump(t) => {
+            let j = fb.jump_placeholder(Instr::Jump);
+            px.fixups.push((j, t));
+        }
+        Term::Branch(c, a, bb) => {
+            emit_expr(px.cg, fb, px.ctr, &c)?;
+            let jf = fb.jump_placeholder(Instr::JumpIfFalse);
+            px.fixups.push((jf, bb));
+            let j = fb.jump_placeholder(Instr::Jump);
+            px.fixups.push((j, a));
+        }
+        Term::ForNext { loop_id, k, v, body, end } => {
+            let (iter, idx) = px.loop_slots[&loop_id];
+            let k_slot = fb.def_local(&k);
+            let v_slot = fb.def_local(&v);
+            scope.insert(k.clone(), k_slot);
+            scope.insert(v.clone(), v_slot);
+            px.slots.insert(k.clone(), k_slot);
+            px.slots.insert(v.clone(), v_slot);
+            fb.emit(Instr::LoadLocal(iter));
+            fb.emit(Instr::LoadLocal(idx));
+            let j = fb.jump_placeholder(Instr::IterNext);
+            px.fixups.push((j, end));
+            // stack after IterNext: iter idx' k v
+            fb.emit(Instr::StoreLocal(v_slot));
+            fb.emit(Instr::StoreLocal(k_slot));
+            fb.emit(Instr::StoreLocal(idx));
+            fb.emit(Instr::StoreLocal(iter));
+            let j = fb.jump_placeholder(Instr::Jump);
+            px.fixups.push((j, body));
+        }
+        Term::Match { id, arms, fall } => {
+            let (_, tag_slot) = px.match_slots[&id];
+            let n_tagged = arms.iter().filter(|(t, _)| t.is_some()).count();
+            let else_entry = arms.iter().find(|(t, _)| t.is_none()).map(|(_, e)| *e);
+            let mut seen = 0;
+            for (tag, entry) in &arms {
+                match tag {
+                    Some(t) => {
+                        seen += 1;
+                        fb.emit(Instr::LoadLocal(tag_slot));
+                        let k = px.cg.k_str(t);
+                        fb.emit(Instr::Const(k));
+                        fb.emit(Instr::BinOp(BinOp::Eq));
+                        let jf = fb.jump_placeholder(Instr::JumpIfFalse);
+                        let j = fb.jump_placeholder(Instr::Jump);
+                        px.fixups.push((j, *entry));
+                        if seen == n_tagged {
+                            px.fixups.push((jf, else_entry.unwrap_or(fall)));
+                        } else {
+                            fb.patch_to_here(jf);
+                        }
+                    }
+                    None => {
+                        if n_tagged == 0 {
+                            let j = fb.jump_placeholder(Instr::Jump);
+                            px.fixups.push((j, *entry));
+                        }
+                    }
+                }
+            }
+            if arms.is_empty() {
+                let j = fb.jump_placeholder(Instr::Jump);
+                px.fixups.push((j, fall));
+            }
+        }
+        Term::Mark { side, piece, cont } => {
+            emit_hop_target(px.cg, fb, side);
+            let entry = px.cfg.pieces[piece].entry;
+            // warn when a locally-bound name is live on the far side but
+            // not in scope here: it can't ship, so it reads as nil/global
+            // there — a confusing evening, made loud at compile time
+            for n in px.live_in[entry].iter() {
+                if px.all_defs.contains(n) && fb.lookup(n).is_none() {
+                    px.cg.warnings.push(format!(
+                        "{}: `{n}` is live on the far side but not in scope at the mark (defined on only some paths); it reads as nil there",
+                        px.cfg.pieces[piece].hop_id
+                    ));
+                }
+            }
+            let ship: BTreeSet<String> = px.live_in[entry]
+                .iter()
+                .filter(|n| fb.lookup(n).is_some())
+                .cloned()
+                .collect();
+            emit_vars_map(px.cg, fb, &ship)?;
+            // the reply carries what the far piece rebinds and the caller
+            // still needs: vars it DEFINED, plus anything that CROSSED —
+            // shipping is call-by-copy, so a mutation through a shared
+            // reference (push, field/index writes) must ride home
+            let rv: BTreeSet<String> = px.live_in[cont]
+                .iter()
+                .filter(|n| px.piece_defs[piece].contains(*n) || ship.contains(*n))
+                .cloned()
+                .collect();
+            px.reply_vars[piece] = rv.clone();
+            px.ship[piece] = ship;
+            let k = px.cg.k_str(&px.cfg.pieces[piece].hop_id);
+            fb.emit(Instr::At(k));
+            let cont_trivial = px.cfg.blocks[cont].stmts.is_empty()
+                && matches!(px.cfg.blocks[cont].term, Term::Exit);
+            let rv = px.reply_vars[piece].clone();
+            if cont_trivial {
+                // tail mark: the far piece's reply is this piece's
+                // result, exactly like the old segment chain
+                fb.emit(Instr::Return);
+            } else if rv.is_empty() {
+                fb.emit(Instr::Pop);
+                let j = fb.jump_placeholder(Instr::Jump);
+                px.fixups.push((j, cont));
+            } else {
+                // the reply is `{ value, vars }`: rebind the locals the
+                // far piece defined that the continuation still needs
+                let h = fb.hidden_local();
+                fb.emit(Instr::StoreLocal(h));
+                let vars_k = px.cg.k_str("vars");
+                for v in &rv {
+                    fb.emit(Instr::LoadLocal(h));
+                    fb.emit(Instr::GetField(vars_k));
+                    let vk = px.cg.k_str(v);
+                    fb.emit(Instr::GetField(vk));
+                    let slot = match px.slots.get(v) {
+                        Some(&s) => s,
+                        None => {
+                            let s = fb.def_local(v);
+                            px.slots.insert(v.clone(), s);
+                            s
+                        }
+                    };
+                    fb.emit(Instr::StoreLocal(slot));
+                    scope.insert(v.clone(), slot);
+                }
+                let j = fb.jump_placeholder(Instr::Jump);
+                px.fixups.push((j, cont));
+            }
+        }
+        Term::Return(e) => {
+            match &e {
+                Some(e) => emit_expr(px.cg, fb, px.ctr, e)?,
+                None => fb.emit(Instr::Nil),
+            }
+            if pi > 0 && !px.reply_vars[pi].is_empty() {
+                emit_reply_wrap(px, fb, pi)?;
+            }
+            fb.emit(Instr::Return);
+        }
+        Term::Exit => {
+            if pi > 0 && !px.reply_vars[pi].is_empty() {
+                fb.emit(Instr::Nil);
+                emit_reply_wrap(px, fb, pi)?;
+            } else {
+                // falling off = reply nil, same value as the old chain's
+                // trailing segment
+                fb.emit(Instr::Nil);
+            }
+            fb.emit(Instr::Return);
+        }
+    }
+    Ok(())
+}
+
+
 
 fn emit_stmts(cg: &mut Cg, fb: &mut Fb, ctr: &mut Counters, ss: &[Stmt]) -> Result<(), String> {
     for s in ss {
@@ -1336,11 +2360,11 @@ fn emit_stmts(cg: &mut Cg, fb: &mut Fb, ctr: &mut Counters, ss: &[Stmt]) -> Resu
                             fb.emit(Instr::BinOp(BinOp::Eq));
                             let j_next = fb.jump_placeholder(Instr::JumpIfFalse);
                             let mark = fb.scope.len();
-                            for f in &arm.fields {
+                            for (key, local) in &arm.fields {
                                 fb.emit(Instr::LoadLocal(subj_slot));
-                                let fk = cg.k_str(f);
+                                let fk = cg.k_str(key);
                                 fb.emit(Instr::GetField(fk));
-                                let slot = fb.def_local(f);
+                                let slot = fb.def_local(local);
                                 fb.emit(Instr::StoreLocal(slot));
                             }
                             emit_stmts(cg, fb, ctr, &arm.body)?;
@@ -1402,7 +2426,7 @@ fn emit_stmts(cg: &mut Cg, fb: &mut Fb, ctr: &mut Counters, ss: &[Stmt]) -> Resu
                 fb.patch_to_here(j_end);
             }
             Stmt::Mark(_) => {
-                unreachable!("marks are split before emission; nested marks are rejected")
+                unreachable!("casts reject marks at compile time; flow bodies use the CFG pipeline")
             }
             Stmt::Cast(target, body) => {
                 ctr.cast_n += 1;
@@ -1491,7 +2515,12 @@ pub fn compile(src: &str) -> Result<Program, String> {
                 for p in params {
                     fb.def_local(p);
                 }
-                emit_flow_body(&mut cg, &mut fb, &mut ctr, name, body)?;
+                let mut rn = Renamer::new();
+                for p in params {
+                    rn.bind(p);
+                }
+                let body = rn.stmts(body);
+                emit_flow_body(&mut cg, &mut fb, &mut ctr, name, &body)?;
                 let fn_idx = cg.add_fn(fb.into_function());
                 cg.named.insert(name.clone(), fn_idx);
             }
@@ -1504,5 +2533,7 @@ pub fn compile(src: &str) -> Result<Program, String> {
         hops: cg.hops,
         named: cg.named,
         server_lets: cg.server_lets,
+        explain: cg.explain,
+        warnings: cg.warnings,
     })
 }

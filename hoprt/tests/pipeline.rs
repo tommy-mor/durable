@@ -56,17 +56,29 @@ fn liveness_ships_only_what_the_remainder_uses() {
         assert!(all.contains(needle), "wire missing {needle:?}:\n{all}");
     };
 
-    // check_handle hop 1 ships handle; hop 2 ships ok plus handle, which
-    // is still live because the result line echoes it
+    // check_handle hops once with handle; ok comes BACK in the reply
+    // wrapper — handle never leaves the parked browser frame, so there is
+    // no second hop at all. (handle rides the reply too since the
+    // mutation fix: anything that crossed and is still needed comes home —
+    // the continuation echoes it.)
     has(r#"check_handle:1 vars={handle: "carol"}"#);
-    has(r#"check_handle:2 vars={handle: "carol", ok: true}"#);
+    has(r#"reply value={vars: {handle: "carol", ok: true}}"#);
+    assert!(
+        !all.contains("check_handle:2"),
+        "the park/resume model collapsed the old chain:\n{all}"
+    );
 
-    // delete_account chain: {} → {n} → {n, yes} → {msg} — n and yes are
-    // dead after the last server segment and dropped from the final hop
+    // delete_account: two hops, not four — {} in (n is defined inside,
+    // nothing dead ships), {n} back by reply, exactly {n, yes} into the
+    // middle piece, {msg} back by reply
     has("delete_account:1 vars={}");
-    has("delete_account:2 vars={n: 3}");
-    has("delete_account:3 vars={n: 3, yes: true}");
-    has(r#"delete_account:4 vars={msg: "deleted 3 items"}"#);
+    has("reply value={vars: {n: 3}}");
+    has("delete_account:2 vars={n: 3, yes: true}");
+    has(r#"reply value={vars: {msg: "deleted 3 items"}}"#);
+    assert!(
+        !all.contains("delete_account:3"),
+        "replies carry backward flow now, not chain hops:\n{all}"
+    );
 
     // nested casts: outer captures {from, to}; inner adds the server-side
     // color
@@ -153,26 +165,6 @@ fn arrays_are_zero_based() {
     assert!(all.contains("first/nil"), "{all}");
     assert!(all.contains("0:first"), "{all}");
     assert!(all.contains("1:second"), "{all}");
-}
-
-#[test]
-fn marks_rejected_inside_branches() {
-    let src = "fn f(x) { if x { server!(); } }";
-    let err = match hoprt::compiler::compile(src) {
-        Err(e) => e,
-        Ok(_) => panic!("nested mark compiled"),
-    };
-    assert!(err.contains("top level"), "{err}");
-}
-
-#[test]
-fn marks_rejected_inside_while() {
-    let src = "fn f(x) { while x { server!(); } }";
-    let err = match hoprt::compiler::compile(src) {
-        Err(e) => e,
-        Ok(_) => panic!("mark in while compiled"),
-    };
-    assert!(err.contains("top level"), "{err}");
 }
 
 #[test]
@@ -360,12 +352,186 @@ fn match_else_arm_and_no_match_fall_through() {
 }
 
 #[test]
-fn marks_rejected_inside_match_arms() {
-    let src = "fn f(e) { match e { go => { server!(); } } }";
+fn marks_nest_inside_branches_loops_and_match_arms() {
+    // The CFG pipeline's reason to exist: marks anywhere a flow body
+    // reaches. The frame parks across each hop, so loop state, iterators,
+    // and branch merges never cross the wire — placement prints prove
+    // which side each line ran on.
+    let src = r#"
+        server let hits = 0;
+
+        fn branch_mark(flag) {
+          if flag {
+            server!();
+            hits = hits + 1;
+            print("server branch, hits=" .. hits);
+          }
+          print("browser merge, flag=" .. flag);
+        }
+
+        fn while_mark() {
+          let i = 0;
+          while i < 3 {
+            i = i + 1;
+            server!();
+            print("server while i=" .. i);
+          }
+          print("browser while done i=" .. i);
+        }
+
+        fn for_mark() {
+          for k, v in ["a", "b"] {
+            server!();
+            print("server for " .. k .. "=" .. v);
+          }
+          print("browser for done");
+        }
+
+        fn match_mark(res) {
+          match res {
+            ok { value } => {
+              server!();
+              print("server match ok " .. value);
+            }
+            else => {
+              print("browser match else");
+            }
+          }
+        }
+
+        // the reply wrapper: a local made server-side flows BACK into the
+        // parked browser frame
+        fn backward_var() {
+          server!();
+          let made = "server-made";
+          browser!();
+          print("browser got " .. made);
+        }
+
+        // a plain call to a fn whose body hops: the tail mark propagates
+        // the far piece's return value into the caller's frame
+        fn tail_val() {
+          server!();
+          return 42;
+        }
+        fn show_tail() {
+          let v = tail_val();
+          print("browser tail v=" .. v);
+        }
+
+        // the merge case: a hopped branch inside a loop, control rejoining
+        // in the original frame each iteration
+        fn merge_in_loop() {
+          for k, v in [10, 20] {
+            if v > 15 {
+              server!();
+              print("server merge sees " .. v);
+            }
+            print("browser tick " .. k);
+          }
+          print("browser merge done");
+        }
+
+        fn go() {
+          spawn branch_mark(1);
+          spawn while_mark();
+          spawn for_mark();
+          spawn match_mark({ type = "ok", value = "v7" });
+          spawn match_mark({ type = "no" });
+          spawn backward_var();
+          spawn show_tail();
+          spawn merge_in_loop();
+        }
+    "#;
+    let mut host = Cluster::new(&["A"], src, false).expect("cluster");
+    host.fire("A", "go");
+    host.pump();
+    host.assert_quiescent();
+    let all = host.log().join("\n");
+    let has = |needle: &str| assert!(all.contains(needle), "transcript missing {needle:?}:\n{all}");
+
+    has("[server] server branch, hits=1");
+    has("[browser A] browser merge, flag=1");
+    has("[server] server while i=1");
+    has("[server] server while i=3");
+    has("[browser A] browser while done i=3");
+    has("[server] server for 0=a");
+    has("[server] server for 1=b");
+    has("[browser A] browser for done");
+    has("[server] server match ok v7");
+    has("[browser A] browser match else");
+    has("[browser A] browser got server-made");
+    has("[browser A] browser tail v=42");
+    has("[server] server merge sees 20");
+    has("[browser A] browser tick 0");
+    has("[browser A] browser tick 1");
+    has("[browser A] browser merge done");
+}
+
+#[test]
+fn casts_still_reject_marks() {
+    // a cast is a fire-and-forget message whose body already runs on the
+    // target — a hop inside it has no meaning
+    let src = "fn f() { cast server { server!(); } }";
     let err = match hoprt::compiler::compile(src) {
         Err(e) => e,
-        Ok(_) => panic!("mark inside match arm compiled"),
+        Ok(_) => panic!("mark inside cast body compiled"),
     };
-    assert!(err.contains("match arms"), "{err}");
-    assert!(err.contains("top level"), "{err}");
+    assert!(err.contains("cast bodies"), "{err}");
+}
+
+#[test]
+fn mutation_across_a_hop_comes_home() {
+    // regression (code review 2026-10-07): a var shipped into a piece is a
+    // COPY on the far side; `push` mutates the copy but counts as a use,
+    // not a def, so the old reply set (LiveIn ∩ defs) left mutations
+    // stranded — the browser printed []. The reply now carries
+    // LiveIn(cont) ∩ (defs ∪ ship): anything that crossed and is still
+    // needed comes home.
+    let src = r#"
+        fn go() {
+          let rows = [];
+          server!();
+          push(rows, 1);
+          push(rows, 2);
+          browser!();
+          print("rows=" .. len(rows));
+        }
+    "#;
+    let mut host = Cluster::new(&["A"], src, false).expect("cluster");
+    host.fire("A", "go");
+    host.pump();
+    host.assert_quiescent();
+    let all = host.log().join("\n");
+    assert!(all.contains("rows=2"), "mutation lost across the hop:\n{all}");
+    assert!(
+        all.contains("rows: [1, 2]"),
+        "reply wrapper didn't carry the mutated rows:\n{all}"
+    );
+}
+
+#[test]
+fn warns_when_live_var_is_out_of_scope_at_the_mark() {
+    // q is defined only inside the branch, so it isn't in scope at the
+    // mark and can't ship — the far side would silently read nil
+    let src = "fn f(c) { if c { let q = 1; } server!(); print(q); }";
+    let prog = hoprt::compiler::compile(src).expect("compile");
+    let all = prog.warnings.join("\n");
+    assert!(all.contains("f:1"), "no warning for the hop: {all}");
+    assert!(all.contains("`q`"), "warning didn't name the var: {all}");
+}
+
+#[test]
+fn explain_reports_what_crosses_each_hop() {
+    // the lamp: hopc --explain's data, asserted at the Program level.
+    // demo.hop's park/resume flow ships {handle} in and replies {ok}
+    // back; the delete_account middle piece takes exactly {n, yes}.
+    let prog = hoprt::compiler::compile(include_str!("../hop/demo.hop")).expect("compile");
+    let all = prog.explain_listing();
+    let has = |needle: &str| assert!(all.contains(needle), "explain missing {needle:?}:\n{all}");
+    has("check_handle:1  side=server  ship={handle}  reply={handle, ok}");
+    has("delete_account:1  side=server  ship={}  reply={n}");
+    has("delete_account:2  side=server  ship={n, yes}  reply={msg}");
+    has("stroke:c1  side=cast  ship={from, to}  reply={}");
+    has("stroke:c2  side=cast  ship={color, from, to}  reply={}");
 }
