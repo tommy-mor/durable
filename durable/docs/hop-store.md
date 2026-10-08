@@ -100,8 +100,30 @@ fn reduce(event) {
 Field access on `store` also provides the schema shape constructors
 (`store.record`, `store.map`, `store.list`, `store.deque`, `store.leaf`,
 `store.sum`), view sugar `store.items(path)` (map entries as records with
-the key merged in as `id`), and `store.verify()` (replay the tape,
-compare projections — the conformance check tests lean on).
+the key merged in as `id`), `store.has(path)` (presence — see below), and
+`store.verify()` (replay the tape, compare projections — the conformance
+check tests lean on).
+
+### Presence: `store.has(path)`
+
+The query contract above says "missing is `nil`", and that is literally
+true for **containers**: a missing map, record, list, or deque reads `nil`
+— truthiness on a container read *is* presence. (The scan you were doing
+anyway detects absence; no extra seek.) **Scalars keep their natural
+defaults**: a missing leaf reads `nil`, a missing sum reads `0` — a
+counter's empty state is zero, so ordinary counter reads need no guard.
+Writes cannot help with presence either way: nested writes auto-vivify by
+key prefix (`files/x/wins.add(1)` creates a partial record for `x` without
+ceremony), because blind-merge writes must never read first.
+
+`store.has(path)` answers presence in the raw keyspace — one seek, no
+materialization: true iff some non-null value exists at or under the path.
+You need it exactly where truthiness can't reach: **sums** (was this
+counter ever written, or is the 0 a default? — billing cares) and **O(1)
+guards on large containers** (checking a 10k-entry map without reading it).
+One honest limit: "never written" and "written empty" are the same
+absence; if that distinction matters to the app, model it (a status leaf),
+don't probe for it.
 
 ## The reducer reads committed state
 

@@ -119,6 +119,48 @@ fn map_get<'a>(v: &'a Value, key: &str) -> &'a Value {
 }
 
 #[test]
+fn has_probes_presence_in_the_raw_keyspace() {
+    let (_dir, db) = open();
+    seed(&db);
+    let has = |navs: Vec<Nav>| query::has(&db, &Store::shape(), &Query::new(navs)).unwrap();
+
+    // Present scalar leaf, present record, present map.
+    assert!(has(vec![
+        Nav::Field("evidence_by_id".into()),
+        Nav::Key(Value::Text("e1".into())),
+        Nav::Field("kind".into()),
+    ]));
+    assert!(has(vec![
+        Nav::Field("evidence_by_id".into()),
+        Nav::Key(Value::Text("e1".into())),
+    ]));
+    assert!(has(vec![Nav::Field("evidence_by_id".into())]));
+
+    // Missing leaf and missing map key are absent, whatever their schema
+    // default would materialize as.
+    assert!(!has(vec![
+        Nav::Field("evidence_by_id".into()),
+        Nav::Key(Value::Text("e9".into())),
+        Nav::Field("kind".into()),
+    ]));
+    assert!(!has(vec![
+        Nav::Field("evidence_by_id".into()),
+        Nav::Key(Value::Text("e9".into())),
+    ]));
+
+    // A sum never written reads 0 when materialized — but it is NOT present.
+    assert!(!has(vec![
+        Nav::Field("scores".into()),
+        Nav::Key(Value::Text("nobody".into())),
+    ]));
+    // …while a written sum is.
+    assert!(has(vec![
+        Nav::Field("scores".into()),
+        Nav::Key(Value::Text("tommy-mor".into())),
+    ]));
+}
+
+#[test]
 fn one_point_get() {
     let (_dir, db) = open();
     seed(&db);

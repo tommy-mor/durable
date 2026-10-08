@@ -274,6 +274,47 @@ pub fn one(db: &Db, schema: &Shape, query: &Query) -> Result<Option<Value>> {
     }
 }
 
+/// Execute `has`: does any non-null value exist at or under the path?
+///
+/// Presence is probed in the raw keyspace, never materialized: schema
+/// defaults (a missing Sum reads as 0) and empty-record subtrees cannot
+/// masquerade as existence, and the cost is one seek, not a subtree read.
+/// In a store where nested writes auto-vivify by key prefix, this is the
+/// only honest existence check.
+pub fn has(db: &Db, schema: &Shape, query: &Query) -> Result<bool> {
+    if query.is_collecting() {
+        return Err(Error::Query("has() requires a point path".into()));
+    }
+    for focus in collect_foci(db, schema, query)? {
+        match &focus {
+            Focus::Val(v) => {
+                if !matches!(v, Value::Null) {
+                    return Ok(true);
+                }
+            }
+            Focus::Db { prefix, .. } => {
+                if prefix_present(db, prefix)? {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Any key at or under this prefix? One seek: the exact key sorts first and
+/// children right after it.
+fn prefix_present(db: &Db, prefix: &[u8]) -> Result<bool> {
+    let mut iter = db
+        .raw()
+        .iterator(rocksdb::IteratorMode::From(prefix, rocksdb::Direction::Forward));
+    match iter.next() {
+        Some(Ok((db_key, _))) => Ok(db_key.starts_with(prefix)),
+        Some(Err(e)) => Err(e.into()),
+        None => Ok(false),
+    }
+}
+
 /// Execute `select`: the list of values at every focus.
 pub fn select(db: &Db, schema: &Shape, query: &Query) -> Result<Vec<Value>> {
     let foci = collect_foci(db, schema, query)?;
@@ -735,6 +776,14 @@ fn materialize_focus(db: &Db, focus: &Focus) -> Result<Value> {
 }
 
 fn materialize(db: &Db, prefix: &[u8], shape: &Shape) -> Result<Value> {
+    // Missing reads nil for CONTAINERS (the hop-store contract): a map,
+    // record, list, or deque nothing was written under answers nil, not an
+    // empty costume — truthiness is presence there. Scalars keep their
+    // natural defaults: a missing leaf is nil, a missing sum is 0 (a
+    // counter's empty state *is* zero; guarding every counter read would be
+    // boilerplate, and `store.has` answers sum presence when it matters).
+    // Absence is detected *while* reading — the read you were doing anyway
+    // is the probe, so nothing here pays an extra seek.
     match shape {
         Shape::Leaf => read_leaf(db, prefix),
         Shape::Sum => match db.raw().get(prefix)? {
@@ -753,25 +802,40 @@ fn materialize(db: &Db, prefix: &[u8], shape: &Shape) -> Result<Value> {
             None => Ok(Value::Integer(Integer::from(0i64))),
         },
         Shape::Map { .. } => {
+            // The entries scan is the probe: empty means nothing written.
             let pairs = map_entries(db, prefix, shape)?;
+            if pairs.is_empty() {
+                return Ok(Value::Null);
+            }
             Ok(Value::Map(pairs))
         }
         Shape::List { .. } | Shape::Deque { .. } if is_leaf_collection(shape) => {
-            Ok(Value::Array(
-                scan_leaf_children(db, prefix, shape)?
-                    .into_iter()
-                    .map(|(_, v)| v)
-                    .collect(),
-            ))
+            let xs: Vec<Value> = scan_leaf_children(db, prefix, shape)?
+                .into_iter()
+                .map(|(_, v)| v)
+                .collect();
+            if xs.is_empty() {
+                return Ok(Value::Null);
+            }
+            Ok(Value::Array(xs))
         }
         Shape::List { .. } | Shape::Deque { .. } => {
+            let cs = children(db, prefix, shape)?;
+            if cs.is_empty() {
+                return Ok(Value::Null);
+            }
             let mut xs = Vec::new();
-            for (_, child) in children(db, prefix, shape)? {
+            for (_, child) in cs {
                 xs.push(materialize_focus(db, &child)?);
             }
             Ok(Value::Array(xs))
         }
         Shape::Record { fields } => {
+            // Records keep the prefix probe: discovering "all N fields
+            // missing" costs N point-gets; the probe costs one seek.
+            if !prefix_present(db, prefix)? {
+                return Ok(Value::Null);
+            }
             let mut pairs = Vec::with_capacity(fields.len());
             for (i, (name, child)) in fields.iter().enumerate() {
                 let p = codec::child_key(prefix, &field_segment(i as u32));

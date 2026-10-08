@@ -139,6 +139,18 @@ impl StoreBinding {
                 self.rt.verify().map_err(|e| e.to_string())?;
                 Ok(Value::Bool(true))
             }
+            NativeId::StoreHas => {
+                // Presence in an auto-vivifying keyspace is semantic, not
+                // structural: probed in the raw keyspace (durable::query::has),
+                // so a missing record's empty-map read and a missing sum's
+                // zero default cannot masquerade as existence.
+                let (steps, term) = split_terminal(args.first())?;
+                if term.is_some() {
+                    return Err("store.has takes a plain path".into());
+                }
+                let q = self.path_query(&steps)?;
+                Ok(Value::Bool(self.rt.has(&q).map_err(|e| e.to_string())?))
+            }
             other => Err(format!("{other:?} is not a store native")),
         }
     }

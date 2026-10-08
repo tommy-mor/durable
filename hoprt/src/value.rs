@@ -37,6 +37,7 @@ pub enum NativeId {
     StoreAppend,
     StoreItems,
     StoreVerify,
+    StoreHas,
     // pure: terminal navigator constructors (store.set(v), store.add(n), …)
     NavSet,
     NavAdd,

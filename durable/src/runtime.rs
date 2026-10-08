@@ -512,6 +512,11 @@ impl<E: Serialize + DeserializeOwned + 'static> Runtime<E> {
         query::entries(&self.db, &self.schema, &self.scoped(query))
     }
 
+    /// Whether any non-null value exists at or under the path.
+    pub fn has(&self, query: &Query) -> Result<bool> {
+        query::has(&self.db, &self.schema, &self.scoped(query))
+    }
+
     pub fn project(&self, spec: &[(String, Query)]) -> Result<Value> {
         let scoped: Vec<(String, Query)> = spec
             .iter()
