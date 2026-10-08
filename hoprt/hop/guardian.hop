@@ -1,10 +1,14 @@
 // guardian.hop — a play/pausable LLM guardian over a sorted index held by
-// slug-as-a-database. Pair selection and run state live here; every vote
-// and the whole ranking live on slug via RPC (http effect). LLM judgments
-// stream live into the vote screen; humans can override with their own.
+// slug-as-a-database: the codebase indexer, one instance per repo. Pair
+// selection and run state live here; every vote and the whole ranking
+// live on slug via RPC (http effect) — ranking is never computed locally.
+// LLM judgments stream live into the vote screen; humans can override
+// with their own. File evidence comes through the rooted fs/git effects.
+// Token usage from every judgment is folded into a billing projection —
+// the invoice is computed from the tape, never from a payment processor.
 //
 //   SLUG: dev server at http://localhost:8080, room gt7dc9y/code-review.
-//   cargo run -p hoprt --bin hopd -- hoprt/hop/guardian.hop
+//   cargo run -p hoprt --bin hopd -- hoprt/hop/guardian.hop --fs-root /Users/tommy/programming/slug-star/slug
 
 server let schema = store.record([
   ["guardian", store.record([
@@ -18,9 +22,13 @@ server let schema = store.record([
   ])],
   ["files", store.map(store.record([
     ["url", store.leaf],
-    ["lines", store.leaf],
-    ["judged", store.sum]
+    ["lines", store.leaf]
   ]))],
+  ["billing", store.record([
+    ["prompt", store.sum],
+    ["completion", store.sum],
+    ["calls", store.sum]
+  ])],
   ["feed", store.list(store.leaf)]
 ]);
 
@@ -30,7 +38,12 @@ server let slug_room = "gt7dc9y/code-review";
 server let slug_room_web = "gt7dc9ycode-review";
 server let slug_token = "slug_erosdev_erosdevsecret";
 server let slug_delegate = "99565dd4-6ce9-4aeb-8da5-7641317de958:eros:moonshotai/kimi-k3";
-server let repo_scanner = "python3 /Users/tommy/eros/scan_slug_repo.py";
+// the indexer tenancy: one hopd per repo — the scope in slug that holds
+// this repo's votes and ranking, the URL base for member items, and the
+// git pathspec that names the repo's big files
+server let index_scope = "~code-review";
+server let repo_url_base = "https://github.com/sortersocial/slug/blob/main/";
+server let scan_pattern = "server/src/*.rs";
 
 fn reduce(event) {
   match event {
@@ -44,11 +57,9 @@ fn reduce(event) {
       store(["guardian", "ticks", store.add(1)]);
     }
     file { path, url, lines } => {
-      store(["files", path, store.set({ url = url, lines = lines, judged = 0 })]);
+      store(["files", path, store.set({ url = url, lines = lines })]);
     }
     judged { winner, loser, full } => {
-      store(["files", winner, "judged", store.add(1)]);
-      store(["files", loser, "judged", store.add(1)]);
       store(["feed", store.push("guardian: " .. winner .. " > " .. loser .. "\n" .. full)]);
     }
     judging { flag, at } => {
@@ -65,12 +76,17 @@ fn reduce(event) {
       store(["guardian", "prompt", store.set(text)]);
     }
     manual { winner, loser } => {
-      store(["files", winner, "judged", store.add(1)]);
-      store(["files", loser, "judged", store.add(1)]);
       store(["feed", store.push("human: " .. winner .. " > " .. loser)]);
     }
     note { text } => {
       store(["feed", store.push("note: " .. text)]);
+    }
+    tokens { prompt, completion } => {
+      // the invoice is a fold: every judgment's token accounting lands on
+      // the tape and the sums below ARE the bill, recomputable from log
+      store(["billing", "prompt", store.add(prompt)]);
+      store(["billing", "completion", store.add(completion)]);
+      store(["billing", "calls", store.add(1)]);
     }
     err { text } => {
       store(["guardian", "err", store.set(text)]);
@@ -112,7 +128,7 @@ fn slug_post_vote(winner_url, loser_url, why) {
 fn slug_rank_rows() {
   let rows = [];
   let res = slug_rpc({
-    GetGardenRank = { room = slug_room, parent_path = "~code-review" }
+    GetGardenRank = { room = slug_room, parent_path = index_scope }
   });
   if !res.ok {
     return rows;
@@ -159,31 +175,6 @@ fn rank_label(item, files) {
   return item;
 }
 
-fn pick_pair(files) {
-  let a = false;
-  let b = false;
-  for i, f in files {
-    if !a {
-      b = a;
-      a = f;
-    } else {
-      if f.judged < a.judged {
-        b = a;
-        a = f;
-      } else {
-        if !b {
-          b = f;
-        } else {
-          if f.judged < b.judged {
-            b = f;
-          }
-        }
-      }
-    }
-  }
-  return { a = a, b = b };
-}
-
 fn file_for_url(files, url) {
   if !files || !url {
     return nil;
@@ -196,82 +187,59 @@ fn file_for_url(files, url) {
   return nil;
 }
 
-// The database suggests the pair — slug's GetPair prefers unranked×ranked
-// bridges first, then unvoted edges, so every vote connects the vote graph.
-// The local pick_pair grinds the same two least-judged files forever, which
-// is how 240 votes left the garden as six disconnected islands. Falls back
-// to the local pick only when slug cannot answer.
-fn slug_next_pair(files) {
+// Pair choosing is ONE question asked of the database: slug's GetPair
+// prefers unranked×ranked bridges first, then unvoted edges, so every
+// vote connects the vote graph. There is no local fallback and no
+// adoption — the scanner registers every big file, so a real scope member
+// is always known here. A slug that cannot answer is an error to show; a
+// suggested item no scanned file matches is foreign (possibly hostile)
+// and is refused loudly — its text never becomes a path or reaches a
+// shell.
+fn next_pair(files) {
   let empty = { a = nil, b = nil };
   let res = slug_rpc({
-    GetPair = { room = slug_room, parent_path = "~code-review" }
+    GetPair = { room = slug_room, parent_path = index_scope }
   });
   if !res.ok {
+    if files {
+      store.append({ type = "err", text = res.err });
+    }
     return empty;
   }
   let results = res.data.results;
   if !results || type(results) != "array" || len(results) == 0 {
+    if files {
+      store.append({ type = "err", text = "slug GetPair: malformed rpc body" });
+    }
     return empty;
   }
   if !results[0].ok {
+    // Before the first scan the scope simply doesn't exist yet — the idle
+    // state, not an error. Once files are registered a refusal is a wound
+    // and gets shown.
+    if files {
+      store.append({ type = "err", text = "slug GetPair refused the scope" });
+    }
     return empty;
   }
   let pair = results[0].result.Pair;
   if !pair || type(pair) != "map" {
+    if files {
+      store.append({ type = "err", text = "slug GetPair: no pair in response" });
+    }
     return empty;
   }
-  // slug may suggest a member the local store doesn't know: the repo
-  // scanner only keeps the top 12 files by line count, but slug sees every
-  // registered member (scope_rank.rs, 433 lines, lives in the 13th slot).
-  // Silently falling back to the local pick here is how the vote graph
-  // stayed six disconnected islands — the bridge suggestions died unheard.
-  // Adopt the stranger from the repo on disk instead.
   let a = file_for_url(files, pair.left);
   if !a {
-    a = adopt_file(pair.left);
+    store.append({ type = "note", text = "refused unknown slug-suggested item: " .. pair.left });
+    return empty;
   }
   let b = file_for_url(files, pair.right);
   if !b {
-    b = adopt_file(pair.right);
+    store.append({ type = "note", text = "refused unknown slug-suggested item: " .. pair.right });
+    return empty;
   }
   return { a = a, b = b };
-}
-
-// Register a slug-suggested item the local store hasn't met: pull its line
-// count from the repo on disk and file it like any scanned file.
-fn adopt_file(slug_url) {
-  if !slug_url {
-    return nil;
-  }
-  // slug's item URLs are double-wrapped: the slug.social room URL wrapping
-  // the github URL wrapping the repo path. Cut the FULL prefix, not just
-  // the marker — str.cut on "blob/main/" alone leaves both host prefixes
-  // in the "path" and wc -l starves on garbage.
-  let prefix = str.before(slug_url, "blob/main/");
-  let path = str.cut(slug_url, prefix .. "blob/main/");
-  if path == "" || !str.has(path, "/") || str.has(path, " ") || str.has(path, ":") {
-    return nil;
-  }
-  let out = bash("wc -l < '/Users/tommy/programming/slug-star/slug/" .. path .. "'");
-  if !out.ok {
-    return nil;
-  }
-  let lines = tonumber(str.strip(out.stdout));
-  if !lines {
-    return nil;
-  }
-  let github_url = "https://github.com/sortersocial/slug/blob/main/" .. path;
-  store.append({ type = "file", path = path, url = github_url, lines = lines });
-  store.append({ type = "note", text = "adopted slug-suggested file: " .. path });
-  return { id = path, url = github_url, lines = lines, judged = 0 };
-}
-
-fn next_pair(files) {
-  let pair = slug_next_pair(files);
-  if !pair.a || !pair.b {
-    pair = pick_pair(files);
-  }
-  return pair;
 }
 
 fn judge_prompt(a, b, bodies) {
@@ -283,14 +251,6 @@ fn judge_prompt(a, b, bodies) {
 }
 
 // ---- view ----
-
-fn arr_len(a) {
-  let n = 0;
-  for i, x in a {
-    n = n + 1;
-  }
-  return n;
-}
 
 fn view_css() {
   return ".guardian-grid { display: flex; gap: 18px; align-items: flex-start; } "
@@ -320,11 +280,13 @@ fn view_css() {
 // /r/ proxy (same origin, bearer injected server-side by hopd). The URLs are
 // computed SERVER-side (fn graph_urls) and passed in: server lets like
 // slug_url and slug_room_web don't exist in the browser VM, where app_view
-// actually renders.
+// actually renders. It sits in a native <details>, collapsed by default with
+// loading="lazy": the first paint carries no iframe weight at all, and the
+// replay appears exactly when someone asks for it. Butter.
 fn chart_block(graph) {
-  return [:div, { class = "chart" },
-    [:h3, {}, "score history · slug's own graph"],
-    [:iframe, { src = graph.src, class = "chart-frame", title = "slug score history" }],
+  return [:details, { class = "chart" },
+    [:summary, {}, "score history · slug's own graph"],
+    [:iframe, { src = graph.src, class = "chart-frame", title = "slug score history", loading = "lazy" }],
     [:p, { class = "meta" },
       [:a, { href = graph.href, target = "_blank" }, "open the replay in slug →"]
     ]
@@ -494,6 +456,24 @@ fn app_view(status, files, rank_rows, feed, stream_a, stream_b, stream_text, err
   return [:div, {}, parts];
 }
 
+// The running invoice, folded from the tape: tokens in, tokens out, and
+// how many judgments the meter has seen. Recomputable from log.jsonl.
+fn billing_line() {
+  let p = store(["billing", "prompt"]);
+  if !p {
+    p = 0;
+  }
+  let c = store(["billing", "completion"]);
+  if !c {
+    c = 0;
+  }
+  let n = store(["billing", "calls"]);
+  if !n {
+    n = 0;
+  }
+  return "⚡ " .. p .. " in / " .. c .. " out · " .. n .. " calls";
+}
+
 fn paint(stream_a, stream_b, stream_text) {
   let files = store.items(["files"]);
   let ticks = store(["guardian", "ticks"]);
@@ -505,10 +485,11 @@ fn paint(stream_a, stream_b, stream_text) {
     feed = [];
   }
   let err = store(["guardian", "err"]);
-  let status = "⏸ paused · tick " .. ticks;
+  let state = "⏸ paused";
   if store(["guardian", "running"]) {
-    status = "● running · tick " .. ticks;
+    state = "● running";
   }
+  let status = state .. " · tick " .. ticks .. " · " .. billing_line();
   let rank_rows = slug_rank_rows();
   let graph = graph_urls();
   let prompt_text = store(["guardian", "prompt"]);
@@ -541,20 +522,30 @@ fn set_view(mode) {
 
 fn scan_repo() {
   server!();
-  let out = bash(repo_scanner);
-  if !out.ok {
-    store.append({ type = "err", text = "scan failed: " .. out.stderr });
+  // Tracked files straight from git, line counts straight from fs — the
+  // rooted effects do what the old Python scanner did, with no shell and
+  // no sidecar. Every file over 400 lines registers: no top-N cut, so
+  // slug's GetPair never suggests a member this store hasn't met.
+  let res = git.files(scan_pattern);
+  if !res.ok {
+    store.append({ type = "err", text = "scan failed: " .. res.error });
     paint("", "", "");
     return;
   }
-  let rows = json.decode(out.stdout);
-  if type(rows) != "array" {
+  let rows = [];
+  for i, path in res.files {
+    let c = fs.count_lines(path);
+    if c.ok && c.lines > 400 {
+      push(rows, { path = path, lines = c.lines });
+    }
+  }
+  if len(rows) == 0 {
     store.append({ type = "err", text = "scan produced no files" });
     paint("", "", "");
     return;
   }
-  let base = "https://github.com/sortersocial/slug/blob/main/";
-  let doc = "~code-review { the slug codebase, judged file by file }\n";
+  let base = repo_url_base;
+  let doc = index_scope .. " { the codebase, judged file by file }\n";
   for i, r in rows {
     store.append({ type = "file", path = r.path, url = base .. r.path, lines = r.lines });
     doc = doc .. base .. r.path .. " { " .. r.path .. " — " .. r.lines .. " lines }\n";
@@ -564,7 +555,7 @@ fn scan_repo() {
   // votes as a ghost — its vote lands in the global graph but the scope's
   // rank table and the database's own garden never see it.
   for i, r in rows {
-    doc = doc .. "{ part of the codebase }\n" .. base .. r.path .. " <: ~code-review\n";
+    doc = doc .. "{ part of the codebase }\n" .. base .. r.path .. " <: " .. index_scope .. "\n";
   }
   let reg = slug_rpc({
     Post = {
@@ -636,16 +627,26 @@ fn tick() {
   }
   store.append({ type = "judging", flag = true, at = time.now() });
   store.append({ type = "tick_mark" });
-  // The real evidence: both files' actual contents, read from the repo on
-  // disk, capped per file with the truncation declared inside the prompt.
-  let bodies = bash("python3 /Users/tommy/eros/read_bodies.py " .. pair.a.id .. " " .. pair.b.id);
-  if !bodies.ok {
-    store.append({ type = "err", text = "body read failed: " .. bodies.stderr });
+  // The real evidence: both files' FULL contents through the rooted fs
+  // effect — hopd refuses anything outside --fs-root in Rust, so no
+  // app-side path gate and no shell ever enter the judging loop.
+  let ra = fs.read(pair.a.id);
+  if !ra.ok {
+    store.append({ type = "err", text = "body read failed: " .. ra.error });
     store.append({ type = "judging", flag = false, at = nil });
     paint("", "", "");
     return;
   }
-  let prompt = judge_prompt(pair.a, pair.b, bodies.stdout);
+  let rb = fs.read(pair.b.id);
+  if !rb.ok {
+    store.append({ type = "err", text = "body read failed: " .. rb.error });
+    store.append({ type = "judging", flag = false, at = nil });
+    paint("", "", "");
+    return;
+  }
+  let bodies = "===== FILE a: " .. pair.a.id .. " =====\n" .. ra.text
+    .. "\n\n===== FILE b: " .. pair.b.id .. " =====\n" .. rb.text;
+  let prompt = judge_prompt(pair.a, pair.b, bodies);
   store.append({ type = "prompt", text = prompt });
   let ticks = store(["guardian", "ticks"]);
   if !ticks {
@@ -655,7 +656,7 @@ fn tick() {
   if !feed {
     feed = [];
   }
-  let status = "● running · tick " .. ticks;
+  let status = "● running · tick " .. ticks .. " · " .. billing_line();
   let rank_rows = slug_rank_rows();
   let graph = graph_urls();
   let prompt_text = store(["guardian", "prompt"]);
@@ -668,7 +669,19 @@ fn tick() {
     cast browsers {
       hui.render("#app", app_view(status, files, rank_rows, feed, pair.a.id, pair.b.id, acc, nil, graph, prompt_text, pair, view));
     }
+    // Heartbeat: keep judging_at fresh while a judgment is actually
+    // streaming. The watchdog reaps at 120s of silence — but bodies are
+    // uncapped, a 40k-token judgment can legitimately exceed that wall
+    // clock, and reaping mid-stream breeds a second concurrent LLM call on
+    // the same store. Touch at most every 30s so the log doesn't drown.
+    let last_at = store(["guardian", "judging_at"]);
+    if !last_at || time.now() - last_at > 30000 {
+      store.append({ type = "judging", flag = true, at = time.now() });
+    }
     out = llm.next(h);
+  }
+  if out.usage {
+    store.append({ type = "tokens", prompt = out.usage.prompt_tokens, completion = out.usage.completion_tokens });
   }
   if out.error {
     store.append({ type = "err", text = "llm: " .. out.error });
@@ -694,6 +707,9 @@ fn tick() {
     store.append({ type = "err", text = res.err });
   } else {
     store.append({ type = "judged", winner = w.id, loser = l.id, full = out.text });
+    // a judgment that lands clears the wound display: stale errors (e.g.
+    // the scope not existing before the first scan) must not outlive health
+    store.append({ type = "err", text = nil });
   }
   store.append({ type = "judging", flag = false, at = nil });
   paint("", "", "");

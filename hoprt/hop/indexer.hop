@@ -1,0 +1,495 @@
+// indexer.hop — the codebase indexer as a service: paste a repo, paste an
+// OpenRouter key, watch an agent sort the repo by needs-refactor, live,
+// with receipts on slug and the running invoice folded from the tape.
+//
+// Rankings live in slug (one scope per repo); the bill is a fold over
+// events; the user's LLM key rides flow state and never touches the tape.
+// Self-hosted v1: the key crosses localhost only.
+//
+//   hopd hoprt/hop/indexer.hop --fs-root /tmp/indexer-workspaces
+
+server let schema = store.record([
+  ["run", store.record([
+    ["running", store.leaf],
+    ["judging", store.leaf],
+    ["judging_at", store.leaf],
+    ["ticks", store.sum],
+    ["err", store.leaf]
+  ])],
+  ["repo", store.record([
+    ["url", store.leaf],
+    ["name", store.leaf]
+  ])],
+  ["files", store.map(store.record([
+    ["url", store.leaf],
+    ["lines", store.leaf]
+  ]))],
+  ["billing", store.record([
+    ["prompt", store.sum],
+    ["completion", store.sum],
+    ["calls", store.sum]
+  ])],
+  ["feed", store.list(store.leaf)]
+]);
+
+server let tick_every_ms = 800;
+server let slug_url = "http://localhost:8080";
+server let slug_room = "public";
+server let slug_token = "slug_erosdev_erosdevsecret";
+server let slug_delegate = "99565dd4-6ce9-4aeb-8da5-7641317de958:eros:moonshotai/kimi-k3";
+server let slug_web = "https://slug.social";
+server let min_lines = 400;
+server let max_lines = 12000;
+server let patterns = ["*.rs", "*.ts", "*.tsx", "*.js", "*.py", "*.go", "*.c", "*.h", "*.cpp"];
+
+fn reduce(event) {
+  match event {
+    play {} => {
+      store(["run", "running", store.set(true)]);
+    }
+    pause {} => {
+      store(["run", "running", store.set(false)]);
+    }
+    tick_mark {} => {
+      store(["run", "ticks", store.add(1)]);
+    }
+    repo { url, name } => {
+      store(["repo", store.set({ url = url, name = name })]);
+    }
+    file { path, url, lines } => {
+      store(["files", path, store.set({ url = url, lines = lines })]);
+    }
+    judging { flag, at } => {
+      store(["run", "judging", store.set(flag)]);
+      store(["run", "judging_at", store.set(at)]);
+    }
+    judged { winner, loser, full } => {
+      store(["feed", store.push("agent: " .. winner .. " > " .. loser .. "\n" .. full)]);
+    }
+    tokens { prompt, completion } => {
+      store(["billing", "prompt", store.add(prompt)]);
+      store(["billing", "completion", store.add(completion)]);
+      store(["billing", "calls", store.add(1)]);
+    }
+    note { text } => {
+      store(["feed", store.push("note: " .. text)]);
+    }
+    err { text } => {
+      store(["run", "err", store.set(text)]);
+    }
+  }
+}
+
+// ---- slug (the database) ----
+
+fn slug_rpc(cmd) {
+  let res = http.post(slug_url .. "/api/v0/rpc", json.encode([cmd]), {
+    Authorization = "Bearer " .. slug_token
+  });
+  if !res.ok {
+    return { ok = false, err = "slug rpc transport error" };
+  }
+  if res.status >= 400 {
+    return { ok = false, err = "slug rpc HTTP " .. res.status };
+  }
+  return { ok = true, data = json.decode(res.body) };
+}
+
+fn slug_post_vote(winner_url, loser_url, why) {
+  return slug_rpc({
+    Post = {
+      room = slug_room,
+      thread_tag = "judgments",
+      delegate = slug_delegate,
+      text = "{ " .. why .. " }\n" .. winner_url .. " 2:1 " .. loser_url .. "\n"
+    }
+  });
+}
+
+fn slug_rank_rows(scope) {
+  let res = slug_rpc({ GetGardenRank = { room = slug_room, parent_path = scope } });
+  if !res.ok {
+    return [];
+  }
+  let results = res.data.results;
+  if !results || type(results) != "array" || len(results) == 0 || !results[0].ok {
+    return [];
+  }
+  let rank = results[0].result.GardenRank;
+  if !rank || type(rank) != "map" || !rank.components {
+    return [];
+  }
+  let rows = [];
+  for ci, comp in rank.components {
+    if comp.ranking {
+      for i, r in comp.ranking {
+        push(rows, { item = r.item, score = r.score });
+      }
+    }
+  }
+  return rows;
+}
+
+// ---- helpers ----
+
+fn rank_label(item, files) {
+  if files {
+    for i, f in files {
+      if str.has(item, f.url) {
+        return f.id;
+      }
+    }
+  }
+  return item;
+}
+
+// Pair choosing is ONE question asked of the database: slug's GetPair
+// prefers unranked×ranked bridges, then unvoted edges. A suggestion no
+// indexed file matches is foreign and refused loudly — never adopted.
+fn next_pair(files, scope) {
+  let empty = { a = nil, b = nil };
+  let res = slug_rpc({ GetPair = { room = slug_room, parent_path = scope } });
+  if !res.ok {
+    if files {
+      store.append({ type = "err", text = res.err });
+    }
+    return empty;
+  }
+  let results = res.data.results;
+  if !results || type(results) != "array" || len(results) == 0 || !results[0].ok {
+    return empty;
+  }
+  let pair = results[0].result.Pair;
+  if !pair || type(pair) != "map" {
+    return empty;
+  }
+  let a = file_for_url(files, pair.left);
+  let b = file_for_url(files, pair.right);
+  if !a || !b {
+    store.append({ type = "note", text = "refused unknown slug-suggested item" });
+    return empty;
+  }
+  return { a = a, b = b };
+}
+
+fn file_for_url(files, url) {
+  if !files || !url {
+    return nil;
+  }
+  for i, f in files {
+    if str.has(url, f.url) {
+      return f;
+    }
+  }
+  return nil;
+}
+
+// "https://github.com/owner/repo(.git)" → "owner-repo"
+fn repo_name(url) {
+  let n = str.cut(url, ".git");
+  let n = str.cut(n, "https://github.com/");
+  return str.replace(n, "/", "-");
+}
+
+fn judge_prompt(a, b, bodies) {
+  return "You are a code-health guardian. Judge which of these two source files MOST needs refactoring, using the actual file contents below as evidence (responsibilities, coupling, cohesion, size).\n\n"
+    .. "a: " .. a.id .. " — " .. a.lines .. " lines\n"
+    .. "b: " .. b.id .. " — " .. b.lines .. " lines\n\n"
+    .. bodies .. "\n\n"
+    .. "Give one short paragraph of reasoning that cites concrete details from the file contents, then a final line that is ONLY this JSON: {\"winner\":\"a\",\"why\":\"one sentence\"} or {\"winner\":\"b\",\"why\":\"one sentence\"}.";
+}
+
+fn billing_line() {
+  let p = store(["billing", "prompt"]);
+  if !p {
+    p = 0;
+  }
+  let c = store(["billing", "completion"]);
+  if !c {
+    c = 0;
+  }
+  let n = store(["billing", "calls"]);
+  if !n {
+    n = 0;
+  }
+  return "⚡ " .. p .. " in / " .. c .. " out · " .. n .. " calls";
+}
+
+// ---- view ----
+
+fn rev_entries(feed) {
+  let entries = [];
+  let n = len(feed);
+  let start = n - 40;
+  if start < 0 {
+    start = 0;
+  }
+  let k = n - 1;
+  while k >= start {
+    push(entries, [:pre, { class = "judge-entry" }, feed[k]]);
+    k = k - 1;
+  }
+  return entries;
+}
+
+// Structure only — the styling is Master's. Everything this renders arrives
+// as arguments: server lets (slug_web et al.) do not exist in the browser VM
+// where this view runs — the same wound the guardian's graph_urls documents.
+fn index_view(status, files, rank_rows, feed, repo, scope_url, err, stream_text, stream_pair) {
+  let parts = [];
+  push(parts, [:h1, {}, "indexer"]);
+  push(parts, [:p, { class = "tagline" },
+    "an agent reads your whole repo and ranks what needs refactoring — receipts on slug, the invoice folded from the tape"
+  ]);
+  if err {
+    push(parts, [:p, { class = "err" }, err]);
+  }
+  push(parts, [:div, { class = "run-form" },
+    [:input, { id = "rurl", placeholder = "github repo url" }],
+    [:input, { id = "rkey", placeholder = "openrouter api key (never stored)" }],
+    [:button, { id = "index", onclick = fn(e) { index_from_form(); } }, "index my repo"]
+  ]);
+  push(parts, [:div, { class = "row" },
+    [:button, { id = "play", onclick = fn(e) { play(); } }, "play"],
+    [:button, { id = "pause", onclick = fn(e) { pause(); } }, "pause"],
+    [:span, { class = "status" }, status]
+  ]);
+  if repo {
+    push(parts, [:p, { class = "meta" },
+      "repo: " .. repo.name .. " · ",
+      [:a, { href = scope_url, target = "_blank" }, "ranking on slug →"],
+      " · ",
+      [:a, { href = scope_url .. "?v=history", target = "_blank" }, "replay ↗"]
+    ]);
+  }
+  if stream_text != "" {
+    push(parts, [:pre, { class = "stream" }, "judging: " .. stream_pair .. "\n" .. stream_text]);
+  }
+  let fr = [];
+  if files {
+    for i, f in files {
+      push(fr, [:li, {}, f.id .. " — " .. f.lines .. " lines"]);
+    }
+  }
+  push(parts, [:h2, {}, "files"]);
+  push(parts, [:ul, { class = "files" }, fr]);
+  let rr = [];
+  for i, r in rank_rows {
+    push(rr, [:tr, {},
+      [:td, { class = "mono" }, rank_label(r.item, files)],
+      [:td, { class = "num" }, "" .. r.score]
+    ]);
+  }
+  push(parts, [:h2, {}, "ranking · slug"]);
+  push(parts, [:table, { class = "rank" },
+    [:tr, {}, [:th, {}, "file"], [:th, {}, "score"]],
+    rr
+  ]);
+  push(parts, [:h2, {}, "judgment log"]);
+  push(parts, [:div, { class = "judge-log" }, rev_entries(feed)]);
+  return [:div, { class = "indexer" }, parts];
+}
+
+fn paint(stream_pair, stream_text) {
+  let files = store.items(["files"]);
+  let repo = store(["repo"]);
+  let err = store(["run", "err"]);
+  let ticks = store(["run", "ticks"]);
+  if !ticks {
+    ticks = 0;
+  }
+  let state = "⏸ paused";
+  if store(["run", "running"]) {
+    state = "● running";
+  }
+  let status = state .. " · tick " .. ticks .. " · " .. billing_line();
+  let feed = store(["feed"]);
+  if !feed {
+    feed = [];
+  }
+  let rank_rows = [];
+  let scope_url = nil;
+  if repo {
+    scope_url = slug_web .. "/~" .. repo.name;
+    rank_rows = slug_rank_rows("~" .. repo.name);
+  }
+  cast browsers {
+    hui.render("#app", index_view(status, files, rank_rows, feed, repo, scope_url, err, stream_text, stream_pair));
+  }
+}
+
+// ---- flows ----
+
+fn play() {
+  server!();
+  store.append({ type = "play" });
+  paint("", "");
+}
+
+fn pause() {
+  server!();
+  store.append({ type = "pause" });
+  paint("", "");
+}
+
+fn index_from_form() {
+  let url = dom.get("#rurl");
+  let key = dom.get("#rkey");
+  if url != "" {
+    start_index(url, key);
+  }
+}
+
+fn start_index(url, key) {
+  server!();
+  let name = repo_name(url);
+  if name == "" {
+    store.append({ type = "err", text = "need a github repo url" });
+    paint("", "");
+    return;
+  }
+  // the user's key lives in a process global, never on the tape; a hopd
+  // restart simply asks for it again
+  run_key = key;
+  let cl = git.clone(url, name);
+  if !cl.ok {
+    store.append({ type = "err", text = "clone failed: " .. cl.error });
+    paint("", "");
+    return;
+  }
+  let rows = [];
+  for i, pat in patterns {
+    let res = git.files(pat, name);
+    if res.ok {
+      for j, path in res.files {
+        let c = fs.count_lines(name .. "/" .. path);
+        if c.ok && c.lines > min_lines && c.lines <= max_lines {
+          push(rows, { path = path, lines = c.lines });
+        }
+      }
+    }
+  }
+  if len(rows) == 0 {
+    store.append({ type = "err", text = "no source files between " .. min_lines .. " and " .. max_lines .. " lines" });
+    paint("", "");
+    return;
+  }
+  let scope = "~" .. name;
+  let base = str.cut(url, ".git") .. "/blob/HEAD/";
+  let doc = scope .. " { " .. name .. ", judged file by file }\n";
+  for i, r in rows {
+    store.append({ type = "file", path = r.path, url = base .. r.path, lines = r.lines });
+    doc = doc .. base .. r.path .. " { " .. r.path .. " — " .. r.lines .. " lines }\n";
+  }
+  // membership is declared, not assumed: without `<: scope` the files vote
+  // as ghosts and the scope's rank table never sees them
+  for i, r in rows {
+    doc = doc .. "{ part of " .. name .. " }\n" .. base .. r.path .. " <: " .. scope .. "\n";
+  }
+  let reg = slug_rpc({
+    Post = { room = slug_room, thread_tag = "files", delegate = slug_delegate, text = doc }
+  });
+  if !reg.ok {
+    store.append({ type = "err", text = "slug registration failed: " .. reg.err });
+    paint("", "");
+    return;
+  }
+  store.append({ type = "repo", url = url, name = name });
+  store.append({ type = "note", text = "indexed " .. name .. ": " .. len(rows) .. " files registered with slug" });
+  store.append({ type = "play" });
+  paint("", "");
+}
+
+fn tick() {
+  if !store(["run", "running"]) {
+    return;
+  }
+  // watchdog: a judging flag older than two minutes means the judgment
+  // died mid-flight — recover and move on
+  if store(["run", "judging"]) {
+    let at = store(["run", "judging_at"]);
+    if at {
+      if time.now() - at < 120000 {
+        return;
+      }
+    }
+  }
+  let repo = store(["repo"]);
+  let files = store.items(["files"]);
+  if !repo || !files {
+    return;
+  }
+  let pair = next_pair(files, "~" .. repo.name);
+  if !pair.a || !pair.b {
+    return;
+  }
+  store.append({ type = "judging", flag = true, at = time.now() });
+  store.append({ type = "tick_mark" });
+  let ra = fs.read(repo.name .. "/" .. pair.a.id);
+  if !ra.ok {
+    store.append({ type = "err", text = "body read failed: " .. ra.error });
+    store.append({ type = "judging", flag = false, at = nil });
+    paint("", "");
+    return;
+  }
+  let rb = fs.read(repo.name .. "/" .. pair.b.id);
+  if !rb.ok {
+    store.append({ type = "err", text = "body read failed: " .. rb.error });
+    store.append({ type = "judging", flag = false, at = nil });
+    paint("", "");
+    return;
+  }
+  let bodies = "===== FILE a: " .. pair.a.id .. " =====\n" .. ra.text
+    .. "\n\n===== FILE b: " .. pair.b.id .. " =====\n" .. rb.text;
+  let prompt = judge_prompt(pair.a, pair.b, bodies);
+  let h = llm.stream({ messages = [{ role = "user", content = prompt }], api_key = run_key });
+  let acc = "";
+  let out = llm.next(h);
+  let pair_label = pair.a.id .. " vs " .. pair.b.id;
+  while out.delta {
+    acc = acc .. out.delta;
+    paint(pair_label, acc);
+    // heartbeat: keep judging_at fresh while a judgment streams (the
+    // watchdog reaps at two minutes of silence)
+    let last_at = store(["run", "judging_at"]);
+    if !last_at || time.now() - last_at > 30000 {
+      store.append({ type = "judging", flag = true, at = time.now() });
+    }
+    out = llm.next(h);
+  }
+  if out.usage {
+    store.append({ type = "tokens", prompt = out.usage.prompt_tokens, completion = out.usage.completion_tokens });
+  }
+  if out.error {
+    store.append({ type = "err", text = "llm: " .. out.error });
+    store.append({ type = "judging", flag = false, at = nil });
+    paint("", "");
+    return;
+  }
+  let verdict = json.first(out.text);
+  if type(verdict) != "map" {
+    store.append({ type = "err", text = "could not parse a verdict" });
+    store.append({ type = "judging", flag = false, at = nil });
+    paint("", "");
+    return;
+  }
+  let w = pair.a;
+  let l = pair.b;
+  if verdict.winner == "b" {
+    w = pair.b;
+    l = pair.a;
+  }
+  let res = slug_post_vote(w.url, l.url, verdict.why);
+  if !res.ok {
+    store.append({ type = "err", text = res.err });
+  } else {
+    store.append({ type = "judged", winner = w.id, loser = l.id, full = out.text });
+    store.append({ type = "err", text = nil });
+  }
+  store.append({ type = "judging", flag = false, at = nil });
+  paint("", "");
+}
+
+fn on_connect(sid) {
+  paint("", "");
+}
