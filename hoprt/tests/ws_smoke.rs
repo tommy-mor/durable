@@ -81,6 +81,10 @@ fn hopd_serves_the_todo_app_over_real_sockets() {
             WS_PORT,
             data_path,
             std::path::PathBuf::from("../hop-web/pkg"),
+            None,
+            None,
+            Vec::new(),
+            None,
             false,
         );
     });

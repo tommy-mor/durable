@@ -86,8 +86,9 @@ enum Ev {
     Effect(Vec<u8>),
     /// One streamed LLM delta for a stream handle.
     LlmChunk(String, String),
-    /// Stream finished: accumulated text + assembled tool calls, or the error.
-    LlmDone(String, Result<(String, Vec<ToolCall>), String>),
+    /// Stream finished: accumulated text, assembled tool calls, token
+    /// usage (when the API reports it), or the error.
+    LlmDone(String, Result<(String, Vec<ToolCall>, Option<LlmUsage>), String>),
 }
 
 /// A structured tool call from the model, assembled from stream deltas
@@ -530,10 +531,12 @@ fn route(sessions: &HashMap<String, Sess>, pkt: &Value) {
 }
 
 /// The server VM's platform: packets queue for routing; prints go to
-/// stdout; there is no DOM on this side.
+/// stdout; there is no DOM on this side. `trace` is hopd's --trace file —
+/// the execution lantern, one greppable line per event.
 struct ServePlatform<'a> {
     outbox: &'a mut VecDeque<Value>,
     store: Option<&'a mut StoreBinding>,
+    trace: Option<std::rc::Rc<std::cell::RefCell<std::fs::File>>>,
 }
 
 impl Platform for ServePlatform<'_> {
@@ -543,6 +546,17 @@ impl Platform for ServePlatform<'_> {
 
     fn print(&mut self, line: String) {
         println!("{line}");
+    }
+
+    fn tracing(&self) -> bool {
+        self.trace.is_some()
+    }
+
+    fn trace(&mut self, line: String) {
+        if let Some(f) = &self.trace {
+            use std::io::Write;
+            let _ = writeln!(&mut *f.borrow_mut(), "{line}");
+        }
     }
 
     fn dom_get(&mut self, _sel: &str) -> String {
@@ -574,10 +588,10 @@ impl Platform for ServePlatform<'_> {
 
 /// Env-configured LLM endpoint (OpenAI-compatible chat completions).
 #[derive(Clone)]
-struct LlmCfg {
-    key: Option<String>,
-    base: String,
-    model: Option<String>,
+pub struct LlmCfg {
+    pub key: Option<String>,
+    pub base: String,
+    pub model: Option<String>,
 }
 
 impl LlmCfg {
@@ -591,9 +605,18 @@ impl LlmCfg {
     }
 }
 
+/// Token accounting from a completed LLM call — the atoms of the invoice.
+/// Metering is a tape concern: apps fold these into billing projections.
+#[derive(Clone, Copy, Default)]
+struct LlmUsage {
+    prompt: i64,
+    completion: i64,
+    total: i64,
+}
+
 struct LlmStream {
     buf: VecDeque<String>,
-    done: Option<Result<(String, Vec<ToolCall>), String>>,
+    done: Option<Result<(String, Vec<ToolCall>, Option<LlmUsage>), String>>,
     /// A parked llm.next waiting for the next chunk: its flow id.
     pending: Option<String>,
 }
@@ -602,6 +625,8 @@ struct LlmStream {
 struct Effects {
     streams: HashMap<String, LlmStream>,
     next_id: u64,
+    /// hopd's --fs-root: the root every fs/git effect resolves inside.
+    fs_root: Option<PathBuf>,
 }
 
 /// `{ kind:"reply", flow, to:"server", value }` — resumes the parked flow.
@@ -657,6 +682,14 @@ fn llm_body(req: &Value, cfg: &LlmCfg, stream: bool) -> Result<String, String> {
         }
     }
     obj.insert("stream".into(), serde_json::Value::Bool(stream));
+    if stream {
+        // the invoice atoms: ask the API to end the stream with a usage
+        // chunk so token metering can be a fold over events
+        obj.insert(
+            "stream_options".into(),
+            serde_json::json!({"include_usage": true}),
+        );
+    }
     serde_json::to_string(&body).map_err(|e| e.to_string())
 }
 
@@ -680,15 +713,17 @@ fn llm_post(cfg: &LlmCfg, body: &str) -> Result<Box<dyn std::io::Read + Send + S
 }
 
 /// Read an SSE chat-completions stream, calling `on_delta` per content
-/// delta. Returns the accumulated text and any tool calls the model made
-/// (their arguments arrive as string fragments, keyed by index).
+/// delta. Returns the accumulated text, any tool calls the model made
+/// (their arguments arrive as string fragments, keyed by index), and the
+/// token usage when the API closes with a usage chunk.
 fn llm_read_stream(
     reader: Box<dyn std::io::Read + Send + Sync>,
     mut on_delta: impl FnMut(&str),
-) -> Result<(String, Vec<ToolCall>), String> {
+) -> Result<(String, Vec<ToolCall>, Option<LlmUsage>), String> {
     use std::io::BufRead;
     let mut acc = String::new();
     let mut calls: Vec<ToolCall> = Vec::new();
+    let mut usage: Option<LlmUsage> = None;
     for line in std::io::BufReader::new(reader).lines() {
         let line = line.map_err(|e| e.to_string())?;
         let Some(data) = line.strip_prefix("data:") else { continue };
@@ -706,6 +741,14 @@ fn llm_read_stream(
                 .and_then(|m| m.as_str())
                 .unwrap_or("llm stream error")
                 .to_string());
+        }
+        // the closing usage chunk rides an empty choices array
+        if let Some(u) = j.get("usage") {
+            usage = Some(LlmUsage {
+                prompt: u["prompt_tokens"].as_i64().unwrap_or(0),
+                completion: u["completion_tokens"].as_i64().unwrap_or(0),
+                total: u["total_tokens"].as_i64().unwrap_or(0),
+            });
         }
         let delta = &j["choices"][0]["delta"];
         if let Some(text) = delta["content"].as_str() {
@@ -733,7 +776,54 @@ fn llm_read_stream(
             }
         }
     }
-    Ok((acc, calls))
+    Ok((acc, calls, usage))
+}
+
+/// The `git.clone` effect: a shallow clone into a root-relative dir. The
+/// url rides argv — never a shell — and the dir is checked like any fs
+/// path (relative, no `..`). Replies { ok, dir } or { ok: false, error }.
+pub(crate) fn git_clone_run(url: &str, dir: &str, root: Option<&Path>) -> Value {
+    let Some(root) = root else {
+        return result_map(vec![
+            ("ok", Value::Bool(false)),
+            ("error", Value::str("hopd has no fs root (start it with --fs-root <dir>)")),
+        ]);
+    };
+    let rel = Path::new(dir);
+    if rel.is_absolute()
+        || rel
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return result_map(vec![
+            ("ok", Value::Bool(false)),
+            ("error", Value::str(format!("clone dir escapes the fs root: {dir}"))),
+        ]);
+    }
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .arg("clone")
+        .arg("--depth")
+        .arg("1")
+        .arg("--quiet")
+        .arg("--")
+        .arg(url)
+        .arg(dir)
+        .output();
+    match out {
+        Ok(o) if o.status.success() => {
+            result_map(vec![("ok", Value::Bool(true)), ("dir", Value::str(dir))])
+        }
+        Ok(o) => result_map(vec![
+            ("ok", Value::Bool(false)),
+            ("error", Value::str(String::from_utf8_lossy(&o.stderr).into_owned())),
+        ]),
+        Err(e) => result_map(vec![
+            ("ok", Value::Bool(false)),
+            ("error", Value::str(e.to_string())),
+        ]),
+    }
 }
 
 /// One outbound HTTP request for the `http` effect. Replies
@@ -776,6 +866,125 @@ fn http_run(method: &str, url: &str, body: &str, headers: Vec<(String, String)>)
     match res {
         Ok(resp) => finish(resp.status(), resp, true),
         Err(ureq::Error::Status(code, resp)) => finish(code, resp, false),
+        Err(e) => result_map(vec![
+            ("ok", Value::Bool(false)),
+            ("error", Value::str(e.to_string())),
+        ]),
+    }
+}
+
+/// Resolve an app-supplied RELATIVE path against hopd's fs root, refusing
+/// absolute paths, `..` components, and (via canonicalize) symlink escapes.
+/// The root is the whole policy: app code never sanitizes paths itself.
+pub(crate) fn fs_resolve(root: Option<&Path>, path: &str) -> Result<PathBuf, String> {
+    let Some(root) = root else {
+        return Err("hopd has no fs root (start it with --fs-root <dir>)".into());
+    };
+    let rel = Path::new(path);
+    if rel.is_absolute() {
+        return Err(format!("absolute path refused: {path}"));
+    }
+    if rel
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(format!("path escapes the fs root: {path}"));
+    }
+    let root = root.canonicalize().map_err(|e| format!("fs root: {e}"))?;
+    // canonicalize requires the target to exist — read/count require it too
+    let canon = root
+        .join(rel)
+        .canonicalize()
+        .map_err(|e| format!("{path}: {e}"))?;
+    if !canon.starts_with(&root) {
+        return Err(format!("path escapes the fs root: {path}"));
+    }
+    Ok(canon)
+}
+
+/// The `fs` effect: rooted file reads. Replies { ok, text } for "read",
+/// { ok, lines } for "count_lines" (wc -l semantics: newline count),
+/// { ok: false, error } on refusal or I/O failure.
+pub(crate) fn fs_run(op: &str, path: &str, root: Option<&Path>) -> Value {
+    let full = match fs_resolve(root, path) {
+        Ok(p) => p,
+        Err(e) => {
+            return result_map(vec![
+                ("ok", Value::Bool(false)),
+                ("error", Value::str(e)),
+            ])
+        }
+    };
+    match op {
+        "read" => match std::fs::read_to_string(&full) {
+            Ok(text) => result_map(vec![("ok", Value::Bool(true)), ("text", Value::str(text))]),
+            Err(e) => result_map(vec![
+                ("ok", Value::Bool(false)),
+                ("error", Value::str(e.to_string())),
+            ]),
+        },
+        "count_lines" => match std::fs::read(&full) {
+            Ok(bytes) => {
+                let lines = bytes.iter().filter(|&&b| b == b'\n').count() as i64;
+                result_map(vec![
+                    ("ok", Value::Bool(true)),
+                    ("lines", Value::Int(lines)),
+                ])
+            }
+            Err(e) => result_map(vec![
+                ("ok", Value::Bool(false)),
+                ("error", Value::str(e.to_string())),
+            ]),
+        },
+        _ => result_map(vec![
+            ("ok", Value::Bool(false)),
+            ("error", Value::str(format!("unknown fs op {op}"))),
+        ]),
+    }
+}
+
+/// The `git` effect: tracked files matching a pathspec, rooted at the fs
+/// root (the repo). argv all the way down — no shell, so the pattern is
+/// inert data. Replies { ok, files = [...] } or { ok: false, error }.
+pub(crate) fn git_files_run(pattern: &str, dir: Option<&str>, root: Option<&Path>) -> Value {
+    let Some(root) = root else {
+        return result_map(vec![
+            ("ok", Value::Bool(false)),
+            ("error", Value::str("hopd has no fs root (start it with --fs-root <dir>)")),
+        ]);
+    };
+    let base = match dir {
+        Some(d) => match fs_resolve(Some(root), d) {
+            Ok(p) => p,
+            Err(e) => {
+                return result_map(vec![
+                    ("ok", Value::Bool(false)),
+                    ("error", Value::str(e)),
+                ])
+            }
+        },
+        None => root.to_path_buf(),
+    };
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&base)
+        .arg("ls-files")
+        .arg("--")
+        .arg(pattern)
+        .output();
+    match out {
+        Ok(o) if o.status.success() => {
+            let files = String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .filter(|l| !l.is_empty())
+                .map(Value::str)
+                .collect();
+            result_map(vec![("ok", Value::Bool(true)), ("files", Value::array(files))])
+        }
+        Ok(o) => result_map(vec![
+            ("ok", Value::Bool(false)),
+            ("error", Value::str(String::from_utf8_lossy(&o.stderr).into_owned())),
+        ]),
         Err(e) => result_map(vec![
             ("ok", Value::Bool(false)),
             ("error", Value::str(e.to_string())),
@@ -836,13 +1045,48 @@ impl Effects {
                     let _ = tx.send(Ev::Effect(effect_reply(&flow, value)));
                 });
             }
+            "fs" => {
+                let op = crate::value::coerce_str(&vars.get_field("op"));
+                let path = crate::value::coerce_str(&vars.get_field("path"));
+                let root = self.fs_root.clone();
+                let tx = tx.clone();
+                thread::spawn(move || {
+                    let value = fs_run(&op, &path, root.as_deref());
+                    let _ = tx.send(Ev::Effect(effect_reply(&flow, value)));
+                });
+            }
+            "git" => {
+                let op = crate::value::coerce_str(&vars.get_field("op"));
+                let root = self.fs_root.clone();
+                let tx = tx.clone();
+                if op == "clone" {
+                    let url = crate::value::coerce_str(&vars.get_field("url"));
+                    let dir = crate::value::coerce_str(&vars.get_field("dir"));
+                    thread::spawn(move || {
+                        let value = git_clone_run(&url, &dir, root.as_deref());
+                        let _ = tx.send(Ev::Effect(effect_reply(&flow, value)));
+                    });
+                } else {
+                    let pattern = crate::value::coerce_str(&vars.get_field("pattern"));
+                    let dir = vars.get_field("dir").as_str().map(|s| s.to_string());
+                    thread::spawn(move || {
+                        let value = git_files_run(&pattern, dir.as_deref(), root.as_deref());
+                        let _ = tx.send(Ev::Effect(effect_reply(&flow, value)));
+                    });
+                }
+            }
             "llm" => {
                 // one-shot completion: the whole turn in one reply
                 let body = llm_body(&vars.get_field("req"), cfg, false);
-                let cfg = cfg.clone();
+                // BYO key: a request may carry api_key (the indexer SaaS is
+                // the user's token, per call — never env, never tape)
+                let mut cfg = cfg.clone();
+                if let Some(k) = vars.get_field("req").get_field("api_key").as_str() {
+                    cfg.key = Some(k.to_string());
+                }
                 let tx = tx.clone();
                 thread::spawn(move || {
-                    let run = || -> Result<(String, Vec<ToolCall>), String> {
+                    let run = || -> Result<(String, Vec<ToolCall>, Option<LlmUsage>), String> {
                         let mut reader = llm_post(&cfg, &body?)?;
                         let mut s = String::new();
                         std::io::Read::read_to_string(&mut reader, &mut s)
@@ -869,17 +1113,36 @@ impl Effects {
                                     .collect()
                             })
                             .unwrap_or_default();
+                        let usage = j.get("usage").map(|u| LlmUsage {
+                            prompt: u["prompt_tokens"].as_i64().unwrap_or(0),
+                            completion: u["completion_tokens"].as_i64().unwrap_or(0),
+                            total: u["total_tokens"].as_i64().unwrap_or(0),
+                        });
                         if text.is_empty() && calls.is_empty() {
                             return Err(format!("no content in response: {s}"));
                         }
-                        Ok((text, calls))
+                        Ok((text, calls, usage))
                     };
                     let value = match run() {
-                        Ok((text, calls)) => {
+                        Ok((text, calls, usage)) => {
                             let mut fields = vec![
                                 ("ok", Value::Bool(true)),
                                 ("text", Value::str(text)),
                             ];
+                            if let Some(u) = usage {
+                                fields.push((
+                                    "usage",
+                                    Value::map(
+                                        [
+                                            (Value::str("prompt_tokens"), Value::Int(u.prompt)),
+                                            (Value::str("completion_tokens"), Value::Int(u.completion)),
+                                            (Value::str("total_tokens"), Value::Int(u.total)),
+                                        ]
+                                        .into_iter()
+                                        .collect(),
+                                    ),
+                                ));
+                            }
                             if !calls.is_empty() {
                                 fields.push(("tool_calls", tool_calls_value(&calls)));
                             }
@@ -901,7 +1164,11 @@ impl Effects {
                     LlmStream { buf: VecDeque::new(), done: None, pending: None },
                 );
                 let body = llm_body(&vars.get_field("req"), cfg, true);
-                let cfg = cfg.clone();
+                // BYO key, same rule as the one-shot arm
+                let mut cfg = cfg.clone();
+                if let Some(k) = vars.get_field("req").get_field("api_key").as_str() {
+                    cfg.key = Some(k.to_string());
+                }
                 let tx_stream = tx.clone();
                 let handle = h.clone();
                 thread::spawn(move || {
@@ -987,11 +1254,25 @@ impl Effects {
             return Some(result_map(vec![("delta", Value::str(delta))]));
         }
         match &stream.done {
-            Some(Ok((text, calls))) => {
+            Some(Ok((text, calls, usage))) => {
                 let mut fields = vec![
                     ("done", Value::Bool(true)),
                     ("text", Value::str(text.as_str())),
                 ];
+                if let Some(u) = usage {
+                    fields.push((
+                        "usage",
+                        Value::map(
+                            [
+                                (Value::str("prompt_tokens"), Value::Int(u.prompt)),
+                                (Value::str("completion_tokens"), Value::Int(u.completion)),
+                                (Value::str("total_tokens"), Value::Int(u.total)),
+                            ]
+                            .into_iter()
+                            .collect(),
+                        ),
+                    ));
+                }
                 if !calls.is_empty() {
                     fields.push(("tool_calls", tool_calls_value(calls)));
                 }
@@ -1014,7 +1295,7 @@ impl Effects {
     fn on_done(
         &mut self,
         h: &str,
-        res: Result<(String, Vec<ToolCall>), String>,
+        res: Result<(String, Vec<ToolCall>, Option<LlmUsage>), String>,
         tx: &mpsc::Sender<Ev>,
     ) {
         let Some(stream) = self.streams.get_mut(h) else { return };
@@ -1043,6 +1324,47 @@ impl Effects {
 #[cfg(test)]
 mod effects_tests {
     use super::*;
+
+    /// The fs/git root is the ONLY path policy an agent-facing app needs:
+    /// absolute paths, `..` traversal, and missing roots all refuse; a
+    /// legitimate relative file reads and counts.
+    #[test]
+    fn fs_root_refuses_escapes_and_reads_inside() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.rs"), "one\ntwo\nthree\n").unwrap();
+
+        let r = fs_run("read", "src/a.rs", Some(root));
+        assert_eq!(r.get_field("ok"), Value::Bool(true));
+        assert_eq!(r.get_field("text").as_str().unwrap(), "one\ntwo\nthree\n");
+
+        let c = fs_run("count_lines", "src/a.rs", Some(root));
+        assert_eq!(c.get_field("ok"), Value::Bool(true));
+        assert_eq!(c.get_field("lines"), Value::Int(3));
+
+        // absolute path refused even when it names a file inside the root
+        let abs = root.join("src/a.rs").to_string_lossy().to_string();
+        assert_eq!(
+            fs_run("read", &abs, Some(root)).get_field("ok"),
+            Value::Bool(false)
+        );
+        // traversal refused
+        assert_eq!(
+            fs_run("read", "../a.rs", Some(root)).get_field("ok"),
+            Value::Bool(false)
+        );
+        // no root: everything refuses
+        assert_eq!(
+            fs_run("read", "src/a.rs", None).get_field("ok"),
+            Value::Bool(false)
+        );
+        // missing file is an honest error, not a crash
+        assert_eq!(
+            fs_run("read", "src/nope.rs", Some(root)).get_field("ok"),
+            Value::Bool(false)
+        );
+    }
 
     fn llm_next_pkt(flow: &str, h: &str) -> Value {
         Value::map(
@@ -1079,7 +1401,7 @@ mod effects_tests {
             "llm:1".into(),
             LlmStream {
                 buf: VecDeque::from(["tail".to_string()]),
-                done: Some(Ok(("full text".into(), Vec::new()))),
+                done: Some(Ok(("full text".into(), Vec::new(), None))),
                 pending: None,
             },
         );
@@ -1118,7 +1440,7 @@ mod effects_tests {
         let reader: Box<dyn std::io::Read + Send + Sync> =
             Box::new(std::io::Cursor::new(sse.as_bytes().to_vec()));
         let mut deltas = Vec::new();
-        let (text, calls) = llm_read_stream(reader, |d| deltas.push(d.to_string())).unwrap();
+        let (text, calls, _usage) = llm_read_stream(reader, |d| deltas.push(d.to_string())).unwrap();
         assert_eq!(text, "let me look");
         assert_eq!(deltas, vec!["let me look"]);
         assert_eq!(calls.len(), 2);
@@ -1143,7 +1465,7 @@ mod effects_tests {
         assert!(fx.streams.contains_key("llm:1"));
 
         fx.streams.get_mut("llm:1").unwrap().pending = Some("f#1".into());
-        fx.on_done("llm:1", Ok(("d1".into(), Vec::new())), &tx);
+        fx.on_done("llm:1", Ok(("d1".into(), Vec::new(), None)), &tx);
         let v = recv_reply(&rx);
         assert_eq!(v.get_field("done"), Value::Bool(true));
         assert!(!fx.streams.contains_key("llm:1"), "final via wake removes the stream");
@@ -1181,7 +1503,7 @@ mod effects_tests {
                         if produced < n_deltas {
                             fx.on_chunk("llm:1", format!("d{produced}"), &tx);
                         } else {
-                            fx.on_done("llm:1", Ok(("all".into(), Vec::new())), &tx);
+                            fx.on_done("llm:1", Ok(("all".into(), Vec::new(), None)), &tx);
                         }
                         produced += 1;
                     } else if want_next && !in_flight {
@@ -1194,7 +1516,7 @@ mod effects_tests {
                         if produced < n_deltas {
                             fx.on_chunk("llm:1", format!("d{produced}"), &tx);
                         } else {
-                            fx.on_done("llm:1", Ok(("all".into(), Vec::new())), &tx);
+                            fx.on_done("llm:1", Ok(("all".into(), Vec::new(), None)), &tx);
                         }
                         produced += 1;
                     }
@@ -1236,6 +1558,14 @@ mod effects_tests {
 /// is the hop-web wasm-pack output. `data_dir` holds the JSONL log and
 /// RocksDB projection when the app declares `schema` + `reduce`.
 /// `log_packets` dumps every packet in diagnostic notation.
+/// `fs_root` roots the fs/git effects (fs.read, fs.count_lines, git.files);
+/// None makes them refuse every call.
+/// `llm` overrides the LLM endpoint config (tests point it at stubs);
+/// None reads OPENAI_API_KEY / OPENAI_BASE_URL from the environment.
+/// `set_vars` overrides server lets after compile (hopd --set k=v) —
+/// the way secrets and per-deploy config stay out of committed source.
+/// `trace` is the execution lantern (hopd --trace <path>): every assign,
+/// hop, and tape event as one greppable line each.
 pub fn serve(
     prog: Rc<Program>,
     app_src: String,
@@ -1243,8 +1573,20 @@ pub fn serve(
     ws_port: u16,
     data_dir: impl AsRef<Path>,
     pkg_dir: PathBuf,
+    fs_root: Option<PathBuf>,
+    llm: Option<LlmCfg>,
+    set_vars: Vec<(String, String)>,
+    trace: Option<PathBuf>,
     log_packets: bool,
 ) -> Result<(), String> {
+    let trace_file = match trace {
+        Some(p) => {
+            let f = std::fs::File::create(&p).map_err(|e| format!("--trace {}: {e}", p.display()))?;
+            println!("[hopd] tracing execution to {}", p.display());
+            Some(std::rc::Rc::new(std::cell::RefCell::new(f)))
+        }
+        None => None,
+    };
     if !pkg_dir.join("hop_web.js").exists() {
         eprintln!(
             "[hopd] warning: {} has no hop_web.js — browsers won't boot.\n\
@@ -1292,9 +1634,16 @@ pub fn serve(
         let mut platform = ServePlatform {
             outbox: &mut outbox,
             store: None,
+            trace: trace_file.clone(),
         };
         Vm::new(prog, SideId::Server, &mut platform)?
     };
+    if !set_vars.is_empty() {
+        println!("[hopd] {} server-let override(s) applied", set_vars.len());
+    }
+    for (k, v) in &set_vars {
+        vm.globals.set(k, crate::value::Value::str(v.as_str()));
+    }
     let mut binding = store::bind(&vm, data_dir.as_ref())?;
     if binding.is_some() {
         println!(
@@ -1304,8 +1653,11 @@ pub fn serve(
     }
 
     let mut sessions: HashMap<String, Sess> = HashMap::new();
-    let mut effects = Effects::default();
-    let llm_cfg = LlmCfg::from_env();
+    let mut effects = Effects {
+        fs_root: fs_root.clone(),
+        ..Default::default()
+    };
+    let llm_cfg = llm.unwrap_or_else(LlmCfg::from_env);
     println!("[hopd] serving http://localhost:{http_port}  (ws on :{ws_port}, CBOR binary)");
 
     // Guardian scheduler: an app that declares `tick_every_ms` (int, ms)
@@ -1347,6 +1699,7 @@ pub fn serve(
                 let mut platform = ServePlatform {
                     outbox: &mut outbox,
                     store: binding.as_mut(),
+                    trace: trace_file.clone(),
                 };
                 vm.session_connect(&mut platform, &sid, &user);
                 boot.store(now_millis(), Ordering::SeqCst);
@@ -1379,6 +1732,7 @@ pub fn serve(
                 let mut platform = ServePlatform {
                     outbox: &mut outbox,
                     store: binding.as_mut(),
+                    trace: trace_file.clone(),
                 };
                 vm.receive(&mut platform, pkt);
             }
@@ -1388,6 +1742,7 @@ pub fn serve(
                     let mut platform = ServePlatform {
                         outbox: &mut outbox,
                         store: binding.as_mut(),
+                        trace: trace_file.clone(),
                     };
                     vm.session_disconnect(&mut platform, &sid, &s.user);
                 }
@@ -1397,6 +1752,7 @@ pub fn serve(
                 let mut platform = ServePlatform {
                     outbox: &mut outbox,
                     store: binding.as_mut(),
+                    trace: trace_file.clone(),
                 };
                 if !matches!(vm.globals.get("on_reset"), Value::Nil) {
                     vm.fire(&mut platform, "on_reset", Vec::new());
@@ -1406,6 +1762,7 @@ pub fn serve(
                 let mut platform = ServePlatform {
                     outbox: &mut outbox,
                     store: binding.as_mut(),
+                    trace: trace_file.clone(),
                 };
                 vm.fire(&mut platform, "tick", Vec::new());
             }
@@ -1423,6 +1780,7 @@ pub fn serve(
                 let mut platform = ServePlatform {
                     outbox: &mut outbox,
                     store: binding.as_mut(),
+                    trace: trace_file.clone(),
                 };
                 vm.receive(&mut platform, pkt);
             }

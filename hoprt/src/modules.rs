@@ -63,6 +63,8 @@ fn builtin_modules() -> Vec<Module> {
         llm_module(),
         str_module(),
         time_module(),
+        fs_module(),
+        git_module(),
     ]
 }
 
@@ -341,6 +343,7 @@ fn str_module() -> Module {
             NativeDef { name: "str.before", kind: NativeKind::Pure(str_before) },
             NativeDef { name: "str.cut", kind: NativeKind::Pure(str_cut) },
             NativeDef { name: "str.strip", kind: NativeKind::Pure(str_strip) },
+            NativeDef { name: "str.replace", kind: NativeKind::Pure(str_replace) },
         ],
     }
 }
@@ -411,4 +414,113 @@ fn str_strip(args: Vec<Value>) -> Result<Value, String> {
         out = out.replace(&format!("</{tag}>"), "");
     }
     Ok(Value::str(out.trim().to_string()))
+}
+
+/// str.replace(s, from, to) — every occurrence, plain string, no regex.
+fn str_replace(args: Vec<Value>) -> Result<Value, String> {
+    let (text, from) = two_strings(&args, "str.replace")?;
+    let to = args.get(2).and_then(Value::as_str).unwrap_or("");
+    Ok(Value::str(text.replace(&from, to)))
+}
+
+// ---------------------------------------------------------------------------
+// fs — rooted file reads for agents: evidence gathering without a shell and
+// without a Python sidecar. The executor (hopd) holds the ONLY path policy:
+// everything resolves inside --fs-root, absolute paths and `..` refused in
+// Rust, so app code never sanitizes paths itself. Effects, never Pure —
+// file I/O has no business in a reducer or the wasm VM.
+// ---------------------------------------------------------------------------
+
+fn fs_module() -> Module {
+    Module {
+        name: "fs",
+        natives: vec![
+            NativeDef {
+                name: "fs.read",
+                kind: NativeKind::Effect { hop: "fs", vars: fs_read_vars },
+            },
+            NativeDef {
+                name: "fs.count_lines",
+                kind: NativeKind::Effect { hop: "fs", vars: fs_count_lines_vars },
+            },
+        ],
+    }
+}
+
+/// fs.read(path) → { ok, text } — the file's full contents.
+fn fs_read_vars(args: Vec<Value>) -> Result<Value, String> {
+    fs_path_vars(args, "read", "fs.read(path)")
+}
+
+/// fs.count_lines(path) → { ok, lines } — wc -l without the shell.
+fn fs_count_lines_vars(args: Vec<Value>) -> Result<Value, String> {
+    fs_path_vars(args, "count_lines", "fs.count_lines(path)")
+}
+
+fn fs_path_vars(args: Vec<Value>, op: &'static str, sig: &str) -> Result<Value, String> {
+    let path = args
+        .first()
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("{sig} expects a path string"))?;
+    let mut m = BTreeMap::new();
+    m.insert(Value::str("op"), Value::str(op));
+    m.insert(Value::str("path"), Value::str(path));
+    Ok(Value::map(m))
+}
+
+// ---------------------------------------------------------------------------
+// git — repo facts without a shell: tracked files matching a pathspec,
+// rooted at hopd's --fs-root (the repo). argv all the way down in the
+// executor, so the pattern is inert data, never a command line.
+// ---------------------------------------------------------------------------
+
+fn git_module() -> Module {
+    Module {
+        name: "git",
+        natives: vec![
+            NativeDef {
+                name: "git.files",
+                kind: NativeKind::Effect { hop: "git", vars: git_files_vars },
+            },
+            NativeDef {
+                name: "git.clone",
+                kind: NativeKind::Effect { hop: "git", vars: git_clone_vars },
+            },
+        ],
+    }
+}
+
+/// git.files(pattern) or git.files(pattern, dir) → { ok, files = [...] } —
+/// tracked files matching a pathspec (git ls-files), in the fs root or a
+/// repo directory under it.
+fn git_files_vars(args: Vec<Value>) -> Result<Value, String> {
+    let pattern = args
+        .first()
+        .and_then(Value::as_str)
+        .ok_or("git.files(pattern, dir?) expects a pathspec string")?;
+    let mut m = BTreeMap::new();
+    m.insert(Value::str("op"), Value::str("files"));
+    m.insert(Value::str("pattern"), Value::str(pattern));
+    if let Some(dir) = args.get(1).and_then(Value::as_str) {
+        m.insert(Value::str("dir"), Value::str(dir));
+    }
+    Ok(Value::map(m))
+}
+
+/// git.clone(url, dir) → { ok, dir } — a shallow clone into dir under the
+/// fs root. The url rides argv (never a shell); dir is root-relative.
+fn git_clone_vars(args: Vec<Value>) -> Result<Value, String> {
+    let url = args
+        .first()
+        .and_then(Value::as_str)
+        .ok_or("git.clone(url, dir) expects a url string")?;
+    let dir = args
+        .get(1)
+        .and_then(Value::as_str)
+        .ok_or("git.clone(url, dir) expects a target dir")?;
+    let mut m = BTreeMap::new();
+    m.insert(Value::str("op"), Value::str("clone"));
+    m.insert(Value::str("url"), Value::str(url));
+    m.insert(Value::str("dir"), Value::str(dir));
+    Ok(Value::map(m))
 }

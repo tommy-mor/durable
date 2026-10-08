@@ -266,7 +266,8 @@ impl Cluster {
         })
     }
 
-    /// Effects, synchronously: real bash (tests use `echo`), fake llm.
+    /// Effects, synchronously: real bash (tests use `echo`), real fs/git
+    /// rooted at the process cwd (same executors as hopd), fake llm.
     /// Same reply shapes as hopd's off-thread executor.
     fn handle_effect(&mut self, pkt: &Value) -> Value {
         let flow = crate::value::coerce_str(&pkt.get_field("flow"));
@@ -309,6 +310,29 @@ impl Cluster {
                     ]),
                 };
                 reply(value)
+            }
+            "fs" => {
+                let op = crate::value::coerce_str(&vars.get_field("op"));
+                let path = crate::value::coerce_str(&vars.get_field("path"));
+                let cwd = std::env::current_dir().ok();
+                reply(crate::serve::fs_run(&op, &path, cwd.as_deref()))
+            }
+            "git" => {
+                let op = crate::value::coerce_str(&vars.get_field("op"));
+                let cwd = std::env::current_dir().ok();
+                if op == "clone" {
+                    let url = crate::value::coerce_str(&vars.get_field("url"));
+                    let dir = crate::value::coerce_str(&vars.get_field("dir"));
+                    reply(crate::serve::git_clone_run(&url, &dir, cwd.as_deref()))
+                } else {
+                    let pattern = crate::value::coerce_str(&vars.get_field("pattern"));
+                    let dir = vars.get_field("dir").as_str().map(|s| s.to_string());
+                    reply(crate::serve::git_files_run(
+                        &pattern,
+                        dir.as_deref(),
+                        cwd.as_deref(),
+                    ))
+                }
             }
             "llm" => {
                 let (text, calls) = fake_llm(&vars.get_field("req"));

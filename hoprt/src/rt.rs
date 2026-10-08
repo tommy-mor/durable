@@ -47,6 +47,12 @@ pub trait Platform {
         args: Vec<Value>,
         prog: &Rc<Program>,
     ) -> Option<Result<Value, String>>;
+    /// Execution trace (hopd --trace): one greppable line per event.
+    /// Default off.
+    fn tracing(&self) -> bool {
+        false
+    }
+    fn trace(&mut self, _line: String) {}
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -317,6 +323,13 @@ impl Vm {
                 } else {
                     Complete::Done
                 };
+                if platform.tracing() {
+                    platform.trace(format!(
+                        "flow {} recv {kind} {hop} vars={}",
+                        ctx.flow,
+                        pkt.get_field("vars")
+                    ));
+                }
                 self.step(platform, exec, ctx, on_complete);
             }
             "reply" | "error" => {
@@ -333,6 +346,14 @@ impl Vm {
                     ));
                     return;
                 };
+                if platform.tracing() {
+                    let detail = if kind == "reply" {
+                        format!("value={}", pkt.get_field("value"))
+                    } else {
+                        format!("err={}", crate::value::coerce_str(&pkt.get_field("err")))
+                    };
+                    platform.trace(format!("flow {flow} recv {kind} {detail}"));
+                }
                 let parked = stack.pop().expect("stacks never hold empty vecs");
                 if stack.is_empty() {
                     self.stacks.remove(&flow);
@@ -368,18 +389,29 @@ impl Vm {
     /// the port of the old runtime's step().
     fn step(&mut self, platform: &mut dyn Platform, exec: Exec, ctx: FlowCtx, on_complete: Complete) {
         match self.run_exec(platform, exec, &ctx) {
-            RunResult::Done(v) => match on_complete {
-                Complete::Reply { to } => {
-                    platform.send(mk_map(vec![
-                        ("kind", Value::str("reply")),
-                        ("flow", Value::str(ctx.flow.as_str())),
-                        ("to", to),
-                        ("value", v),
-                    ]));
+            RunResult::Done(v) => {
+                if platform.tracing() {
+                    platform.trace(format!("flow {} done value={v}", ctx.flow));
                 }
-                Complete::Done => {}
-            },
+                match on_complete {
+                    Complete::Reply { to } => {
+                        platform.send(mk_map(vec![
+                            ("kind", Value::str("reply")),
+                            ("flow", Value::str(ctx.flow.as_str())),
+                            ("to", to),
+                            ("value", v),
+                        ]));
+                    }
+                    Complete::Done => {}
+                }
+            }
             RunResult::Suspended(exec, target, hop, vars) => {
+                if platform.tracing() {
+                    platform.trace(format!(
+                        "flow {} hop -> {} {} vars={}",
+                        ctx.flow, target, hop, vars
+                    ));
+                }
                 platform.send(mk_map(vec![
                     ("kind", Value::str("call")),
                     ("flow", Value::str(ctx.flow.as_str())),
@@ -478,6 +510,14 @@ impl Host for StepHost<'_> {
         self.platform.print(line);
     }
 
+    fn tracing(&self) -> bool {
+        self.platform.tracing()
+    }
+
+    fn trace(&mut self, line: String) {
+        self.platform.trace(line);
+    }
+
     fn cast(&mut self, target: Value, hop: &str, vars: Value) -> Result<(), String> {
         self.platform.send(mk_map(vec![
             ("kind", Value::str("cast")),
@@ -556,11 +596,22 @@ impl Host for StepHost<'_> {
                 Ok(NativeOut::Val(Value::Nil))
             }
             // store natives are the platform's (server has one; a browser
-            // platform answers None and this errors cleanly)
-            other => match self.platform.store_native(other, args, self.prog) {
-                Some(r) => r.map(NativeOut::Val),
-                None => Err(format!("{other:?} is not available on this side")),
-            },
+            // platform answers None and this errors cleanly). Appends are
+            // traced as tape lines — the event log is the whole point.
+            other => {
+                if matches!(other, NativeId::StoreAppend) && self.platform.tracing() {
+                    if let Some(ev) = args.first() {
+                        let line = crate::value::to_json(ev)
+                            .map(|j| j.to_string())
+                            .unwrap_or_else(|_| "<unprintable event>".into());
+                        self.platform.trace(format!("tape {line}"));
+                    }
+                }
+                match self.platform.store_native(other, args, self.prog) {
+                    Some(r) => r.map(NativeOut::Val),
+                    None => Err(format!("{other:?} is not available on this side")),
+                }
+            }
         }
     }
 

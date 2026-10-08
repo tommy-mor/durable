@@ -80,6 +80,12 @@ pub trait Host {
         let _ = (hop, vars);
         Err(format!("{name} is not available here"))
     }
+    /// Execution trace (hopd --trace): one greppable line per event.
+    /// Default off; near-zero cost when off.
+    fn tracing(&self) -> bool {
+        false
+    }
+    fn trace(&mut self, _line: String) {}
 }
 
 fn new_frame(f: &Function, fn_idx: usize, caps: &[Value], args: Vec<Value>) -> Frame {
@@ -193,11 +199,24 @@ pub fn run(
             Instr::LoadLocal(i) => push!(top!().locals[i as usize].clone()),
             Instr::StoreLocal(i) => {
                 let v = pop!();
+                if host.tracing() {
+                    let f = &prog.fns[top!().fn_idx];
+                    let label = f
+                        .locals_dbg
+                        .get(i as usize)
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.as_str())
+                        .unwrap_or("$hidden");
+                    host.trace(format!("assign {} {label} = {v}", f.name));
+                }
                 top!().locals[i as usize] = v;
             }
             Instr::LoadGlobal(k) => push!(globals.get(prog.const_str(k))),
             Instr::StoreGlobal(k) => {
                 let v = pop!();
+                if host.tracing() {
+                    host.trace(format!("assign global {} = {v}", prog.const_str(k)));
+                }
                 globals.set(prog.const_str(k).to_string(), v);
             }
             Instr::MakeArray(n) => {

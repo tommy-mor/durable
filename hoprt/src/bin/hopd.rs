@@ -1,6 +1,6 @@
 //! hopd — serve a .hop application over CBOR-binary WebSockets.
 //!
-//! Usage: hopd <app.hop> [http_port] [ws_port] [--data <dir>] [--web <pkg_dir>] [--log]
+//! Usage: hopd <app.hop> [http_port] [ws_port] [--data <dir>] [--web <pkg_dir>] [--fs-root <dir>] [--log]
 //!
 //! Compiles the app with hopc, runs the server VM, and routes hop packets
 //! over WebSockets. Real tabs get the shell page + glue.js and the wasm
@@ -8,7 +8,8 @@
 //! `wasm-pack build hop-web --target web` output). If the app declares
 //! `schema` and `fn reduce`, the server VM opens a durable store (JSONL
 //! log + RocksDB projection) at `--data` (default `./hop-data`). `--log`
-//! dumps every packet in diagnostic notation.
+//! dumps every packet in diagnostic notation. `--fs-root` roots the fs/git
+//! effects — every path they touch resolves inside it, escapes refused.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -38,6 +39,9 @@ fn main() -> ExitCode {
     let mut ports: Vec<u16> = Vec::new();
     let mut data_dir = PathBuf::from("hop-data");
     let mut pkg_dir = PathBuf::from("hop-web/pkg");
+    let mut fs_root: Option<PathBuf> = None;
+    let mut set_vars: Vec<(String, String)> = Vec::new();
+    let mut trace: Option<PathBuf> = None;
     let mut log_packets = false;
     let mut i = 0;
     while i < args.len() {
@@ -62,6 +66,39 @@ fn main() -> ExitCode {
                     }
                 }
             }
+            "--fs-root" => {
+                i += 1;
+                match args.get(i) {
+                    Some(p) => fs_root = Some(PathBuf::from(p)),
+                    None => {
+                        eprintln!("hopd: --fs-root needs a directory");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+            "--set" => {
+                // override a server let after compile: `--set slug_token=...`
+                // keeps secrets out of committed source
+                i += 1;
+                match args.get(i).and_then(|kv| kv.split_once('=')) {
+                    Some((k, v)) => set_vars.push((k.to_string(), v.to_string())),
+                    None => {
+                        eprintln!("hopd: --set needs key=value");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+            "--trace" => {
+                // the execution lantern: every assign, hop, and tape event
+                i += 1;
+                match args.get(i) {
+                    Some(p) => trace = Some(PathBuf::from(p)),
+                    None => {
+                        eprintln!("hopd: --trace needs a file path");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
             "--log" => log_packets = true,
             a if a.starts_with('-') => {
                 eprintln!("hopd: unknown flag {a}");
@@ -79,7 +116,7 @@ fn main() -> ExitCode {
         i += 1;
     }
     let Some(path) = input else {
-        eprintln!("usage: hopd <app.hop> [http_port] [ws_port] [--data <dir>] [--web <pkg_dir>] [--log]");
+        eprintln!("usage: hopd <app.hop> [http_port] [ws_port] [--data <dir>] [--web <pkg_dir>] [--fs-root <dir>] [--log]");
         return ExitCode::FAILURE;
     };
     let http_port = ports.first().copied().unwrap_or(9000);
@@ -105,7 +142,7 @@ fn main() -> ExitCode {
         prog.hops.len()
     );
 
-    match hoprt::serve::serve(Rc::new(prog), src, http_port, ws_port, data_dir, pkg_dir, log_packets) {
+    match hoprt::serve::serve(Rc::new(prog), src, http_port, ws_port, data_dir, pkg_dir, fs_root, None, set_vars, trace, log_packets) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("hopd: {e}");

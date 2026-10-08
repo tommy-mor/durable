@@ -42,6 +42,10 @@ fn spawn_hopd(src: impl Into<String>, http: u16, ws: u16) {
             ws,
             data_path,
             pkg,
+            None,
+            None,
+            Vec::new(),
+            None,
             false,
         );
     });
