@@ -35,7 +35,9 @@ server let schema = store.record([
 server let tick_every_ms = 800;
 server let slug_url = "http://localhost:8080";
 server let slug_room = "public";
-server let slug_token = "slug_erosdev_erosdevsecret";
+// the slug RPC bearer token — injected per deploy via `--set slug_token=...`;
+// the dev-slug secret must never live in committed source.
+server let slug_token = "";
 server let slug_delegate = "99565dd4-6ce9-4aeb-8da5-7641317de958:eros:moonshotai/kimi-k3";
 server let slug_web = "https://slug.social";
 server let min_lines = 400;

@@ -8,7 +8,9 @@
 // the invoice is computed from the tape, never from a payment processor.
 //
 //   SLUG: dev server at http://localhost:8080, room gt7dc9y/code-review.
-//   cargo run -p hoprt --bin hopd -- hoprt/hop/guardian.hop --fs-root /Users/tommy/programming/slug-star/slug
+//   cargo run -p hoprt --bin hopd -- hoprt/hop/guardian.hop \
+//     --set slug_token=<dev-slug-token> \
+//     --fs-root /Users/tommy/programming/slug-star/slug
 
 server let schema = store.record([
   ["guardian", store.record([
@@ -36,7 +38,9 @@ server let tick_every_ms = 800;
 server let slug_url = "http://localhost:8080";
 server let slug_room = "gt7dc9y/code-review";
 server let slug_room_web = "gt7dc9ycode-review";
-server let slug_token = "slug_erosdev_erosdevsecret";
+// the slug RPC bearer token — injected per deploy via `--set slug_token=...`;
+// the dev-slug secret must never live in committed source.
+server let slug_token = "";
 server let slug_delegate = "99565dd4-6ce9-4aeb-8da5-7641317de958:eros:moonshotai/kimi-k3";
 // the indexer tenancy: one hopd per repo — the scope in slug that holds
 // this repo's votes and ranking, the URL base for member items, and the

@@ -131,7 +131,7 @@ fn guardian_source(slug_port: u16) -> String {
             &format!("server let slug_url = \"http://127.0.0.1:{slug_port}\";"),
         )
         .replace(
-            "server let slug_token = \"slug_erosdev_erosdevsecret\";",
+            "server let slug_token = \"\";",
             "server let slug_token = \"stub-token\";",
         )
 }
@@ -628,7 +628,7 @@ fn indexer_source(slug_port: u16) -> String {
         &format!("server let slug_url = \"http://127.0.0.1:{slug_port}\";"),
     )
     .replace(
-        "server let slug_token = \"slug_erosdev_erosdevsecret\";",
+        "server let slug_token = \"\";",
         "server let slug_token = \"stub-token\";",
     )
 }
