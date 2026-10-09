@@ -165,7 +165,7 @@ fn slug_rank_rows() {
 // ---- helpers ----
 
 fn rank_label(item, files) {
-  if files {
+  if len(files) > 0 {
     for i, f in files {
       if str.has(item, f.url) {
         return f.id;
@@ -176,7 +176,7 @@ fn rank_label(item, files) {
 }
 
 fn file_for_url(files, url) {
-  if !files || !url {
+  if !url {
     return nil;
   }
   for i, f in files {
@@ -201,14 +201,14 @@ fn next_pair(files) {
     GetPair = { room = slug_room, parent_path = index_scope }
   });
   if !res.ok {
-    if files {
+    if len(files) > 0 {
       store.append({ type = "err", text = res.err });
     }
     return empty;
   }
   let results = res.data.results;
   if !results || type(results) != "array" || len(results) == 0 {
-    if files {
+    if len(files) > 0 {
       store.append({ type = "err", text = "slug GetPair: malformed rpc body" });
     }
     return empty;
@@ -217,14 +217,14 @@ fn next_pair(files) {
     // Before the first scan the scope simply doesn't exist yet — the idle
     // state, not an error. Once files are registered a refusal is a wound
     // and gets shown.
-    if files {
+    if len(files) > 0 {
       store.append({ type = "err", text = "slug GetPair refused the scope" });
     }
     return empty;
   }
   let pair = results[0].result.Pair;
   if !pair || type(pair) != "map" {
-    if files {
+    if len(files) > 0 {
       store.append({ type = "err", text = "slug GetPair: no pair in response" });
     }
     return empty;
@@ -319,33 +319,44 @@ fn pair_card(file, side) {
   ];
 }
 
-// Newest first: the live edge pins to the top of the log — no autoscroll
-// needed, no JavaScript. (feed is pushed oldest-first; we render it reversed.)
-// The wire carries only the last 40 entries: the full record lives in the
-// durable log, and an unbounded feed made every paint megabytes — the
-// websocket died under its own weight and reconnects ate the clicks.
-fn rev_entries(feed) {
-  let entries = [];
-  let n = 0;
-  for i, j in feed {
-    n = n + 1;
-  }
+// The wire carries only the newest 40 feed entries, never the whole tape.
+// `feed_tail` is the SERVER half: it slices the already-materialized feed
+// (pushed oldest-first) down to the last 40 strings, newest first, so the
+// cast ships a bounded payload no matter how far the tape has grown. The
+// full record stays in the durable store and log — an unbounded feed
+// shipped on every paint made the websocket megabytes, and reconnects ate
+// the clicks.
+fn feed_tail(feed) {
+  let out = [];
+  let n = len(feed);
   let start = n - 40;
   if start < 0 {
     start = 0;
   }
   let k = n - 1;
   while k >= start {
-    push(entries, [:pre, { class = "judge-entry" }, feed[k]]);
+    push(out, feed[k]);
     k = k - 1;
   }
-  return entries;
+  return out;
+}
+
+// The BROWSER half of the same split: wrap the already-trimmed tail in
+// hiccup. Slice on the server, render in the tab — the same division as
+// graph_urls / chart_block. The live "guardian thinking" entry is built by
+// the caller and prepended ahead of these rows.
+fn entries_view(entries) {
+  let rows = [];
+  for i, e in entries {
+    push(rows, [:pre, { class = "judge-entry" }, e]);
+  }
+  return rows;
 }
 
 // The fullscreen agent tail: back button on top, the entire lower pane is
 // the live judgment log.
-fn log_view(status, feed, stream_a, stream_b, stream_text, err) {
-  let entries = rev_entries(feed);
+fn log_view(status, entries, stream_a, stream_b, stream_text, err) {
+  let rows = entries_view(entries);
   let live = [];
   if stream_text != "" {
     push(live, [:pre, { class = "judge-entry stream-entry" },
@@ -362,7 +373,7 @@ fn log_view(status, feed, stream_a, stream_b, stream_text, err) {
   if err {
     push(parts, [:p, { class = "err" }, err]);
   }
-  push(parts, [:div, { class = "log-pane" }, live, entries]);
+  push(parts, [:div, { class = "log-pane" }, live, rows]);
   return [:div, { class = "log-page" }, parts];
 }
 
@@ -390,9 +401,9 @@ fn prompt_view(prompt_text, status) {
   return [:div, { class = "log-page" }, parts];
 }
 
-fn app_view(status, files, rank_rows, feed, stream_a, stream_b, stream_text, err, graph, prompt_text, pair, view) {
+fn app_view(status, files, rank_rows, entries, stream_a, stream_b, stream_text, err, graph, prompt_text, pair, view) {
   if view == "log" {
-    return log_view(status, feed, stream_a, stream_b, stream_text, err);
+    return log_view(status, entries, stream_a, stream_b, stream_text, err);
   }
   if view == "prompt" {
     return prompt_view(prompt_text, status);
@@ -417,8 +428,8 @@ fn app_view(status, files, rank_rows, feed, stream_a, stream_b, stream_text, err
 
   let vote_col = [];
   push(vote_col, [:h2, {}, "vote screen"]);
-  // pair is computed server-side (slug's GetPair suggestion, with a local
-  // fallback) and passed in — the store and RPC don't exist in this VM.
+  // pair is computed server-side (slug's GetPair suggestion) and passed in —
+  // the store and RPC don't exist in this VM.
   push(vote_col, [:div, { class = "vote-row" },
     (pair_card(pair.a, "a")),
     [:div, { class = "vs" }, "vs"],
@@ -440,14 +451,14 @@ fn app_view(status, files, rank_rows, feed, stream_a, stream_b, stream_text, err
 
   let log_col = [];
   push(log_col, [:h2, {}, "judgment log"]);
-  let entries = rev_entries(feed);
+  let rows = entries_view(entries);
   let live = [];
   if stream_text != "" {
     push(live, [:pre, { class = "judge-entry stream-entry" },
       "guardian thinking: " .. stream_a .. " vs " .. stream_b .. "\n" .. stream_text
     ]);
   }
-  push(log_col, [:div, { class = "judge-log" }, live, entries]);
+  push(log_col, [:div, { class = "judge-log" }, live, rows]);
 
   push(parts, [:div, { class = "guardian-grid" },
     [:div, { class = "vote-col" }, vote_col],
@@ -460,30 +471,19 @@ fn app_view(status, files, rank_rows, feed, stream_a, stream_b, stream_text, err
 // how many judgments the meter has seen. Recomputable from log.jsonl.
 fn billing_line() {
   let p = store(["billing", "prompt"]);
-  if !p {
-    p = 0;
-  }
   let c = store(["billing", "completion"]);
-  if !c {
-    c = 0;
-  }
   let n = store(["billing", "calls"]);
-  if !n {
-    n = 0;
-  }
   return "⚡ " .. p .. " in / " .. c .. " out · " .. n .. " calls";
 }
 
 fn paint(stream_a, stream_b, stream_text) {
   let files = store.items(["files"]);
   let ticks = store(["guardian", "ticks"]);
-  if !ticks {
-    ticks = 0;
-  }
   let feed = store(["feed"]);
   if !feed {
     feed = [];
   }
+  let entries = feed_tail(feed);
   let err = store(["guardian", "err"]);
   let state = "⏸ paused";
   if store(["guardian", "running"]) {
@@ -496,7 +496,7 @@ fn paint(stream_a, stream_b, stream_text) {
   let pair = next_pair(files);
   let view = store(["guardian", "view"]);
   cast browsers {
-    hui.render("#app", app_view(status, files, rank_rows, feed, stream_a, stream_b, stream_text, err, graph, prompt_text, pair, view));
+    hui.render("#app", app_view(status, files, rank_rows, entries, stream_a, stream_b, stream_text, err, graph, prompt_text, pair, view));
   }
 }
 
@@ -574,7 +574,7 @@ fn scan_repo() {
 
 fn manual_pick(side) {
   let files = store.items(["files"]);
-  if !files {
+  if len(files) == 0 {
     paint("", "", "");
     return;
   }
@@ -618,7 +618,7 @@ fn tick() {
     }
   }
   let files = store.items(["files"]);
-  if !files {
+  if len(files) == 0 {
     return;
   }
   let pair = next_pair(files);
@@ -649,13 +649,11 @@ fn tick() {
   let prompt = judge_prompt(pair.a, pair.b, bodies);
   store.append({ type = "prompt", text = prompt });
   let ticks = store(["guardian", "ticks"]);
-  if !ticks {
-    ticks = 0;
-  }
   let feed = store(["feed"]);
   if !feed {
     feed = [];
   }
+  let entries = feed_tail(feed);
   let status = "● running · tick " .. ticks .. " · " .. billing_line();
   let rank_rows = slug_rank_rows();
   let graph = graph_urls();
@@ -667,7 +665,7 @@ fn tick() {
     acc = acc .. out.delta;
     let view = store(["guardian", "view"]);
     cast browsers {
-      hui.render("#app", app_view(status, files, rank_rows, feed, pair.a.id, pair.b.id, acc, nil, graph, prompt_text, pair, view));
+      hui.render("#app", app_view(status, files, rank_rows, entries, pair.a.id, pair.b.id, acc, nil, graph, prompt_text, pair, view));
     }
     // Heartbeat: keep judging_at fresh while a judgment is actually
     // streaming. The watchdog reaps at 120s of silence — but bodies are

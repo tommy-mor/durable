@@ -535,3 +535,19 @@ fn explain_reports_what_crosses_each_hop() {
     has("stroke:c1  side=cast  ship={from, to}  reply={}");
     has("stroke:c2  side=cast  ship={color, from, to}  reply={}");
 }
+
+#[test]
+fn guardian_cast_ships_the_bounded_feed_tail_not_the_tape() {
+    // guardian's own "the wire carries only the last 40 entries" comment is
+    // a promise the compiler must now actually keep. The feed slice happens
+    // SERVER-side (feed_tail) and only the bounded `entries` tail crosses
+    // the cast — never the unbounded `feed` list, which used to ride every
+    // paint and every llm stream delta until the websocket died of its own
+    // weight (2026-10-09 fix). Assert the exact ship sets so a regression
+    // that smuggles `feed` back in fails on the spot.
+    let prog = hoprt::compiler::compile(include_str!("../hop/guardian.hop")).expect("compile");
+    let all = prog.explain_listing();
+    let has = |needle: &str| assert!(all.contains(needle), "explain missing {needle:?}:\n{all}");
+    has("paint:c1  side=cast  ship={entries, err, files, graph, pair, prompt_text, rank_rows, status, stream_a, stream_b, stream_text, view}  reply={}");
+    has("tick:c1  side=cast  ship={acc, entries, files, graph, pair, prompt_text, rank_rows, status, view}  reply={}");
+}
