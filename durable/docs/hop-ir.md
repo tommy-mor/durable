@@ -158,8 +158,11 @@ once into hidden locals, then each arm compiles to the if-chain it
 replaces — `LoadLocal tag; Const "name"; BinOp Eq; JumpIfFalse next`,
 field binds as `LoadLocal subj; GetField f; StoreLocal fresh`, and a
 `Jump end` after the arm body. Placement marks (`server!()` /
-`browser!()`) are rejected inside match arms with a compile error, the
-same rule as `if` branches and loop bodies; casts are fine.
+`browser!()`) are legal inside match arms, just as in `if` branches and
+loop bodies: flow bodies compile through a control-flow graph, and a mark
+is a call edge whose piece extends to the end of its enclosing block
+(see the CFG pipeline in `hoprt/src/compiler.rs`). Marks remain illegal
+only inside `cast` bodies.
 
 ## What stays true across the rewrite
 

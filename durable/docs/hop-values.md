@@ -58,6 +58,9 @@ strings; anything else is a runtime error. The total order above is the
 - Keys must be scalar. Aggregate keys are a runtime error at insertion.
 - Maps iterate in key order (the total order above). This makes `for k, v
   in pairs m` deterministic — a nondeterminism Lua had and Hop does not.
+- This is the order of *in-memory* maps. Maps read back from the store
+  iterate in encoded-key order instead (keys are length-prefixed in
+  RocksDB, so shorter keys sort first); see `durable/src/codec.rs`.
 - Absent key reads as `nil`; assigning `nil` deletes the key. Absence and
   nil-value are indistinguishable, matching the wire and the store.
 

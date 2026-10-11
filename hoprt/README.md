@@ -113,7 +113,7 @@ server let schema = store.record([
 
 fn reduce(event) {
   match event {
-    tick_mark {} => { store(["run", "ticks", store.add(1)]); }
+    tick_mark {} => { store(["guardian", "ticks", store.add(1)]); }
     file { path, url, lines } => {
       store(["files", path, store.set({ url = url, lines = lines })]);
     }
@@ -123,7 +123,10 @@ fn reduce(event) {
 
 Reads are path-based: `store(["files", path])`, `store.items(["files"])`
 (map entries as records with the key merged in as `id` — ready for
-`for i, f in ...` rendering).
+`for i, f in ...` rendering). Store maps iterate in *encoded key* order: a
+key's bytes are length-prefixed in RocksDB, so shorter keys come first
+(`"b"` before `"aa"`). This differs from the VM's value order for
+in-memory maps; sort explicitly when display order matters.
 
 **Presence is honest.** A missing leaf reads `nil`; a missing sum reads
 `0`; a missing container reads `nil` (so ordinary truthiness *is*
@@ -170,7 +173,7 @@ type:
 
 ```hop
 let res = http.post(url, body, { Authorization = "Bearer " .. token });
-let out = bash("ls -la");                       // bash -c — quote carefully
+let out = bash("ls -la");                       // bash -c — UNROOTED, see below
 let text = fs.read("src/main.rs");              // rooted: --fs-root is the
 let n = fs.count_lines("src/main.rs");          //   whole path policy
 let files = git.files("*.rs");                  // tracked files (ls-files)
@@ -181,7 +184,10 @@ let out = llm.next(h);    // out.delta streams; final has out.text/out.usage
 ```
 
 `fs` and `git` resolve every path inside `hopd --fs-root`; absolute paths,
-`..`, and symlink escapes are refused in the executor. `llm` calls report
+`..`, and symlink escapes are refused in the executor. `bash` is the
+exception: it runs an arbitrary shell command with hopd's full permissions
+and is not bound by `--fs-root`. Never build a `bash` command from data a
+client or a model supplied; prefer `fs` / `git` whenever they can do the job. `llm` calls report
 token usage (`out.usage.prompt_tokens` etc.) when the API provides it —
 fold it onto the tape and billing is a projection.
 
@@ -220,7 +226,8 @@ hopd <app.hop> [http_port] [ws_port]
 - `spawn f(args)` starts a flow; it runs when the current piece finishes.
 - Assignment to an unbound name sets a process global (`x = 1` with no
   `let x` in scope is a global store — useful for per-process state like
-  an ephemeral API key that must never touch the tape).
+  an ephemeral API key that must never touch the tape). The flip side:
+  a typo'd local silently becomes a global.
 - Lambdas are closures (`fn (e) { ... }`); captures are copied at
   creation. Lambdas may contain marks — this is what makes
   `onclick = fn(e) { server!(); ... }` work.
