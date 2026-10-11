@@ -1803,6 +1803,10 @@ struct Px<'a> {
     /// every locally-bound name in the whole function (warning analysis)
     all_defs: BTreeSet<String>,
     reply_vars: Vec<BTreeSet<String>>,
+    /// pieces that can return: contain a `return`, or mark into a piece
+    /// that can. Their replies carry a `ret` tag so a far piece's return
+    /// stops the caller instead of resuming it.
+    can_ret: Vec<bool>,
     /// vars map each hop piece expects, recorded when its mark is emitted
     ship: Vec<BTreeSet<String>>,
     preds: Vec<Vec<usize>>,
@@ -1839,7 +1843,22 @@ fn emit_flow_body(
         }
     }
     // reply vars are computed at each mark, where the ship set exists:
-    // LiveIn(resume) ∩ (defs of the piece ∪ what crossed into it)
+    // LiveIn(resume) ∩ (defs of the piece ∪ what crossed into it).
+    //
+    // can_ret is computed up front instead: a piece can return if it
+    // contains a `return`, or marks into a piece that can. Children
+    // always have higher indices than their parents (assigned when the
+    // mark is built), so one reverse pass covers nesting.
+    let mut can_ret = vec![false; cfg.pieces.len()];
+    for pi in (1..cfg.pieces.len()).rev() {
+        for b in rpo(&cfg, pi) {
+            match &cfg.blocks[b].term {
+                Term::Return(_) => can_ret[pi] = true,
+                Term::Mark { piece, .. } if can_ret[*piece] => can_ret[pi] = true,
+                _ => {}
+            }
+        }
+    }
     let mut px = Px {
         cg,
         ctr,
@@ -1848,6 +1867,7 @@ fn emit_flow_body(
         piece_defs,
         all_defs,
         reply_vars: vec![BTreeSet::new(); cfg.pieces.len()],
+        can_ret,
         ship: vec![BTreeSet::new(); cfg.pieces.len()],
         preds: preds(&cfg),
         loop_slots: HashMap::new(),
@@ -2080,10 +2100,19 @@ fn emit_simple(
 
 /// The reply of a reply-carrying piece: `{ value, vars }` where vars are
 /// the caller-continuation's live locals this piece defined. The value is
-/// already on the stack.
-fn emit_reply_wrap(px: &mut Px, fb: &mut Fb, pi: usize) -> Result<(), String> {
+/// already on the stack. Pieces that can return tag it `{ ret, value,
+/// vars }` instead — always wrapped, even when `vars` is empty — so the
+/// mark can tell "the function returned" from "resume me".
+fn emit_reply_wrap(px: &mut Px, fb: &mut Fb, pi: usize, ret: bool) -> Result<(), String> {
     let h = fb.hidden_local();
     fb.emit(Instr::StoreLocal(h));
+    let mut n = 2;
+    if px.can_ret[pi] {
+        let k = px.cg.k_str("ret");
+        fb.emit(Instr::Const(k));
+        fb.emit(if ret { Instr::True } else { Instr::False });
+        n = 3;
+    }
     let value_k = px.cg.k_str("value");
     fb.emit(Instr::Const(value_k));
     fb.emit(Instr::LoadLocal(h));
@@ -2101,8 +2130,35 @@ fn emit_reply_wrap(px: &mut Px, fb: &mut Fb, pi: usize) -> Result<(), String> {
         }
     }
     fb.emit(Instr::MakeMap(rv.len() as u16));
-    fb.emit(Instr::MakeMap(2));
+    fb.emit(Instr::MakeMap(n));
     Ok(())
+}
+
+/// Rebind the reply vars from the wrapper already in local `h`.
+fn emit_rebind(
+    px: &mut Px,
+    fb: &mut Fb,
+    scope: &mut BTreeMap<String, u16>,
+    h: u16,
+    rv: &BTreeSet<String>,
+) {
+    let vars_k = px.cg.k_str("vars");
+    for v in rv {
+        fb.emit(Instr::LoadLocal(h));
+        fb.emit(Instr::GetField(vars_k));
+        let vk = px.cg.k_str(v);
+        fb.emit(Instr::GetField(vk));
+        let slot = match px.slots.get(v) {
+            Some(&s) => s,
+            None => {
+                let s = fb.def_local(v);
+                px.slots.insert(v.clone(), s);
+                s
+            }
+        };
+        fb.emit(Instr::StoreLocal(slot));
+        scope.insert(v.clone(), slot);
+    }
 }
 
 fn emit_term(
@@ -2213,6 +2269,39 @@ fn emit_term(
             px.ship[piece] = ship;
             let k = px.cg.k_str(&px.cfg.pieces[piece].hop_id);
             fb.emit(Instr::At(k));
+            if px.can_ret[piece] {
+                // the far piece may have returned: check the tag. On
+                // `ret`, the origin unwraps the value and returns from the
+                // whole function; a nested hop forwards the wrapper
+                // verbatim up a level (its parent expects this shape
+                // because can_ret propagated to it too). Otherwise resume
+                // normally, rebinding from h.vars. The tail-mark shortcut
+                // is skipped here: in a nested piece it would forward the
+                // child's vars as if they were this piece's own.
+                let h = fb.hidden_local();
+                fb.emit(Instr::StoreLocal(h));
+                // did the far side return?
+                fb.emit(Instr::LoadLocal(h));
+                let ret_k = px.cg.k_str("ret");
+                fb.emit(Instr::GetField(ret_k));
+                let j_resume = fb.jump_placeholder(Instr::JumpIfFalse);
+                if pi == 0 {
+                    // origin: unwrap and return from the whole function
+                    fb.emit(Instr::LoadLocal(h));
+                    let value_k = px.cg.k_str("value");
+                    fb.emit(Instr::GetField(value_k));
+                } else {
+                    // nested hop: forward the wrapper verbatim, ret = true.
+                    fb.emit(Instr::LoadLocal(h));
+                }
+                fb.emit(Instr::Return);
+                fb.patch_to_here(j_resume);
+                // normal resume: rebind reply vars from h.vars, then on
+                emit_rebind(px, fb, scope, h, &rv);
+                let j = fb.jump_placeholder(Instr::Jump);
+                px.fixups.push((j, cont));
+                return Ok(());
+            }
             let cont_trivial = px.cfg.blocks[cont].stmts.is_empty()
                 && matches!(px.cfg.blocks[cont].term, Term::Exit);
             let rv = px.reply_vars[piece].clone();
@@ -2229,23 +2318,7 @@ fn emit_term(
                 // far piece defined that the continuation still needs
                 let h = fb.hidden_local();
                 fb.emit(Instr::StoreLocal(h));
-                let vars_k = px.cg.k_str("vars");
-                for v in &rv {
-                    fb.emit(Instr::LoadLocal(h));
-                    fb.emit(Instr::GetField(vars_k));
-                    let vk = px.cg.k_str(v);
-                    fb.emit(Instr::GetField(vk));
-                    let slot = match px.slots.get(v) {
-                        Some(&s) => s,
-                        None => {
-                            let s = fb.def_local(v);
-                            px.slots.insert(v.clone(), s);
-                            s
-                        }
-                    };
-                    fb.emit(Instr::StoreLocal(slot));
-                    scope.insert(v.clone(), slot);
-                }
+                emit_rebind(px, fb, scope, h, &rv);
                 let j = fb.jump_placeholder(Instr::Jump);
                 px.fixups.push((j, cont));
             }
@@ -2255,15 +2328,17 @@ fn emit_term(
                 Some(e) => emit_expr(px.cg, fb, px.ctr, e)?,
                 None => fb.emit(Instr::Nil),
             }
-            if pi > 0 && !px.reply_vars[pi].is_empty() {
-                emit_reply_wrap(px, fb, pi)?;
+            let wrap = px.can_ret[pi] || !px.reply_vars[pi].is_empty();
+            if pi > 0 && wrap {
+                emit_reply_wrap(px, fb, pi, true)?;
             }
             fb.emit(Instr::Return);
         }
         Term::Exit => {
-            if pi > 0 && !px.reply_vars[pi].is_empty() {
+            let wrap = px.can_ret[pi] || !px.reply_vars[pi].is_empty();
+            if pi > 0 && wrap {
                 fb.emit(Instr::Nil);
-                emit_reply_wrap(px, fb, pi)?;
+                emit_reply_wrap(px, fb, pi, false)?;
             } else {
                 // falling off = reply nil, same value as the old chain's
                 // trailing segment
