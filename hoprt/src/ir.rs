@@ -112,6 +112,24 @@ pub struct HopExplain {
     pub reply: Vec<String>,
 }
 
+/// Store schema as a core language construct (`schema { ... }`).
+///
+/// This is the compile-time form of what `server let schema =
+/// store.record(...)` used to build as runtime data. Same meaning, but
+/// field names are identifiers checked by the parser, nesting is grammar
+/// instead of nested calls, and future semantic kinds (sets, queues,
+/// indexes) get their own keywords here instead of new `store.*`
+/// builtins.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SchemaDef {
+    Leaf,
+    Sum,
+    Map(Box<SchemaDef>),
+    List(Box<SchemaDef>),
+    Deque(Box<SchemaDef>),
+    Record(Vec<(String, SchemaDef)>),
+}
+
 #[derive(Clone, Default)]
 pub struct Program {
     pub consts: Vec<Value>,
@@ -123,6 +141,10 @@ pub struct Program {
     /// `server let` initializers: (global name, thunk fn) — run on the
     /// server VM only, in declaration order.
     pub server_lets: Vec<(String, usize)>,
+    /// `schema { ... }` block, if the app uses first-class schema syntax.
+    /// Preferred over the legacy `server let schema = store.record(...)`
+    /// data literal; `store::bind` uses this when present.
+    pub schema: Option<SchemaDef>,
     /// per-hop shipping, in creation order (hopc --explain)
     pub explain: Vec<HopExplain>,
     /// non-fatal compile warnings (hopc prints them to stderr)
@@ -158,6 +180,11 @@ impl Program {
         out
     }
 
+    /// One-line rendering of the declared store schema, if any.
+    pub fn schema_listing(&self) -> Option<String> {
+        self.schema.as_ref().map(schema_render)
+    }
+
     /// Human-readable listing (hopc --dump, log mode).
     pub fn listing(&self) -> String {
         use std::fmt::Write;
@@ -184,5 +211,23 @@ impl Program {
             }
         }
         out
+    }
+}
+
+fn schema_render(def: &SchemaDef) -> String {
+    match def {
+        SchemaDef::Leaf => "leaf".to_string(),
+        SchemaDef::Sum => "sum".to_string(),
+        SchemaDef::Map(of) => format!("map<{}>", schema_render(of)),
+        SchemaDef::List(of) => format!("list<{}>", schema_render(of)),
+        SchemaDef::Deque(of) => format!("deque<{}>", schema_render(of)),
+        SchemaDef::Record(fields) => {
+            let inner = fields
+                .iter()
+                .map(|(n, t)| format!("{n}: {}", schema_render(t)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("schema {{ {inner} }}")
+        }
     }
 }

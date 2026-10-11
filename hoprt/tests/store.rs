@@ -105,3 +105,96 @@ fn rebuild_from_tape_matches_live() {
     let created = host.store_get(arr(vec![s("stats"), s("created")])).unwrap();
     assert_eq!(created, i(2));
 }
+
+// First-class `schema { ... }` block: same store, core syntax instead of
+// the legacy `server let schema = store.record(...)` data literal.
+const BLOCK_TODO: &str = r#"
+schema {
+  todos: map<record { text: leaf, done: leaf }>,
+  stats: record { created: sum, completed: sum },
+}
+
+fn reduce(event) {
+  match event {
+    add { seq, text } => {
+      store(["todos", seq, store.set({ text = text, done = false })]);
+      store(["stats", "created", store.add(1)]);
+    }
+    toggle { id } => {
+      let done = store(["todos", id, "done"]);
+      store(["todos", id, "done", store.set(!done)]);
+      if done {
+        store(["stats", "completed", store.add(-1)]);
+      } else {
+        store(["stats", "completed", store.add(1)]);
+      }
+    }
+  }
+}
+
+fn add_todo(text) {
+  server!();
+  store.append({ type = "add", text = text });
+}
+
+fn sim_demo() {
+  spawn add_todo("buy milk");
+  spawn add_todo("write the compiler");
+}
+"#;
+
+#[test]
+fn schema_block_binds_store_and_verifies() {
+    let mut host = Cluster::new(&["A"], BLOCK_TODO, false).expect("host");
+    host.fire("A", "sim_demo");
+    host.pump();
+    host.assert_quiescent();
+    assert_eq!(host.applied().unwrap(), 2);
+    let milk = host.store_get(arr(vec![s("todos"), i(0), s("text")])).unwrap();
+    assert_eq!(milk, s("buy milk"));
+    let created = host.store_get(arr(vec![s("stats"), s("created")])).unwrap();
+    assert_eq!(created, i(2));
+    host.verify().unwrap();
+}
+
+#[test]
+fn schema_block_parses_nested_generics() {
+    let prog = hoprt::compiler::compile(
+        r#"
+schema {
+  a: map<list<leaf>>,
+  b: record { x: sum, y: deque<leaf>, z: record { w: leaf } },
+}
+fn reduce(event) {
+}
+"#,
+    )
+    .expect("schema block should compile");
+    let rendered = prog.schema_listing().expect("schema present");
+    assert!(rendered.contains("map<list<leaf>>"), "{rendered}");
+    assert!(rendered.contains("deque<leaf>"), "{rendered}");
+}
+
+#[test]
+fn schema_block_rejects_unknown_type() {
+    let err = hoprt::compiler::compile(
+        "schema { xs: set<leaf>, }\nfn reduce(event) {\n}\n",
+    )
+    .expect_err("unknown schema type should fail");
+    assert!(err.contains("unknown schema type"), "{err}");
+}
+
+#[test]
+fn schema_block_rejects_duplicates_and_legacy_conflict() {
+    let dup = hoprt::compiler::compile(
+        "schema { a: leaf, }\nschema { b: leaf, }\nfn reduce(event) {\n}\n",
+    )
+    .expect_err("duplicate schema should fail");
+    assert!(dup.contains("duplicate"), "{dup}");
+
+    let mixed = hoprt::compiler::compile(
+        "schema { a: leaf, }\nserver let schema = store.leaf;\nfn reduce(event) {\n}\n",
+    )
+    .expect_err("mixed schema spellings should fail");
+    assert!(mixed.contains("cannot define both"), "{mixed}");
+}

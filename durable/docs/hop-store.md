@@ -95,9 +95,29 @@ fn reduce(event) {
 }
 ```
 
+## Declaring the schema
+
+The store shape is a core language construct, not a data literal:
+
+```text
+schema {
+  todos: map<record { text: leaf, done: leaf }>,
+  stats: record { created: sum, completed: sum },
+  feed: list<leaf>,
+}
+```
+
+Field names are bare identifiers; nesting is grammar (`map<T>`,
+`list<T>`, `deque<T>`, `record { ... }`, `leaf`, `sum`) instead of nested
+`store.record([...])` calls. Same meaning, same key layout and presence
+contract — the declaration just lives in the compiler now, where typos
+fail at compile time and future semantic kinds get their own keywords.
+The legacy `server let schema = store.record(...)` spelling still binds,
+but new apps should use the block.
+
 ## The rest of the module
 
-Field access on `store` also provides the schema shape constructors
+Field access on `store` also provides the legacy schema shape constructors
 (`store.record`, `store.map`, `store.list`, `store.deque`, `store.leaf`,
 `store.sum`), view sugar `store.items(path)` (map entries as records with
 the key merged in as `id`), `store.has(path)` (presence — see below), and

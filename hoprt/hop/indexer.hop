@@ -8,29 +8,13 @@
 //
 //   hopd hoprt/hop/indexer.hop --fs-root /tmp/indexer-workspaces
 
-server let schema = store.record([
-  ["run", store.record([
-    ["running", store.leaf],
-    ["judging", store.leaf],
-    ["judging_at", store.leaf],
-    ["ticks", store.sum],
-    ["err", store.leaf]
-  ])],
-  ["repo", store.record([
-    ["url", store.leaf],
-    ["name", store.leaf]
-  ])],
-  ["files", store.map(store.record([
-    ["url", store.leaf],
-    ["lines", store.leaf]
-  ]))],
-  ["billing", store.record([
-    ["prompt", store.sum],
-    ["completion", store.sum],
-    ["calls", store.sum]
-  ])],
-  ["feed", store.list(store.leaf)]
-]);
+schema {
+  run: record { running: leaf, judging: leaf, judging_at: leaf, ticks: sum, err: leaf },
+  repo: record { url: leaf, name: leaf },
+  files: map<record { url: leaf, lines: leaf }>,
+  billing: record { prompt: sum, completion: sum, calls: sum },
+  feed: list<leaf>,
+}
 
 server let tick_every_ms = 800;
 server let slug_url = "http://localhost:8080";

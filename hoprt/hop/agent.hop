@@ -20,20 +20,15 @@
 // browser can append events and render; it never sees the API key and
 // cannot reach bash.
 
-server let schema = store.record([
-  ["threads", store.map(store.record([
-    ["title", store.leaf],              // first user message (or "thread N")
-    ["msgs", store.list(store.leaf)],   // { role, text } — the transcript
-    ["pending", store.leaf],            // command string awaiting approval
-    ["busy", store.leaf]                // a turn is in flight on this thread
-  ]))],
-  ["views", store.map(store.leaf)],     // uid -> tid: what each user is viewing
-  ["next", store.leaf],                 // next thread id to mint
-  ["auto", store.leaf],                 // auto-approve: tools run ungated
-  ["model", store.leaf],                // chosen model (nil = env default)
-  ["models", store.leaf],               // the provider's catalog, for the picker
-  ["home", store.leaf]                  // working directory for bash
-]);
+schema {
+  threads: map<record { title: leaf, msgs: list<leaf>, pending: leaf, busy: leaf }>,
+  views: map<leaf>,
+  next: leaf,
+  auto: leaf,
+  model: leaf,
+  models: leaf,
+  home: leaf,
+}
 
 fn reduce(event) {
   match event {

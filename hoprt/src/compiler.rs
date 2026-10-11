@@ -5,7 +5,13 @@
 //!
 //! ```text
 //! item  := "server" "let" name "=" expr ";"        server-side global
+//!        | "schema" "{" field ("," field)* ","? "}"  store schema (core construct)
 //!        | "fn" name "(" params ")" block
+//! field := name ":" type
+//! type  := "leaf" | "sum"
+//!        | "map" "<" type ">" | "list" "<" type ">" | "deque" "<" type ">"
+//!        | "record" "{" field ("," field)* ","? "}"
+//! ```
 //! stmt  := "let" name "=" expr ";"
 //!        | "server" "!" "(" ")" ";"                placement mark
 //!        | "browser" "!" "(" ")" ";"               placement mark (→ origin)
@@ -47,7 +53,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use crate::ir::{BinOp, Function, HopExplain, Instr, Program, UnOp};
+use crate::ir::{BinOp, Function, HopExplain, Instr, Program, SchemaDef, UnOp};
 use crate::value::Value;
 
 // ---------------------------------------------------------------------------
@@ -66,6 +72,7 @@ enum Tok {
     RBrace,
     LBracket,
     RBracket,
+    Colon,
     Comma,
     Semi,
     Bang,
@@ -129,6 +136,18 @@ fn lex(src: &str) -> Result<Vec<Tok>, String> {
             '&' if two('&') => { out.push(Tok::AndAnd); i += 2 }
             '|' if two('|') => { out.push(Tok::OrOr); i += 2 }
             ':' => {
+                // `:name` is a keyword literal (hiccup tags); a bare `:`
+                // followed by anything else is the schema field separator.
+                // `todos: map` lexes as Ident/Colon/Ident, while `:li`
+                // stays one Keyword token. `todos:map` (no space) would
+                // read as a keyword, so schema fields need the space.
+                let followed = i + 1 < cs.len()
+                    && (cs[i + 1].is_ascii_alphanumeric() || cs[i + 1] == '_' || cs[i + 1] == '-');
+                if !followed {
+                    out.push(Tok::Colon);
+                    i += 1;
+                    continue;
+                }
                 i += 1;
                 let start = i;
                 while i < cs.len() && (cs[i].is_ascii_alphanumeric() || cs[i] == '_' || cs[i] == '-') {
@@ -255,6 +274,7 @@ enum Stmt {
 #[derive(Debug)]
 enum Item {
     ServerLet(String, Expr),
+    Schema(SchemaDef),
     Fn(String, Vec<String>, Vec<Stmt>),
 }
 
@@ -335,6 +355,12 @@ impl Parser {
                 let e = self.expr()?;
                 self.expect(Tok::Semi)?;
                 out.push(Item::ServerLet(name, e));
+            } else if self.at_kw("schema") {
+                self.eat_kw("schema")?;
+                self.expect(Tok::LBrace)?;
+                let fields = self.schema_fields()?;
+                self.expect(Tok::RBrace)?;
+                out.push(Item::Schema(SchemaDef::Record(fields)));
             } else if self.at_kw("fn") {
                 self.eat_kw("fn")?;
                 let name = self.ident()?;
@@ -346,6 +372,54 @@ impl Parser {
             }
         }
         Ok(out)
+    }
+
+    /// `name: Type` fields inside `schema { ... }` / `record { ... }`.
+    /// Names are bare identifiers — never string literals — and trailing
+    /// commas are allowed.
+    fn schema_fields(&mut self) -> Result<Vec<(String, SchemaDef)>, String> {
+        let mut out = Vec::new();
+        while !matches!(self.peek(), Some(Tok::RBrace)) {
+            let name = self.ident()?;
+            self.expect(Tok::Colon)?;
+            let ty = self.schema_type()?;
+            out.push((name, ty));
+            if matches!(self.peek(), Some(Tok::Comma)) {
+                self.pos += 1;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Schema types: `leaf`, `sum`, `map<T>`, `list<T>`, `deque<T>`,
+    /// `record { ... }`. Generic brackets nest (`map<list<leaf>>`).
+    /// Unknown names error with the known list, so tomorrow's semantic
+    /// kinds (`set<T>`, `queue<T>`, …) land here as new keywords.
+    fn schema_type(&mut self) -> Result<SchemaDef, String> {
+        let name = self.ident()?;
+        match name.as_str() {
+            "leaf" => Ok(SchemaDef::Leaf),
+            "sum" => Ok(SchemaDef::Sum),
+            "map" | "list" | "deque" => {
+                self.expect(Tok::Lt)?;
+                let inner = self.schema_type()?;
+                self.expect(Tok::Gt)?;
+                Ok(match name.as_str() {
+                    "map" => SchemaDef::Map(Box::new(inner)),
+                    "list" => SchemaDef::List(Box::new(inner)),
+                    _ => SchemaDef::Deque(Box::new(inner)),
+                })
+            }
+            "record" => {
+                self.expect(Tok::LBrace)?;
+                let fields = self.schema_fields()?;
+                self.expect(Tok::RBrace)?;
+                Ok(SchemaDef::Record(fields))
+            }
+            other => Err(format!(
+                "unknown schema type {other:?} — expected leaf, sum, map<T>, list<T>, deque<T>, or record {{ ... }}"
+            )),
+        }
     }
 
     fn block(&mut self) -> Result<Vec<Stmt>, String> {
@@ -2489,10 +2563,17 @@ pub fn compile(src: &str) -> Result<Program, String> {
     let items = parser.items()?;
 
     let mut cg = Cg::default();
+    let mut schema: Option<SchemaDef> = None;
 
     for item in &items {
         match item {
             Item::ServerLet(name, e) => {
+                if name == "schema" && schema.is_some() {
+                    return Err(
+                        "cannot define both `schema { ... }` and `server let schema` — pick the first-class block"
+                            .into(),
+                    );
+                }
                 let mut ctr = Counters {
                     fn_name: format!("let:{name}"),
                     cast_n: 0,
@@ -2503,6 +2584,18 @@ pub fn compile(src: &str) -> Result<Program, String> {
                 fb.emit(Instr::Return);
                 let fn_idx = cg.add_fn(fb.into_function());
                 cg.server_lets.push((name.clone(), fn_idx));
+            }
+            Item::Schema(def) => {
+                if schema.is_some() {
+                    return Err("duplicate `schema { ... }` block — only one per app".into());
+                }
+                if cg.server_lets.iter().any(|(n, _)| n == "schema") {
+                    return Err(
+                        "cannot define both `schema { ... }` and `server let schema` — pick the first-class block"
+                            .into(),
+                    );
+                }
+                schema = Some(def.clone());
             }
             Item::Fn(name, params, body) => {
                 let mut ctr = Counters {
@@ -2533,6 +2626,7 @@ pub fn compile(src: &str) -> Result<Program, String> {
         hops: cg.hops,
         named: cg.named,
         server_lets: cg.server_lets,
+        schema,
         explain: cg.explain,
         warnings: cg.warnings,
     })

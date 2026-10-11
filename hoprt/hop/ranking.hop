@@ -6,12 +6,9 @@
 //
 //   cargo run -p hoprt --bin hopd -- hoprt/hop/ranking.hop
 
-server let schema = store.record([
-  ["scopes", store.map(store.record([
-    ["votes", store.sum],
-    ["edges", store.map(store.sum)]
-  ]))]
-]);
+schema {
+  scopes: map<record { votes: sum, edges: map<sum> }>,
+}
 
 fn reduce(event) {
   match event {

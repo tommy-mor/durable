@@ -5,16 +5,10 @@
 //   open http://localhost:9000 in two tabs — they stay in sync.
 //   restart hopd: the JSONL tape restores the board.
 
-server let schema = store.record([
-  ["todos", store.map(store.record([
-    ["text", store.leaf],
-    ["done", store.leaf]
-  ]))],
-  ["stats", store.record([
-    ["created", store.sum],
-    ["completed", store.sum]
-  ])]
-]);
+schema {
+  todos: map<record { text: leaf, done: leaf }>,
+  stats: record { created: sum, completed: sum },
+}
 
 fn reduce(event) {
   match event {

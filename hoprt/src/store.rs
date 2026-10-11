@@ -29,12 +29,21 @@ pub struct StoreBinding {
 }
 
 /// If the app defined `schema` and `reduce`, open the runtime and bind it.
+///
+/// Two spellings, one meaning: the first-class `schema { ... }` block
+/// (preferred — `Program::schema`) and the legacy `server let schema =
+/// store.record(...)` data literal (evaluated into globals). The block
+/// wins if both somehow exist; the compiler rejects that anyway.
 pub fn bind(vm: &Vm, data_dir: &Path) -> Result<Option<StoreBinding>, String> {
-    let schema_v = vm.globals.get("schema");
-    if matches!(schema_v, Value::Nil) {
-        return Ok(None);
-    }
-    let schema = value_shape(&schema_v)?;
+    let schema = if let Some(def) = vm.prog.schema.as_ref() {
+        schema_from_def(def)
+    } else {
+        let schema_v = vm.globals.get("schema");
+        if matches!(schema_v, Value::Nil) {
+            return Ok(None);
+        }
+        value_shape(&schema_v)?
+    };
     let Some(&reduce_idx) = vm.prog.named.get("reduce") else {
         return Err("schema is set but reduce is missing — define fn reduce(tx, event)".into());
     };
@@ -350,6 +359,25 @@ impl ReduceHost<'_> {
 // ---------------------------------------------------------------------------
 // Schema: shape-constructor values → durable::Shape
 // ---------------------------------------------------------------------------
+
+/// First-class `schema { ... }` block → runtime shape. Total: the parser
+/// only produces these six forms, so this cannot fail.
+pub fn schema_from_def(def: &crate::ir::SchemaDef) -> Shape {
+    use crate::ir::SchemaDef as D;
+    match def {
+        D::Leaf => Shape::Leaf,
+        D::Sum => Shape::Sum,
+        D::Map(of) => Shape::map(schema_from_def(of)),
+        D::List(of) => Shape::list(schema_from_def(of)),
+        D::Deque(of) => Shape::deque(schema_from_def(of)),
+        D::Record(fields) => Shape::record(
+            fields
+                .iter()
+                .map(|(n, t)| (n.clone(), schema_from_def(t)))
+                .collect(),
+        ),
+    }
+}
 
 fn value_shape(v: &Value) -> Result<Shape, String> {
     let k = v.get_field("k");

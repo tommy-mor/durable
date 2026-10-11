@@ -19,28 +19,20 @@
 // bracket in a local map (seeding, bye resolution) and writes it once;
 // report-time advancement reads only keys committed by earlier events.
 
-server let schema = store.record([
-  ["tournaments", store.map(store.record([
-    ["name", store.leaf],
-    ["format", store.leaf],                 // "single" | "double" | "robin"
-    ["status", store.leaf],                 // "signup" | "live" | "done"
-    ["players", store.list(store.leaf)],
-    ["rounds", store.leaf],
-    ["champion", store.leaf],
-    ["matches", store.map(store.record([
-      ["p1", store.leaf],
-      ["p2", store.leaf],
-      ["winner", store.leaf],
-      ["s1", store.leaf],
-      ["s2", store.leaf],
-      ["round", store.leaf],
-      ["slot", store.leaf],
-      ["bracket", store.leaf],              // "w" | "l" | "gf" | "rr"
-      ["w_to", store.leaf],                 // [mid, side] | "champion" | nil
-      ["l_to", store.leaf]
-    ]))]
-  ]))]
-]);
+schema {
+  tournaments: map<record {
+    name: leaf,
+    format: leaf,
+    status: leaf,
+    players: list<leaf>,
+    rounds: leaf,
+    champion: leaf,
+    matches: map<record {
+      p1: leaf, p2: leaf, winner: leaf, s1: leaf, s2: leaf,
+      round: leaf, slot: leaf, bracket: leaf, w_to: leaf, l_to: leaf
+    }>,
+  }>,
+}
 
 // ── reducer ─────────────────────────────────────────────────────────────
 
