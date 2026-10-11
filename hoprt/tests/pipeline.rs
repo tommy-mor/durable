@@ -89,17 +89,27 @@ fn liveness_ships_only_what_the_remainder_uses() {
 
 #[test]
 fn todo_app_runs_on_simulated_cluster() {
+    // Wait-shape: writers append and return; each tab's panel wakes itself.
+    // Open boards first (one live panel iteration per tab, parked), then
+    // write. Toggle through the flow the onclick calls.
     let src = include_str!("../hop/todo.hop");
     let mut host = Cluster::new(&["A", "B"], src, false).expect("cluster");
+    host.fire("A", "open_board");
+    host.fire("B", "open_board");
+    host.pump();
     host.fire("A", "sim_demo");
     host.pump();
 
-    // Renders go to #app. After two adds the first item's onclick is
-    // handler 4 (render 1 mints button=1, milk=2; render 2 mints button=3,
-    // milk=4, compiler=5).
-    host.fire_handler("A", 4);
+    for tab in ["A", "B"] {
+        let app = host.dom(tab, "#app");
+        assert!(app.contains("buy milk"), "tab {tab}: {app}");
+        assert!(app.contains("write the compiler"), "tab {tab}: {app}");
+    }
+
+    // Toggle the first item through the same flow the onclick calls, then
+    // both panels wake on their own — no refresh poke anywhere.
+    host.fire_args("A", "toggle_todo", vec![Value::Int(0)]);
     host.pump();
-    host.assert_quiescent();
 
     for tab in ["A", "B"] {
         let app = host.dom(tab, "#app");
@@ -108,6 +118,8 @@ fn todo_app_runs_on_simulated_cluster() {
         assert!(app.contains("class=\"done\""), "tab {tab} missing struck-through milk: {app}");
         assert!(app.contains("1 done of 2"), "tab {tab} stats: {app}");
     }
+    // Panels parked, nothing else suspended.
+    assert_eq!(host.server_parked().len(), 2);
 }
 
 #[test]
@@ -116,16 +128,14 @@ fn lambda_with_marks_ships_only_its_captures() {
     // captured — not item, rows, or the items array
     let src = include_str!("../hop/todo.hop");
     let mut host = Cluster::new(&["A"], src, false).expect("cluster");
-    host.fire("A", "sim_demo");
+    host.fire("A", "open_board");
     host.pump();
-    host.fire_handler("A", 4);
+    host.fire_args("A", "toggle_todo", vec![Value::Int(0)]);
     host.pump();
-    host.assert_quiescent();
 
     let all = host.log().join("\n");
-    assert!(all.contains("todo_view:l1:1 vars={id: 0}"), "{all}");
-    // its cast carries the snapshot back out
-    assert!(all.contains("todo_view:c1 vars={completed: 1, created: 2, snapshot:"), "{all}");
+    // the writer hops with exactly the captured id — no collection rides along
+    assert!(all.contains("toggle_todo:1 vars={id: 0}"), "{all}");
 }
 
 #[test]
@@ -292,6 +302,9 @@ fn guardian2_offline_deluge_ranks_longest_first() {
         )],
     );
     host.pump();
+    // a panel wakes per commit while the deluge lands
+    host.fire("A", "open_board");
+    host.pump();
     // run_all judges the full chain server-side (offline judge → edges on the
     // tape → rank.scores) and prints the current leader.
     host.fire("A", "run_all");
@@ -317,6 +330,8 @@ fn guardian2_sorts_a_files_lines_offline() {
         "load_lines",
         vec![Value::str("x\nlet a;\nlet ab;\nlet abc;\nlet abcd;\nlet abcde;")],
     );
+    host.pump();
+    host.fire("A", "open_board");
     host.pump();
     host.fire("A", "run_all");
     host.pump();

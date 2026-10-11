@@ -577,6 +577,37 @@ impl Platform for ServePlatform<'_> {
     ) -> Option<Result<Value, String>> {
         self.store.as_mut().map(|b| b.native(id, args))
     }
+
+    fn store_wait(
+        &mut self,
+        path: Value,
+        flow: &str,
+        read_seq: u64,
+        origin: &str,
+    ) -> Option<Result<Value, String>> {
+        let b = self.store.as_mut()?;
+        Some(b.wait(path, flow, read_seq, origin))
+    }
+
+    fn last_read_seq(&self) -> u64 {
+        self.store.as_ref().and_then(|b| b.applied().ok()).unwrap_or(0)
+    }
+
+    fn drain_woken(&mut self) -> Vec<String> {
+        self.store.as_mut().map(|b| b.drain_woken()).unwrap_or_default()
+    }
+
+    fn cancel_waiter(&mut self, flow: &str) {
+        if let Some(b) = self.store.as_mut() {
+            b.cancel_waiter(flow);
+        }
+    }
+
+    fn cancel_waiters_of_origin(&mut self, sid: &str) {
+        if let Some(b) = self.store.as_mut() {
+            b.cancel_waiters_of_origin(sid);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1818,6 +1849,11 @@ pub fn serve(
                         store: binding.as_mut(),
                         trace: trace_file.clone(),
                     };
+                    // Closing a tab ends its flows before the hook runs.
+                    let n = vm.kill_origin(&mut platform, &sid);
+                    if n > 0 {
+                        println!("[hopd] session {sid}: {n} flow(s) ended with the tab");
+                    }
                     vm.session_disconnect(&mut platform, &sid, &s.user);
                 }
             }

@@ -30,6 +30,26 @@ pub struct StoreBinding {
     /// layout (`schema`) is all durable needs; this drives write-time
     /// validation of map key kinds and blob shapes.
     validation: Option<SchemaDef>,
+    /// Flows parked in `store.wait(path)`: (flow id, watched prefix,
+    /// read seq). Woken when a commit's writes overlap the prefix, or
+    /// when any commit lands past the read seq under that prefix.
+    waiters: Vec<Waiter>,
+    /// Flow ids the last commit woke — drained by the platform after
+    /// every append that ran on it.
+    woken: Vec<String>,
+}
+
+#[derive(Clone)]
+struct Waiter {
+    flow: String,
+    watch: Vec<u8>,
+    /// Applied seq she had read when she parked. Kept so future
+    /// precision work can narrow re-checks; waking today is pure overlap.
+    #[allow(dead_code)]
+    read_seq: u64,
+    /// Session that owns the flow (browser-origin flows). Tab close
+    /// kills every waiter of a dead session.
+    origin: String,
 }
 
 /// Lower a first-class schema to its durable key layout. Key constraints
@@ -106,7 +126,7 @@ pub fn bind(vm: &Vm, data_dir: &Path) -> Result<Option<StoreBinding>, String> {
 
     let rt = Runtime::open(db_path, log_path, schema.clone(), None, reducer)
         .map_err(|e| e.to_string())?;
-    Ok(Some(StoreBinding { rt, schema, validation }))
+    Ok(Some(StoreBinding { rt, schema, validation, waiters: Vec::new(), woken: Vec::new() }))
 }
 
 impl StoreBinding {
@@ -120,6 +140,74 @@ impl StoreBinding {
 
     pub fn applied(&self) -> Result<u64, String> {
         self.rt.applied().map_err(|e| e.to_string())
+    }
+
+    /// Park a flow in `store.wait`: resolve the path to its watch prefix
+    /// and register (flow, prefix, read seq). Returns `Ok(Woken)` when a
+    /// commit landed between her last read and this park (wake at once),
+    /// `Err(Parked)` to suspend toward the courier.
+    pub fn wait(
+        &mut self,
+        path: Value,
+        flow: &str,
+        read_seq: u64,
+        origin: &str,
+    ) -> Result<Value, String> {
+        let (steps, term) = split_terminal(Some(&path))?;
+        if term.is_some() {
+            return Err("store.wait takes a plain path".into());
+        }
+        let q = self.path_query(&steps)?;
+        let watch = durable::watch_prefix(&self.schema, None, &q.navs);
+        let applied = self.rt.applied().map_err(|e| e.to_string())?;
+        if applied > read_seq {
+            return Ok(Value::str("changed"));
+        }
+        self.waiters.push(Waiter {
+            flow: flow.to_string(),
+            watch,
+            read_seq,
+            origin: origin.to_string(),
+        });
+        Ok(Value::str("__parked"))
+    }
+
+    /// Cancel one parked waiter by handle. Returns true when she existed.
+    pub fn cancel_waiter(&mut self, flow: &str) -> bool {
+        let n = self.waiters.len();
+        self.waiters.retain(|w| w.flow != flow);
+        n != self.waiters.len()
+    }
+
+    /// Cancel every waiter owned by a dead session. Returns how many died.
+    pub fn cancel_waiters_of_origin(&mut self, sid: &str) -> usize {
+        let n = self.waiters.len();
+        self.waiters.retain(|w| w.origin != sid);
+        n - self.waiters.len()
+    }
+
+    /// Flows the last commit woke. Drained by the platform after every
+    /// append that ran on it — the courier's delivery queue.
+    pub fn drain_woken(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.woken)
+    }
+
+    /// Which parked flows does this commit wake? Called from the
+    /// runtime's on_commit listener while still holding the ingest lock.
+    pub fn wake_with(&mut self, writes: &[durable::Write]) {
+        let mut woken = Vec::new();
+        self.waiters.retain(|w| {
+            let hit = writes.iter().any(|wr| {
+                durable::write_range(wr).overlaps(&durable::WatchRange::prefix(&w.watch))
+            });
+            if hit {
+                woken.push(w.flow.clone());
+                false
+            } else {
+                true
+            }
+        });
+        self.woken.extend(woken);
     }
 
     /// Dispatch a store native (the server platform's store_native).
@@ -153,6 +241,11 @@ impl StoreBinding {
                 let ev = args.first().ok_or("store.append(event)")?;
                 let ev = to_json(ev)?;
                 let rec = self.rt.append(ev).map_err(|e| e.to_string())?;
+                // The courier wakes here: the commit's waking set lands in
+                // last_writes under the ingest lock; check every parked
+                // watch against it before the next flow runs.
+                let writes = self.rt.last_writes();
+                self.wake_with(&writes);
                 Ok(Value::Int(rec.seq as i64))
             }
             NativeId::StoreItems => {
@@ -199,7 +292,6 @@ impl StoreBinding {
         Ok(Query::new(navs))
     }
 }
-
 /// A terminal navigator, parsed off the end of a path.
 enum Term {
     Set(Value),
@@ -309,7 +401,7 @@ impl Host for ReduceHost<'_> {
         Err("cast is not allowed in a reducer".into())
     }
 
-    fn spawn(&mut self, _c: Value, _a: Vec<Value>) -> Result<(), String> {
+    fn spawn(&mut self, _c: Value, _a: Vec<Value>) -> Result<Value, String> {
         Err("spawn is not allowed in a reducer".into())
     }
 

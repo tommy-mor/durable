@@ -137,6 +137,14 @@ in-memory maps; sort explicitly when display order matters.
 presence). `store.has(path)` probes the raw keyspace when you need to
 distinguish "absent" from "zero."
 
+**A story can wait for the world to change.** `store.wait(path)` parks the
+flow until a commit touches the watched subtree, then wakes her to show
+again — no broadcasts, no refresh pokes. Watches are whole subtrees
+(overlap checked both directions through `durable::watch`); dashboards
+that read everything watch the root (`store.wait([])`). The commit point
+of the flow's last read rides along invisibly, so a write landing between
+the read and the wait wakes at once. See `docs/hop-wait.md`.
+
 The tape is the source of truth (`log.jsonl`); the projection is RocksDB
 (`proj/`), rebuildable from the tape at any time. Every event is appended
 atomically with its reduce — a crash before commit simply replays.
@@ -228,6 +236,11 @@ hopd <app.hop> [http_port] [ws_port]
   iterate key order), `match` on `.type` with field destructuring
   (`ok { value } => ...`), `return`.
 - `spawn f(args)` starts a flow; it runs when the current piece finishes.
+  `spawn` is an expression — its value is the child's handle (flow id).
+  `cancel(handle)` kills one flow (stack and store watch); `cancel_origin()`
+  kills all my server flows (room switches, tab close does this for you).
+  `while true` bodies may not hold marks — write wait-loops as spawn
+  chains: show, `store.wait`, spawn the next iteration, return.
 - Assignment to an unbound name sets a process global (`x = 1` with no
   `let x` in scope is a global store — useful for per-process state like
   an ephemeral API key that must never touch the tape). The flip side:

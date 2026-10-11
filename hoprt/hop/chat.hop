@@ -1,7 +1,12 @@
-// chat.hop — rooms of messages, fan-out by broadcast snapshot.
+// chat.hop — rooms of messages, one panel per tab, woken by the store.
 //
 // Nested path: rooms → record → messages list. A send is one ListPush
-// under that prefix. Switching rooms is a query, not a mutation.
+// under that prefix. Switching rooms kills the tab's old panels and
+// spawns a new one — "which room am I in" is the argument of the running
+// panel flow, not a hidden input and not a tape event.
+//
+// The panel is a spawn chain, not a loop (loops can't hold marks): show,
+// wait, spawn her next iteration, return. Same story, unfolded.
 //
 //   cargo run -p hoprt --bin hopd -- hoprt/hop/chat.hop
 
@@ -43,7 +48,6 @@ fn chat_view(room, rooms, messages) {
   }
   return [:div, {},
     [:h1, {}, "chat"],
-    [:input, { id = "current-room", type = "hidden", value = room }],
     [:p, { class = "meta", id = "room-name" }, "room " .. room],
     [:div, { class = "row", id = "room-bar" }, room_links],
     [:div, { class = "row" },
@@ -53,7 +57,7 @@ fn chat_view(room, rooms, messages) {
     [:ul, { id = "messages" }, lines],
     [:div, { class = "row" },
       [:input, { id = "draft", placeholder = "message" }],
-      [:button, { id = "send", onclick = fn(e) { say(); } }, "send"]
+      [:button, { id = "send", onclick = fn(e) { say_in(room); } }, "send"]
     ]
   ];
 }
@@ -78,28 +82,35 @@ fn paint(room) {
   return { room = room, rooms = rooms, messages = messages };
 }
 
-fn say() {
-  let text = dom.get("#draft");
-  let room = dom.get("#current-room");
-  if text == "" {
-    return;
-  }
+// The panel: hop over, show the room, hop back, wait until it changes,
+// then spawn her next iteration and return. Still a story — nothing
+// listens the code didn't name. One live iteration per tab, parked in
+// store.wait while quiet. Always spawned browser-side (entry assumes it).
+fn chat_panel(room) {
   server!();
-  store.append({ type = "say", sid = session(), room = room, text = text });
-  cast browsers {
-    refresh_chat();
+  let snap = paint(room);
+  let me = session();
+  browser!();
+  hui.render("#app", chat_view(snap.room, snap.rooms, snap.messages));
+  server!();
+  store.wait(["rooms", room, "messages"]);
+  // The next iteration must start browser-side (entry assumes it), but
+  // this piece is on the server with no way home except a cast: hand my
+  // own session a spawn. Origin preserved, entry correct, chain unbroken.
+  cast session(me) {
+    spawn chat_panel(room);
   }
 }
 
-fn refresh_chat() {
-  let room = dom.get("#current-room");
-  if room == "" {
-    room = "lobby";
-  }
+// Switching rooms kills the tab's old panels and spawns a new one. The
+// kill runs server-side (panels live on the server, owned by my session);
+// the spawn runs browser-side (panel entry assumes a browser start... no —
+// panels are server flows: spawn her from the server piece, then come home).
+fn open_room(room) {
   server!();
-  let snap = paint(room);
+  cancel_origin();
   browser!();
-  hui.render("#app", chat_view(snap.room, snap.rooms, snap.messages));
+  spawn chat_panel(room);
 }
 
 fn open_typed_room() {
@@ -110,19 +121,22 @@ fn open_typed_room() {
   open_room(name);
 }
 
-fn open_room(room) {
-  server!();
-  let snap = paint(room);
-  let me = session();
-  cast session(me) {
-    hui.render("#app", chat_view(snap.room, snap.rooms, snap.messages));
+// A send appends and returns. The room rides the button's closure — born
+// inside the send button at render time — so no hidden input, no DOM
+// scrape, no tab state outside the panel's own argument. The panel wakes
+// itself: no broadcast, no refresh poke, no N round trips per write.
+fn say_in(room) {
+  let text = dom.get("#draft");
+  if text == "" {
+    return;
   }
+  server!();
+  store.append({ type = "say", sid = session(), room = room, text = text });
 }
 
 fn on_connect(sid) {
-  let snap = paint("lobby");
   cast session(sid) {
-    hui.render("#app", chat_view(snap.room, snap.rooms, snap.messages));
+    open_room("lobby");
   }
 }
 

@@ -43,7 +43,9 @@ pub fn store_field(name: &str) -> Option<Value> {
         // presence: "is any leaf at or under this path non-null?" — the only
         // honest existence check in an auto-vivifying keyspace
         "has" => Value::Native(NativeId::StoreHas),
-        // collecting navigators: a path containing one is a select
+        // park until a commit touches this subtree — the wait verb.
+        // A story shows, waits, shows again; nothing listens unnamed.
+        "wait" => Value::Native(NativeId::StoreWait),
         "all" | "keys" | "vals" | "first" | "last" | "entries" => {
             Value::tagged("nav", Value::str(name))
         }

@@ -47,6 +47,38 @@ pub trait Platform {
         args: Vec<Value>,
         prog: &Rc<Program>,
     ) -> Option<Result<Value, String>>;
+    /// Park the current flow in `store.wait`: suspend like an effect hop,
+    /// registering (flow, watch prefix, read seq) with the store. The
+    /// default refuses — browser platforms never park on the store.
+    /// Returns `Some(reply)` when the wait resolved immediately
+    /// (a commit slipped in between read and park), `None` to suspend.
+    fn store_wait(
+        &mut self,
+        _path: Value,
+        _flow: &str,
+        _read_seq: u64,
+        _origin: &str,
+    ) -> Option<Result<Value, String>> {
+        Some(Err("store.wait is server-side only".into()))
+    }
+    /// Flows the last commit woke. Drained after every store append that
+    /// ran on this platform — the courier's delivery queue.
+    fn drain_woken(&mut self) -> Vec<String> {
+        Vec::new()
+    }
+    /// Resume a parked waiter with a wake value.
+    fn resume_waiter(&mut self, _flow: &str, _value: Value) {}
+    /// Drop one parked waiter (cancel by handle). Server platforms drop
+    /// her watch; browser platforms never hold any.
+    fn cancel_waiter(&mut self, _flow: &str) {}
+    /// Drop every parked waiter whose flow belongs to session `sid`
+    /// (tab close ends its flows).
+    fn cancel_waiters_of_origin(&mut self, _sid: &str) {}
+    /// Applied seq as of the last store read on this platform — stamps
+    /// the flow's invisible read_seq after every query.
+    fn last_read_seq(&self) -> u64 {
+        0
+    }
     /// Execution trace (hopd --trace): one greppable line per event.
     /// Default off.
     fn tracing(&self) -> bool {
@@ -54,7 +86,6 @@ pub trait Platform {
     }
     fn trace(&mut self, _line: String) {}
 }
-
 #[derive(Clone, Debug, PartialEq)]
 pub enum SideId {
     Server,
@@ -78,6 +109,10 @@ struct FlowCtx {
     /// the origin session's user (Str) or Nil. Stamped by hopd at the
     /// socket, propagated on every hop of the flow — never client-claimed.
     user: Value,
+    /// Commit point of the flow's last store read: the applied seq when
+    /// it read. Rides invisibly like origin so a write landing between
+    /// read and wait wakes at once instead of slipping through.
+    read_seq: u64,
 }
 
 enum Complete {
@@ -140,6 +175,8 @@ impl Vm {
             ("sort_by", NativeId::SortBy),
             ("floor", NativeId::Floor),
             ("type", NativeId::TypeOf),
+            ("cancel", NativeId::Cancel),
+            ("cancel_origin", NativeId::CancelOrigin),
         ] {
             globals.set(name, Value::Native(id));
         }
@@ -197,9 +234,13 @@ impl Vm {
             let lets: Vec<(String, usize)> = vm.prog.server_lets.clone();
             for (name, fn_idx) in lets {
                 let exec = Exec::call(&vm.prog, fn_idx, Vec::new());
-                let ctx =
-                    FlowCtx { flow: format!("init:{name}"), origin: Value::Nil, user: Value::Nil };
-                match vm.run_exec(platform, exec, &ctx) {
+                let ctx = FlowCtx {
+                    flow: format!("init:{name}"),
+                    origin: Value::Nil,
+                    user: Value::Nil,
+                    read_seq: 0,
+                };
+                match vm.run_exec(platform, exec, &mut ctx.clone()) {
                     RunResult::Done(v) => vm.globals.set(name, v),
                     RunResult::Suspended(..) => {
                         return Err(format!("server let {name}: initializer cannot hop"))
@@ -247,14 +288,32 @@ impl Vm {
         }
     }
 
-    pub fn start_flow(&mut self, platform: &mut dyn Platform, callee: Value, args: Vec<Value>) {
+    /// Mint a fresh flow id on this side's namespace without starting anything.
+    /// Hands the spawner her handle synchronously; the child starts at the
+    /// next segment boundary under exactly this id.
+    pub fn mint_flow(&mut self) -> String {
         self.next_flow += 1;
-        let flow = format!("{}#{}", self.side.addr(), self.next_flow);
+        format!("{}#{}", self.side.addr(), self.next_flow)
+    }
+
+    pub fn start_flow(&mut self, platform: &mut dyn Platform, callee: Value, args: Vec<Value>) {
+        let flow = self.mint_flow();
+        self.start_flow_with_id(platform, flow, callee, args);
+    }
+
+    /// Start a flow under an already-minted id (spawn's eager handle).
+    pub fn start_flow_with_id(
+        &mut self,
+        platform: &mut dyn Platform,
+        flow: String,
+        callee: Value,
+        args: Vec<Value>,
+    ) {
         let origin = match &self.side {
             SideId::Browser(s) => Value::str(s.as_str()),
             SideId::Server => Value::Nil,
         };
-        let ctx = FlowCtx { flow, origin, user: self.user.clone() };
+        let ctx = FlowCtx { flow, origin, user: self.user.clone(), read_seq: 0 };
         let exec = match Exec::call_value(&self.prog, &callee, args) {
             Ok(e) => e,
             Err(e) => {
@@ -263,6 +322,57 @@ impl Vm {
             }
         };
         self.step(platform, exec, ctx, Complete::Done);
+    }
+
+    /// Cancel a spawned flow by handle: drop her parked stack (a waiter
+    /// sleeping in store.wait dies too — the platform drops her watch).
+    /// Switching rooms is a story that cancels the old panel and spawns
+    /// a new one. Returns true when a flow actually died.
+    pub fn cancel_flow(&mut self, platform: &mut dyn Platform, flow: &str) -> bool {
+        platform.cancel_waiter(flow);
+        self.stacks.remove(flow).is_some()
+    }
+
+    /// Resume a flow parked in store.wait with a wake value: pop one
+    /// parked level (a waiter sleeps exactly one frame deep, at her wait
+    /// call site) and push the value as the call's return. No-op when the
+    /// flow is gone (cancelled, or never parked).
+    pub fn resume_waiter_flow(&mut self, platform: &mut dyn Platform, flow: &str, value: Value) {
+        let Some(stack) = self.stacks.get_mut(flow) else {
+            return;
+        };
+        let parked = stack.pop().expect("stacks never hold empty vecs");
+        if stack.is_empty() {
+            self.stacks.remove(flow);
+        }
+        let Parked { mut exec, ctx, on_complete } = parked;
+        if let Some(top) = exec.frames.last_mut() {
+            top.stack.push(value);
+        }
+        self.step(platform, exec, ctx, on_complete);
+    }
+
+    /// Kill every flow whose origin session is `sid` — closing a tab ends
+    /// its flows. Server-side only; browser VMs die whole on disconnect.
+    /// Waiters die through the platform hook; hop-parked stacks drop here.
+    /// Returns how many flows died.
+    pub fn kill_origin(&mut self, platform: &mut dyn Platform, sid: &str) -> usize {
+        platform.cancel_waiters_of_origin(sid);
+        let doomed: Vec<String> = self
+            .stacks
+            .iter()
+            .filter_map(|(flow, stack)| {
+                stack.last().and_then(|p| match &p.ctx.origin {
+                    Value::Str(o) if o.as_ref() == sid => Some(flow.clone()),
+                    _ => None,
+                })
+            })
+            .collect();
+        let n = doomed.len();
+        for flow in doomed {
+            self.stacks.remove(&flow);
+        }
+        n
     }
 
     /// Run a global function to completion, synchronously, returning its
@@ -277,12 +387,13 @@ impl Vm {
         let callee = self.globals.get(name);
         let exec = Exec::call_value(&self.prog, &callee, args)?;
         self.next_flow += 1;
-        let ctx = FlowCtx {
+        let mut ctx = FlowCtx {
             flow: format!("{}#sync{}", self.side.addr(), self.next_flow),
             origin: Value::Nil,
             user: Value::Nil,
+            read_seq: 0,
         };
-        match self.run_exec(platform, exec, &ctx) {
+        match self.run_exec(platform, exec, &mut ctx) {
             RunResult::Done(v) => Ok(v),
             RunResult::Suspended(..) => Err(format!("call_sync {name}: cannot hop")),
             RunResult::Failed(e) => Err(e),
@@ -317,6 +428,15 @@ impl Vm {
                     flow: flow_s,
                     origin: pkt.get_field("origin"),
                     user: pkt.get_field("user"),
+                    read_seq: pkt
+                        .get_field("read_seq")
+                        .as_str()
+                        .and_then(|x| x.parse::<u64>().ok())
+                        .or_else(|| match pkt.get_field("read_seq") {
+                            crate::value::Value::Int(n) => Some(n as u64),
+                            _ => None,
+                        })
+                        .unwrap_or(0),
                 };
                 let on_complete = if kind == "call" {
                     Complete::Reply { to: pkt.get_field("reply_to") }
@@ -359,7 +479,24 @@ impl Vm {
                     self.stacks.remove(&flow);
                 }
                 if kind == "reply" {
-                    let Parked { mut exec, ctx, on_complete } = parked;
+                    let Parked { mut exec, mut ctx, on_complete } = parked;
+                    // Per-flow monotonic commit point: neither side's copy
+                    // may go backwards. The browser never reads the store
+                    // (its copy stays 0); without this max, her next hop
+                    // would clobber the server's stamp and every wait would
+                    // wake instantly — an infinite render chain.
+                    let incoming = pkt
+                        .get_field("read_seq")
+                        .as_str()
+                        .and_then(|x| x.parse::<u64>().ok())
+                        .or_else(|| match pkt.get_field("read_seq") {
+                            crate::value::Value::Int(n) => Some(n as u64),
+                            _ => None,
+                        })
+                        .unwrap_or(0);
+                    if incoming > ctx.read_seq {
+                        ctx.read_seq = incoming;
+                    }
                     if let Some(top) = exec.frames.last_mut() {
                         top.stack.push(pkt.get_field("value"));
                     }
@@ -383,12 +520,21 @@ impl Vm {
         }
     }
 
+    /// Flow ids parked on this side (hops awaiting replies AND waiters
+    /// sleeping in store.wait). A wait-loop panel lives here by design —
+    /// parked is her sleeping state, not a leak.
+    pub fn parked_flows(&self) -> Vec<String> {
+        let mut out: Vec<String> = self.stacks.keys().cloned().collect();
+        out.sort();
+        out
+    }
+
     // -- internals ---------------------------------------------------------
 
     /// Drive an exec to its next boundary and dispose of the outcome —
     /// the port of the old runtime's step().
-    fn step(&mut self, platform: &mut dyn Platform, exec: Exec, ctx: FlowCtx, on_complete: Complete) {
-        match self.run_exec(platform, exec, &ctx) {
+    fn step(&mut self, platform: &mut dyn Platform, exec: Exec, mut ctx: FlowCtx, on_complete: Complete) {
+        match self.run_exec(platform, exec, &mut ctx) {
             RunResult::Done(v) => {
                 if platform.tracing() {
                     platform.trace(format!("flow {} done value={v}", ctx.flow));
@@ -400,12 +546,25 @@ impl Vm {
                             ("flow", Value::str(ctx.flow.as_str())),
                             ("to", to),
                             ("value", v),
+                            ("read_seq", Value::Int(ctx.read_seq as i64)),
                         ]));
                     }
                     Complete::Done => {}
                 }
             }
             RunResult::Suspended(exec, target, hop, vars) => {
+                // A store.wait park never touches the wire: the flow
+                // sleeps on the Vm itself until the courier wakes her.
+                if target.as_str() == Some("@wait") {
+                    if platform.tracing() {
+                        platform.trace(format!("flow {} parked in store.wait", ctx.flow));
+                    }
+                    self.stacks
+                        .entry(ctx.flow.clone())
+                        .or_default()
+                        .push(Parked { exec, ctx, on_complete });
+                    return;
+                }
                 if platform.tracing() {
                     platform.trace(format!(
                         "flow {} hop -> {} {} vars={}",
@@ -420,6 +579,7 @@ impl Vm {
                     ("vars", vars),
                     ("origin", ctx.origin.clone()),
                     ("user", ctx.user.clone()),
+                    ("read_seq", Value::Int(ctx.read_seq as i64)),
                     ("reply_to", self.my_addr()),
                 ]));
                 self.stacks
@@ -455,9 +615,10 @@ impl Vm {
 
     /// Run one exec against this VM's globals, then run any flows it
     /// spawned. Returns the exec's own outcome.
-    fn run_exec(&mut self, platform: &mut dyn Platform, mut exec: Exec, ctx: &FlowCtx) -> RunResult {
+    fn run_exec(&mut self, platform: &mut dyn Platform, mut exec: Exec, ctx: &mut FlowCtx) -> RunResult {
         let prog = self.prog.clone();
-        let mut spawned: Vec<(Value, Vec<Value>)> = Vec::new();
+        let mut flow_ops: Vec<FlowOp> = Vec::new();
+        let mut woken: Vec<String> = Vec::new();
         let outcome = {
             let mut host = StepHost {
                 side: &self.side,
@@ -465,20 +626,39 @@ impl Vm {
                 vm_user: &self.user,
                 hui: &mut self.hui,
                 platform,
-                spawned: &mut spawned,
+                flow_ops: &mut flow_ops,
+                next_flow: &mut self.next_flow,
+                woken: &mut woken,
                 prog: &prog,
             };
             interp::run(&prog, &mut exec, &mut self.globals, &mut host)
         };
+        // The courier woke parked waiters mid-step: resume them now that
+        // the platform borrow has ended.
+        for flow in woken {
+            self.resume_waiter_flow(platform, &flow, Value::str("changed"));
+        }
         let result = match outcome {
             Outcome::Done(v) => RunResult::Done(v),
             Outcome::Suspend { target, hop, vars } => RunResult::Suspended(exec, target, hop, vars),
             Outcome::Error(e) => RunResult::Failed(e),
         };
-        // spawned flows are scheduled: they run when the spawning segment
-        // has reached its own boundary
-        for (callee, args) in spawned {
-            self.start_flow(platform, callee, args);
+        // queued flow ops apply in program order when the spawning
+        // segment has reached its own boundary — after woken resumes, so
+        // a cancel later in the program kills what it names even if the
+        // courier woke her mid-step.
+        for op in flow_ops {
+            match op {
+                FlowOp::Spawn { flow, callee, args } => {
+                    self.start_flow_with_id(platform, flow, callee, args)
+                }
+                FlowOp::Cancel { flow } => {
+                    self.cancel_flow(platform, &flow);
+                }
+                FlowOp::CancelOrigin { sid } => {
+                    self.kill_origin(platform, &sid);
+                }
+            }
         }
         result
     }
@@ -494,14 +674,33 @@ enum RunResult {
 // The per-step Host: bridges interpreter needs to VM state + platform
 // ---------------------------------------------------------------------------
 
+/// One queued flow operation: spawn a child, cancel by handle, or kill
+/// every flow of a session. Queued in program order during the step,
+/// applied at the segment boundary.
+pub enum FlowOp {
+    Spawn { flow: String, callee: Value, args: Vec<Value> },
+    Cancel { flow: String },
+    CancelOrigin { sid: String },
+}
+
 struct StepHost<'a> {
     side: &'a SideId,
-    ctx: &'a FlowCtx,
+    ctx: &'a mut FlowCtx,
     /// The VM's own user (browser tabs); Nil on the server.
     vm_user: &'a Value,
     hui: &'a mut HuiState,
     platform: &'a mut dyn Platform,
-    spawned: &'a mut Vec<(Value, Vec<Value>)>,
+    /// Flow operations queued this step, in program order: spawns (with
+    /// eagerly-minted ids so `spawn` answers synchronously), cancels by
+    /// handle, and origin-kills. Applied at the segment boundary after
+    /// woken resumes — a cancel later in the program kills a spawn
+    /// earlier in it, which is what room-switch wants.
+    flow_ops: &'a mut Vec<FlowOp>,
+    /// Fresh ids are minted here (the Vm's counter, borrowed for the step).
+    next_flow: &'a mut u64,
+    /// Flows the courier woke during this step: resumed on the Vm once
+    /// the platform borrow ends.
+    woken: &'a mut Vec<String>,
     prog: &'a Rc<Program>,
 }
 
@@ -527,14 +726,42 @@ impl Host for StepHost<'_> {
             ("vars", vars),
             ("origin", self.ctx.origin.clone()),
             ("user", self.ctx.user.clone()),
+            ("read_seq", Value::Int(self.ctx.read_seq as i64)),
         ]));
         Ok(())
     }
 
-    fn spawn(&mut self, callee: Value, args: Vec<Value>) -> Result<(), String> {
-        self.spawned.push((callee, args));
-        Ok(())
+    fn spawn(&mut self, callee: Value, args: Vec<Value>) -> Result<Value, String> {
+        *self.next_flow += 1;
+        let flow = format!("{}#{}", self.side.addr(), self.next_flow);
+        self.flow_ops.push(FlowOp::Spawn { flow: flow.clone(), callee, args });
+        Ok(Value::str(flow))
     }
+
+    fn cancel(&mut self, flow: &str) -> Result<bool, String> {
+        self.flow_ops.push(FlowOp::Cancel { flow: flow.to_string() });
+        // applied at the boundary; report true when she is (still) parked
+        Ok(true)
+    }
+
+    fn cancel_origin(&mut self, sid: &str) -> Result<u64, String> {
+        // No sid = my own session: browser tabs pass nothing and kill
+        // their own panels; the server resolves origin from the packet.
+        let sid = if sid.is_empty() {
+            match self.side {
+                SideId::Browser(s) => s.clone(),
+                SideId::Server => match &self.ctx.origin {
+                    Value::Str(o) => o.to_string(),
+                    _ => return Ok(0),
+                },
+            }
+        } else {
+            sid.to_string()
+        };
+        self.flow_ops.push(FlowOp::CancelOrigin { sid });
+        Ok(0)
+    }
+
 
     fn session(&mut self) -> Result<Value, String> {
         match self.side {
@@ -598,6 +825,48 @@ impl Host for StepHost<'_> {
             // store natives are the platform's (server has one; a browser
             // platform answers None and this errors cleanly). Appends are
             // traced as tape lines — the event log is the whole point.
+            NativeId::StoreWait => {
+                // A story waits for the world: park like an effect hop.
+                // The platform registers (flow, watch prefix, read seq);
+                // Some(reply) = a commit slipped in — answer at once.
+                // None = suspend toward the courier, wake on overlap.
+                let path = args.first().cloned().unwrap_or(Value::Nil);
+                let flow = self.ctx.flow.clone();
+                let read_seq = self.ctx.read_seq;
+                let origin = match &self.ctx.origin {
+                    Value::Str(o) => o.to_string(),
+                    _ => String::new(),
+                };
+                match self.platform.store_wait(path, &flow, read_seq, &origin) {
+                    // "__parked" is the park signal: suspend locally toward
+                    // the courier. Any other value ("changed") answers at
+                    // once; an error fails the flow loudly.
+                    Some(Ok(v)) if v.as_str() == Some("__parked") => {
+                        Ok(NativeOut::Suspend {
+                            target: Value::str("@wait"),
+                            hop: "wait".to_string(),
+                            vars: Value::map(
+                                [(Value::str("flow"), Value::str(flow.as_str()))]
+                                    .into_iter()
+                                    .collect(),
+                            ),
+                        })
+                    }
+                    Some(r) => r.map(NativeOut::Val),
+                    // No store on this side (a browser platform): a
+                    // browser-side wait ships the path as data; for now it
+                    // parks like a server wait — the hop carries it home.
+                    None => Ok(NativeOut::Suspend {
+                        target: Value::str("@wait"),
+                        hop: "wait".to_string(),
+                        vars: Value::map(
+                            [(Value::str("flow"), Value::str(flow.as_str()))]
+                                .into_iter()
+                                .collect(),
+                        ),
+                    }),
+                }
+            }
             other => {
                 if matches!(other, NativeId::StoreAppend) && self.platform.tracing() {
                     if let Some(ev) = args.first() {
@@ -608,7 +877,27 @@ impl Host for StepHost<'_> {
                     }
                 }
                 match self.platform.store_native(other, args, self.prog) {
-                    Some(r) => r.map(NativeOut::Val),
+                    Some(r) => {
+                        // Every store read stamps the flow's commit point —
+                        // the invisible read_seq riding alongside origin.
+                        // The platform reports it after serving the read.
+                        if matches!(
+                            other,
+                            NativeId::StoreCall | NativeId::StoreItems | NativeId::StoreHas
+                        ) {
+                            let seq = self.platform.last_read_seq();
+                            if seq > self.ctx.read_seq {
+                                self.ctx.read_seq = seq;
+                            }
+                        }
+                        // A commit through this same platform wakes parked
+                        // flows whose watches overlap: collect them; the
+                        // Vm resumes once the platform borrow ends.
+                        if matches!(other, NativeId::StoreAppend) {
+                            self.woken.extend(self.platform.drain_woken());
+                        }
+                        r.map(NativeOut::Val)
+                    }
                     None => Err(format!("{other:?} is not available on this side")),
                 }
             }

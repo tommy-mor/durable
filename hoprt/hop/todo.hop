@@ -1,5 +1,8 @@
 // todo.hop — multiplayer todos on the durable store.
 //
+// One panel per tab, woken by the store: writers append and return, the
+// panel wakes itself. No push-snapshot, no per-write broadcast.
+//
 //   wasm-pack build hop-web --target web   (once; the browser interpreter)
 //   cargo run -p hoprt --bin hopd -- hoprt/hop/todo.hop
 //   open http://localhost:9000 in two tabs — they stay in sync.
@@ -40,16 +43,7 @@ fn todo_view(items) {
     let id = item.id;
     push(rows, [:li, {
       class = item.done && "done",
-      onclick = fn(e) {
-        server!();
-        store.append({ type = "toggle", id = id });
-        let snapshot = store.items(["todos"]);
-        let created = store(["stats", "created"]);
-        let completed = store(["stats", "completed"]);
-        cast browsers {
-          hui.render("#app", todo_app(snapshot, created, completed));
-        }
-      }
+      onclick = fn(e) { toggle_todo(id); }
     }, item.text]);
   }
   return [:ul, { id = "todos" }, rows];
@@ -74,29 +68,50 @@ fn add_from_form() {
   }
 }
 
+// Writers append and return. The panel wakes itself — the write path
+// carries no render, no snapshot, no cast.
 fn add_todo(text) {
   server!();
   store.append({ type = "add", text = text });
+}
+
+fn toggle_todo(id) {
+  server!();
+  store.append({ type = "toggle", id = id });
+}
+
+// The panel: show the board, wait until it changes, then spawn her next
+// iteration and return. One live iteration per tab, parked in store.wait
+// while quiet. Always spawned browser-side (entry assumes it).
+fn todo_panel() {
+  server!();
   let snapshot = store.items(["todos"]);
   let created = store(["stats", "created"]);
   let completed = store(["stats", "completed"]);
-  cast browsers {
-    hui.render("#app", todo_app(snapshot, created, completed));
+  let me = session();
+  browser!();
+  hui.render("#app", todo_app(snapshot, created, completed));
+  server!();
+  store.wait(["todos"]);
+  // Next iteration must start browser-side; this piece is on the server,
+  // so hand my own session a spawn. Chain unbroken, entry correct.
+  cast session(me) {
+    spawn todo_panel();
   }
 }
 
+// One panel per tab. Kill strays first (reconnects double-open), then
+// spawn her browser-side so entry is correct.
+fn open_board() {
+  server!();
+  cancel_origin();
+  browser!();
+  spawn todo_panel();
+}
+
 fn on_connect(sid) {
-  let snapshot = store.items(["todos"]);
-  let created = store(["stats", "created"]);
-  let completed = store(["stats", "completed"]);
-  if !created {
-    created = 0;
-  }
-  if !completed {
-    completed = 0;
-  }
   cast session(sid) {
-    hui.render("#app", todo_app(snapshot, created, completed));
+    open_board();
   }
 }
 

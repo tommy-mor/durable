@@ -1,8 +1,15 @@
 # hop wait — how the world reaches the other tabs
 
-*Status: a design landing, not a spec. Written 2026-10-11 after a long
-night of going around the problem from every side. This records the path,
-not just the destination, because most of the value was in learning which
+*Status: SHIPPED (single-path `store.wait`), 2026-10-11. The design below
+landed as: `durable::watch` (the shipped bridge), `store.wait(path)` with
+prefix-overlap waking, `spawn` handles + `cancel` / `cancel_origin`, tab
+close ending flows, and the read-seq riding every hop and reply. Still
+open: general `wait([...])`, the morph-race rule, the dev lint, Rust
+reducers. Details at the bottom.*
+
+*Original landing note (design, not spec): written after a long night of
+going around the problem from every side. This records the path, not just
+the destination, because most of the value was in learning which
 reasonable-looking ideas are wrong for hop and why.*
 
 ## The question
@@ -279,7 +286,7 @@ the design above.
   marked flow"), and every `sim_*` duplicates a real flow. A mark meaning
   "be on the server" (a no-op if already there) would delete all of it.
 
-## Still open
+## Still open (pre-ship list, kept for honesty)
 
 - Exact surface: `store.wait` vs a general `wait([...])` with
   `store.changed(...)` as one waitable among clicks, timers, and LLM streams.
@@ -292,3 +299,32 @@ the design above.
   warning, never an auto-listener.
 - Whether reducers stay in hop (needed if browsers ever run them for
   optimistic UI) or move to Rust (types, derived event schemas).
+
+## What shipping taught (2026-10-11)
+
+- **Single path first.** `store.wait(path)` shipped; general `wait([...])`
+  with clicks/timers/LLM waitables did not. agent.hop's approval gate is
+  still the mouth hungry for it.
+- **Cancel is handles + origins.** `spawn` is an expression (the child flow
+  id); `cancel(handle)` kills one; `cancel_origin()` kills all my server
+  flows (no arg = my session). Tab close kills by origin before the
+  disconnect hook. A cancelled waiter simply never wakes.
+- **read-seq rides everywhere.** Every store read stamps the flow's commit
+  point; it rides hop packets AND replies, max-merged per flow. Miss the
+  reply half and browser hops clobber the stamp to 0 — every wait wakes
+  instantly in an infinite render chain (found live, fixed).
+- **Panels are spawn chains, not loops.** `while true` with marks panics
+  the CFG backend (missing fixup address), so the compiler rejects marks
+  inside `while true` with a clear error. Bounded loops and for-loops
+  with marks are fine. The panel shape: show, wait, cast-spawn the next
+  iteration browser-side, return. The cast-spawn matters: a server-spawned
+  child has Nil origin, so her `browser!()` dies — chain through your own
+  session.
+- **Coarse watches are honest.** Dashboards that read the whole store
+  (guardian2, microblog) watch the root (`store.wait([])`). Precision, as
+  designed, will live in reducer-kept indexes, not a smarter bridge.
+- **Direct appends drain too.** The harness `append` resumes woken waiters
+  inline — otherwise store-only tests would never observe a wake.
+- **Replies have side effects on arrival order.** A woken panel's
+  done-reply and chain cast land in the same server pass as the writer's
+  reply — socket tests must accept any order.

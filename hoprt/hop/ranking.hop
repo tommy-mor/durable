@@ -31,19 +31,16 @@ fn reduce(event) {
   }
 }
 
+fn cast_vote(scope, a, b) {
+  server!();
+  store.append({ type = "vote", scope = scope, winner = a, loser = b });
+}
+
 fn pair_button(scope, a, b) {
   return [:button, {
     class = "pair",
     id = "vote-" .. a .. "-" .. b,
-    onclick = fn(e) {
-      server!();
-      store.append({ type = "vote", scope = scope, winner = a, loser = b });
-      let votes = store(["scopes", scope, "votes"]);
-      let edges = store(["scopes", scope, "edges", store.entries]);
-      cast browsers {
-        hui.render("#app", ranking_view(scope, votes, edges));
-      }
-    }
+    onclick = fn(e) { cast_vote(scope, a, b); }
   }, a .. " beats " .. b];
 }
 
@@ -67,39 +64,52 @@ fn ranking_view(scope, votes, edges) {
       pair_button(scope, "grep", "ag")
     ],
     [:div, { class = "row" },
-      [:button, { id = "decay", onclick = fn(e) {
-        server!();
-        store.append({ type = "decay", scope = scope });
-        let v = store(["scopes", scope, "votes"]);
-        let es = store(["scopes", scope, "edges", store.entries]);
-        cast browsers {
-          hui.render("#app", ranking_view(scope, v, es));
-        }
-      } }, "decay 10%"]
+      [:button, { id = "decay", onclick = fn(e) { decay_scope(scope); } }, "decay 10%"]
     ],
     [:h2, {}, "edges"],
     [:ul, { id = "edges" }, rows]
   ];
 }
 
+fn decay_scope(scope) {
+  server!();
+  store.append({ type = "decay", scope = scope });
+}
+
 fn vote(scope, winner, loser) {
   server!();
   store.append({ type = "vote", scope = scope, winner = winner, loser = loser });
-  let votes = store(["scopes", scope, "votes"]);
-  let edges = store(["scopes", scope, "edges", store.entries]);
-  cast browsers {
-    hui.render("#app", ranking_view(scope, votes, edges));
-  }
 }
 
-fn on_connect(sid) {
+// One panel per tab on the tools scope: show, wait on the scope, chain.
+// Writers append and return; the panel wakes itself.
+fn ranking_panel() {
+  server!();
   let votes = store(["scopes", "tools", "votes"]);
   let edges = store(["scopes", "tools", "edges", store.entries]);
   if !votes {
     votes = 0;
   }
+  let me = session();
+  browser!();
+  hui.render("#app", ranking_view("tools", votes, edges));
+  server!();
+  store.wait(["scopes", "tools"]);
+  cast session(me) {
+    spawn ranking_panel();
+  }
+}
+
+fn open_board() {
+  server!();
+  cancel_origin();
+  browser!();
+  spawn ranking_panel();
+}
+
+fn on_connect(sid) {
   cast session(sid) {
-    hui.render("#app", ranking_view("tools", votes, edges));
+    open_board();
   }
 }
 

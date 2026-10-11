@@ -76,15 +76,7 @@ fn blog_view(me, users, feed) {
         [:button, {
           class = "follow",
           id = "follow-" .. id,
-          onclick = fn(e) {
-            server!();
-            store.append({ type = "follow", sid = session(), who = id });
-            let us = store.items(["users"]);
-            let tl = gather_timeline(session());
-            cast session(session()) {
-              hui.render("#app", blog_view(me, us, tl));
-            }
-          }
+          onclick = fn(e) { follow(id); }
         }, "follow"]
       ]);
     }
@@ -120,6 +112,13 @@ fn blog_view(me, users, feed) {
   ];
 }
 
+// Writers append and return. Panels wake themselves — no broadcast,
+// no refresh token, no per-session rebuild dance.
+fn follow(id) {
+  server!();
+  store.append({ type = "follow", sid = session(), who = id });
+}
+
 fn join() {
   let name = dom.get("#name");
   if name == "" {
@@ -127,9 +126,6 @@ fn join() {
   }
   server!();
   store.append({ type = "join", sid = session(), name = name });
-  cast browsers {
-    refresh_feed();
-  }
 }
 
 fn publish() {
@@ -139,32 +135,35 @@ fn publish() {
   }
   server!();
   store.append({ type = "post", sid = session(), text = text });
-  let users = store.items(["users"]);
-  // each connected tab has its own timeline; broadcast a refresh token
-  // and let on_refresh rebuild per session.
-  cast browsers {
-    refresh_feed();
-  }
 }
 
-fn refresh_feed() {
-  // Capture this tab's session on the browser before hopping. A
-  // `cast browsers { refresh_feed() }` keeps the poster's origin on
-  // the packet — session() on the server would then paint every tab
-  // with the author's timeline.
+// One panel per tab: show my feed, wait until the store moves, spawn the
+// next iteration. Root watch — the view reads users, timelines, and posts
+// together, so the whole store is the honest watch.
+fn feed_panel() {
   let me = session();
   server!();
   let users = store.items(["users"]);
   let feed = gather_timeline(me);
   browser!();
   hui.render("#app", blog_view(me, users, feed));
+  server!();
+  store.wait([]);
+  cast session(me) {
+    spawn feed_panel();
+  }
+}
+
+fn open_board() {
+  server!();
+  cancel_origin();
+  browser!();
+  spawn feed_panel();
 }
 
 fn on_connect(sid) {
-  let users = store.items(["users"]);
-  let feed = gather_timeline(sid);
   cast session(sid) {
-    hui.render("#app", blog_view(sid, users, feed));
+    open_board();
   }
 }
 

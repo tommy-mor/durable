@@ -1,8 +1,14 @@
 //! A fake browser over real sockets: connect to hopd via WebSocket and
 //! speak exactly the CBOR packets a browser's origin segments would send.
 //! This validates the transport half without a browser: session hello,
-//! on_connect snapshot, server-side state mutation, broadcast, and the
-//! at-reply — all across real TCP, all binary.
+//! on_connect panel boot, a server-side append, the panel's re-render data
+//! riding hop replies (not broadcasts), and identity stamping — all across
+//! real TCP, all binary.
+//!
+//! Wire shape of the wait world: the tab sends calls, the server answers
+//! with replies whose vars carry the render data; writers get bare replies;
+//! chain links arrive as casts the tab answers by sending the next
+//! iteration's first hop.
 
 use std::net::TcpStream;
 use std::thread;
@@ -56,12 +62,32 @@ fn map(entries: &[(&str, Value)]) -> Value {
     )
 }
 
-/// vars.snapshot[i].field
-fn snap_field(pkt: &Value, i: i64, field: &str) -> Value {
-    let snapshot = pkt.get_field("vars").get_field("snapshot");
-    match &snapshot {
-        Value::Array(a) => a.borrow()[i as usize].get_field(field),
-        other => panic!("snapshot is {other}"),
+fn call(flow: &str, hop: &str, vars: &[(&str, Value)]) -> Value {
+    map(&[
+        ("kind", s("call")),
+        ("flow", s(flow)),
+        ("to", s("server")),
+        ("hop", s(hop)),
+        ("vars", map(vars)),
+        ("origin", s("FAKE")),
+        ("reply_to", s("FAKE")),
+    ])
+}
+
+fn reply(flow: &str, value: Value) -> Value {
+    map(&[
+        ("kind", s("reply")),
+        ("flow", s(flow)),
+        ("to", s("server")),
+        ("value", value),
+    ])
+}
+
+/// Snapshot array out of a panel reply's vars.
+fn snap_of(pkt: &Value) -> Vec<Value> {
+    match pkt.get_field("value").get_field("vars").get_field("snapshot") {
+        Value::Array(a) => a.borrow().clone(),
+        other => panic!("snapshot is {other}: {pkt}"),
     }
 }
 
@@ -89,7 +115,7 @@ fn hopd_serves_the_todo_app_over_real_sockets() {
         );
     });
 
-    // ── tab A connects: hello, then the on_connect snapshot (empty board)
+    // ── tab A connects: hello, then the on_connect cast that boots her board
     let mut a = connect_with_retry();
     let hello = recv(&mut a);
     assert_eq!(hello.get_field("kind"), s("hello"));
@@ -98,64 +124,143 @@ fn hopd_serves_the_todo_app_over_real_sockets() {
     assert_eq!(pkt.get_field("kind"), s("cast"));
     assert_eq!(pkt.get_field("hop"), s("on_connect:c1"));
 
-    // ── A "types a todo": send what add_todo's origin segment sends
-    send(
-        &mut a,
-        &map(&[
-            ("kind", s("call")),
-            ("flow", s("A#1")),
-            ("to", s("server")),
-            ("hop", s("add_todo:1")),
-            ("vars", map(&[("text", s("buy milk"))])),
-            ("origin", s("A")),
-            ("reply_to", s("A")),
-        ]),
-    );
+    // ── emulate the tab VM: open_board hits server!() …
+    send(&mut a, &call("A#1", "open_board:1", &[]));
+    let pkt = recv(&mut a);
+    assert_eq!(pkt.get_field("kind"), s("reply"));
+    assert_eq!(pkt.get_field("flow"), s("A#1"));
 
-    // broadcast render with the new item, then the reply completing the flow
-    let cast = recv(&mut a);
-    assert_eq!(cast.get_field("kind"), s("cast"));
-    assert_eq!(cast.get_field("hop"), s("add_todo:c1"));
-    assert_eq!(snap_field(&cast, 0, "text"), s("buy milk"));
-    assert_eq!(snap_field(&cast, 0, "done"), Value::Bool(false));
-    let reply = recv(&mut a);
-    assert_eq!(reply.get_field("kind"), s("reply"));
-    assert_eq!(reply.get_field("flow"), s("A#1"));
+    // … the spawn runs panel browser-side: her first server hop …
+    send(&mut a, &call("A#2", "todo_panel:1", &[]));
+    // … answered with the render data: the empty board
+    let pkt = recv(&mut a);
+    assert_eq!(pkt.get_field("flow"), s("A#2"));
+    assert_eq!(snap_of(&pkt).len(), 0, "empty board renders: {pkt}");
 
-    // ── tab B joins late and is brought up to date by on_connect
+    // ── the browser piece "renders", then hops back to wait …
+    let me = pkt
+        .get_field("value")
+        .get_field("vars")
+        .get_field("me")
+        .as_str()
+        .unwrap()
+        .to_string();
+    send(&mut a, &call("A#2", "todo_panel:2", &[("me", s(me.as_str()))]));
+    // … and nothing comes back: she parked in store.wait (read timeout
+    // would fire — so send the write on a NEW flow instead of reading)
+    // ── A "types a todo": the writer appends and gets a bare reply. Three
+    // packets land in one server pass, any order: the writer reply (A#3),
+    // the woken panel's done-reply (A#2 returns after chaining), and the
+    // chain cast spawning iteration 2.
+    send(&mut a, &call("A#3", "add_todo:1", &[("text", s("buy milk"))]));
+    let (mut replies, mut casts) = (Vec::new(), Vec::new());
+    for _ in 0..3 {
+        let pkt = recv(&mut a);
+        match pkt.get_field("kind").as_str() {
+            Some("reply") => replies.push(pkt),
+            Some("cast") => casts.push(pkt),
+            other => panic!("unexpected packet: {other:?} {pkt}"),
+        }
+    }
+    assert!(replies.iter().any(|p| p.get_field("flow") == s("A#3")), "writer reply");
+    // ── the woken panel chains: a cast arrives spawning the next iteration …
+    assert_eq!(casts.len(), 1, "one chain cast");
+    assert_eq!(casts[0].get_field("hop"), s("todo_panel:c1"));
+    // … the tab spawns her browser-side: first server hop of iteration 2 …
+    send(&mut a, &call("A#4", "todo_panel:1", &[]));
+    let pkt = recv(&mut a);
+    assert_eq!(pkt.get_field("flow"), s("A#4"));
+    let items = snap_of(&pkt);
+    assert_eq!(items.len(), 1, "woken panel re-reads: {pkt}");
+    assert_eq!(items[0].get_field("text"), s("buy milk"));
+    let me = pkt
+        .get_field("value")
+        .get_field("vars")
+        .get_field("me")
+        .as_str()
+        .unwrap()
+        .to_string();
+    send(&mut a, &call("A#4", "todo_panel:2", &[("me", s(me.as_str()))]));
+    // parked again — silence. On to tab B.
+
+    // ── tab B joins late: hello, boot cast, same dance, but her panel
+    // reads the existing board (replay from the tape, not a push)
     let mut b = connect_with_retry();
     let hello = recv(&mut b);
     assert_eq!(hello.get_field("session"), s("B"));
     let pkt = recv(&mut b);
     assert_eq!(pkt.get_field("hop"), s("on_connect:c1"));
-    assert_eq!(snap_field(&pkt, 0, "text"), s("buy milk"));
+    send(&mut b, &call("B#1", "open_board:1", &[]));
+    let pkt = recv(&mut b);
+    assert_eq!(pkt.get_field("flow"), s("B#1"));
+    send(&mut b, &call("B#2", "todo_panel:1", &[]));
+    let pkt = recv(&mut b);
+    assert_eq!(snap_of(&pkt).len(), 1, "late tab sees the board: {pkt}");
+    let me = pkt
+        .get_field("value")
+        .get_field("vars")
+        .get_field("me")
+        .as_str()
+        .unwrap()
+        .to_string();
+    send(&mut b, &call("B#2", "todo_panel:2", &[("me", s(me.as_str()))]));
 
-    // ── B toggles item 0 by invoking the onclick lambda's server segment
-    // (in a real tab, clicking the <li> runs the closure, whose first act
-    // is exactly this packet); the broadcast reaches BOTH tabs
+    // ── B toggles item 0 (forged origin: hopd stamps the connection's id).
+    // The writer's bare reply goes to B, not the forged A; then BOTH tabs
+    // get chain casts and re-render with done=true.
     send(
         &mut b,
         &map(&[
             ("kind", s("call")),
-            ("flow", s("B#1")),
+            ("flow", s("B#3")),
             ("to", s("server")),
-            ("hop", s("todo_view:l1:1")),
+            ("hop", s("toggle_todo:1")),
             ("vars", map(&[("id", Value::Int(0))])),
-            // a forged origin: hopd must overwrite it with the connection's id
             ("origin", s("A")),
             ("reply_to", s("A")),
         ]),
     );
+    // B's socket gets three packets, any order: her writer reply (B#3),
+    // her panel's done-reply, and her chain cast.
+    let (mut b_replies, mut b_cast) = (Vec::new(), None);
+    for _ in 0..3 {
+        let pkt = recv(&mut b);
+        match pkt.get_field("kind").as_str() {
+            Some("reply") => b_replies.push(pkt),
+            Some("cast") => b_cast = Some(pkt),
+            other => panic!("unexpected packet: {other:?} {pkt}"),
+        }
+    }
+    assert!(b_replies.iter().any(|p| p.get_field("flow") == s("B#3")), "writer reply to B");
+    assert_eq!(b_cast.as_ref().expect("chain cast to B").get_field("hop"), s("todo_panel:c1"));
 
-    let cast_b = recv(&mut b);
-    assert_eq!(cast_b.get_field("hop"), s("todo_view:c1"));
-    assert_eq!(snap_field(&cast_b, 0, "done"), Value::Bool(true));
-    let cast_a = recv(&mut a);
-    assert_eq!(cast_a.get_field("hop"), s("todo_view:c1"));
-    assert_eq!(snap_field(&cast_a, 0, "done"), Value::Bool(true));
+    // A's socket gets two packets, either order: her panel's done-reply
+    // and her chain cast.
+    let (mut a_replies, mut a_cast) = (Vec::new(), None);
+    for _ in 0..2 {
+        let pkt = recv(&mut a);
+        match pkt.get_field("kind").as_str() {
+            Some("reply") => a_replies.push(pkt),
+            Some("cast") => a_cast = Some(pkt),
+            other => panic!("unexpected packet: {other:?} {pkt}"),
+        }
+    }
+    assert_eq!(a_cast.as_ref().expect("chain cast to A").get_field("hop"), s("todo_panel:c1"));
 
-    // identity rode the connection: the reply went to B, not the forged A
-    let reply = recv(&mut b);
-    assert_eq!(reply.get_field("kind"), s("reply"));
-    assert_eq!(reply.get_field("flow"), s("B#1"));
+    // Each tab spawns her next iteration and re-reads done=true.
+    for (tab, ws, flow) in [("B", &mut b, "B#4"), ("A", &mut a, "A#5")] {
+        send(ws, &call(flow, "todo_panel:1", &[]));
+        let pkt = recv(ws);
+        let items = snap_of(&pkt);
+        assert_eq!(items.len(), 1, "{tab} re-reads");
+        assert_eq!(items[0].get_field("done"), Value::Bool(true), "{tab} sees the toggle");
+        let me = pkt
+            .get_field("value")
+            .get_field("vars")
+            .get_field("me")
+            .as_str()
+            .unwrap()
+            .to_string();
+        send(ws, &call(flow, "todo_panel:2", &[("me", s(me.as_str()))]));
+    }
 }

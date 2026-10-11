@@ -80,6 +80,9 @@ impl<E> Record<E> {
 pub struct Tx {
     batch: Batch,
     meta: Meta,
+    /// Every reified write recorded, kept alongside the batch so the
+    /// commit can report what it touched without re-reading anything.
+    writes: Vec<Write>,
 }
 
 impl Tx {
@@ -87,6 +90,7 @@ impl Tx {
         Self {
             batch: db.batch(),
             meta,
+            writes: Vec::new(),
         }
     }
 
@@ -139,12 +143,20 @@ impl Tx {
 
     /// Record a reified write. This is how a reducer mutates state.
     pub fn write(&mut self, write: Write) {
-        self.batch.write(write);
+        self.batch.write(write.clone());
+        self.writes.push(write);
     }
 
     /// Record several reified writes.
     pub fn extend<I: IntoIterator<Item = Write>>(&mut self, writes: I) {
-        self.batch.extend(writes);
+        for w in writes {
+            self.write(w);
+        }
+    }
+
+    /// Every write this transaction recorded — the commit's waking set.
+    pub fn writes(&self) -> &[Write] {
+        &self.writes
     }
 
     /// Committed projection, not including in-flight writes of this event.
@@ -152,8 +164,10 @@ impl Tx {
         self.batch.db()
     }
 
-    fn commit(self, durability: Durability) -> Result<()> {
-        self.batch.commit_with(durability)
+    fn commit(self, durability: Durability) -> Result<Vec<Write>> {
+        let writes = self.writes.clone();
+        self.batch.commit_with(durability)?;
+        Ok(writes)
     }
 }
 
@@ -283,6 +297,14 @@ pub struct Runtime<E> {
     schema: Shape,
     namespace: Option<String>,
     reducer: Arc<dyn Fn(&mut Tx, &E) -> Result<()> + Send + Sync>,
+    /// Fired after every committed event with the seq and the writes it
+    /// touched. The courier hangs her waking loop here — single-threaded
+    /// runtimes call it inline on the committing thread.
+    on_commit: Mutex<Option<Arc<dyn Fn(u64, &[Write]) + Send + Sync>>>,
+    /// Writes of the most recent committed event. Stashed under the ingest
+    /// lock; the store binding pulls them right after `append` returns to
+    /// wake parked waiters — same thread, no race.
+    last_writes: Mutex<Vec<Write>>,
 }
 
 impl<E: Serialize + DeserializeOwned + 'static> Runtime<E> {
@@ -313,6 +335,8 @@ impl<E: Serialize + DeserializeOwned + 'static> Runtime<E> {
             schema,
             namespace,
             reducer: Arc::new(reducer),
+            on_commit: Mutex::new(None),
+            last_writes: Mutex::new(Vec::new()),
         };
         rt.catch_up()?;
         Ok(rt)
@@ -334,6 +358,23 @@ impl<E: Serialize + DeserializeOwned + 'static> Runtime<E> {
 
     pub fn schema(&self) -> &Shape {
         &self.schema
+    }
+
+    /// Hang the courier here: called after every committed event with its
+    /// seq and the writes it touched. Replaces any previous listener.
+    pub fn on_commit(&self, f: impl Fn(u64, &[Write]) + Send + Sync + 'static) {
+        *self.on_commit.lock().expect("on_commit lock") = Some(Arc::new(f));
+    }
+
+    /// Drop the commit listener.
+    pub fn clear_on_commit(&self) {
+        *self.on_commit.lock().expect("on_commit lock") = None;
+    }
+
+    /// Writes of the most recent committed event — the waking set the
+    /// courier checks parked watches against.
+    pub fn last_writes(&self) -> Vec<Write> {
+        self.last_writes.lock().expect("last_writes lock").clone()
     }
 
     /// Path of the canonical JSONL tape.
@@ -442,9 +483,17 @@ impl<E: Serialize + DeserializeOwned + 'static> Runtime<E> {
         (self.reducer)(&mut tx, &rec.event)?;
         tx.write(applied_leaf().set(&(rec.seq + 1)));
         // The log is the durable source of truth; the projection is rebuildable.
-        tx.commit(Durability::DisableWal)?;
+        let writes = tx.commit(Durability::DisableWal)?;
+        *self.last_writes.lock().expect("last_writes lock") = writes.clone();
         inner.applied = rec.seq + 1;
         self.applied.store(inner.applied, Ordering::Release);
+        // Wake whoever waits: report the commit's waking set AFTER it is
+        // durable, while still holding the ingest lock so no waiter can
+        // register between the commit and this fire.
+        let listener = self.on_commit.lock().expect("on_commit lock").clone();
+        if let Some(f) = listener {
+            f(rec.seq, &writes);
+        }
         Ok(())
     }
 

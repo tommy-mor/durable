@@ -152,23 +152,22 @@ fn judge(a, b) {
 
 // ---- flows ----
 
+// Writers append and return. Panels wake themselves — no paint calls on
+// the write path.
 fn play() {
   server!();
   store.append({ type = "play" });
-  paint();
 }
 
 fn pause() {
   server!();
   store.append({ type = "pause" });
-  paint();
 }
 
 fn set_model() {
   let m = dom.get("#model_pick");
   server!();
   store.append({ type = "model", slug = m });
-  paint();
 }
 
 // ---- corpus ingestion ----
@@ -193,11 +192,9 @@ fn load() {
   let r = fs.read(p);
   if !r.ok {
     store.append({ type = "err", text = "load: " .. r.error });
-    paint();
     return;
   }
   load_lines(r.text);
-  paint();
 }
 
 // One full chain pass, judged server-side in one go: the deterministic core
@@ -223,7 +220,6 @@ fn run_all() {
   }
   let res = rank.scores(n, edges);
   print("top=" .. res.order[0]);
-  paint();
 }
 
 // The scheduler-driven loop: judge one pair per tick, forever. In production
@@ -257,7 +253,6 @@ fn tick() {
     return;
   }
   store.append({ type = "judged", a = r.a, b = r.b, pa = r.pa });
-  paint();
 }
 
 // ---- view (pure render; all data computed server-side in paint) ----
@@ -324,7 +319,33 @@ fn view(running, votes, model, err, feed, rank_rows) {
   return [:div, {}, parts];
 }
 
-fn paint() {
+// The panel: show the index, wait until the store moves, then spawn her
+// next iteration and return. She watches the root — the dashboard reads
+// items, edges, votes, feed, running, model, err together, so the whole
+// store is her watch. Coarse and honest; precision later lives in the
+// schema, not in a smarter bridge.
+fn guardian_panel() {
+  server!();
+  let snap = paint_data();
+  let me = session();
+  browser!();
+  hui.render("#app", view(snap.running, snap.votes, snap.model, snap.err, snap.feed, snap.rank_rows));
+  server!();
+  store.wait([]);
+  // Next iteration must start browser-side; hand my own session a spawn.
+  cast session(me) {
+    spawn guardian_panel();
+  }
+}
+
+fn open_board() {
+  server!();
+  cancel_origin();
+  browser!();
+  spawn guardian_panel();
+}
+
+fn paint_data() {
   let items = store(["items"]);
   if !items {
     items = [];
@@ -347,11 +368,11 @@ fn paint() {
     feed = [];
   }
   let running = store(["running"]);
-  cast browsers {
-    hui.render("#app", view(running, votes, model, err, feed, rank_rows));
-  }
+  return { running = running, votes = votes, model = model, err = err, feed = feed, rank_rows = rank_rows };
 }
 
 fn on_connect(sid) {
-  paint();
+  cast session(sid) {
+    open_board();
+  }
 }

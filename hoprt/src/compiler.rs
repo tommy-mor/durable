@@ -234,6 +234,8 @@ enum Expr {
     Array(Vec<Expr>),
     /// `fn (params) { ... }` in expression position; body may contain marks
     Fn(Vec<String>, Vec<Stmt>),
+    /// `spawn f(args)` — start a flow now, evaluate to its handle (flow id).
+    Spawn(Box<Expr>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -829,6 +831,15 @@ impl Parser {
     }
 
     fn primary(&mut self) -> Result<Expr, String> {
+        // spawn expression: `spawn f(args)` evaluates to the child's handle
+        if self.at_kw("spawn") {
+            self.eat_kw("spawn")?;
+            let e = self.expr()?;
+            if !matches!(e, Expr::Call(..)) {
+                return Err("spawn expects a function call".into());
+            }
+            return Ok(Expr::Spawn(Box::new(e)));
+        }
         // lambda: `fn (params) { ... }`
         if self.at_kw("fn") {
             self.eat_kw("fn")?;
@@ -917,6 +928,7 @@ fn refs_expr(e: &Expr, out: &mut BTreeSet<String>) {
         }
         // a lambda's captures are whatever its body references
         Expr::Fn(_, body) => refs_stmts(body, out),
+        Expr::Spawn(e) => refs_expr(e, out),
         _ => {}
     }
 }
@@ -968,6 +980,71 @@ fn refs_stmts(ss: &[Stmt], out: &mut BTreeSet<String>) {
 /// Marks are legal anywhere a flow body reaches — branches, loops, match
 /// arms — EXCEPT cast bodies: a cast is a fire-and-forget message whose
 /// body already runs on the target, so a hop inside it has no meaning.
+/// Infinite-loop bodies may not contain placement marks: a `while true`
+/// back-edge has no exit edge, so a mark inside one strands the CFG backend
+/// (missing fixup address — a panic). Bounded loops carry their
+/// iterator/condition state across pieces fine (while_mark and go_b prove
+/// it). Until infinite loops compile across hops, write the wait-loop as a
+/// spawn chain instead: a flow that shows, waits, then spawns her next
+/// iteration and returns. Same story, no loop keyword, marks stay linear.
+fn check_no_loop_marks(ss: &[Stmt]) -> Result<(), String> {
+    fn is_true(e: &Expr) -> bool {
+        matches!(e, Expr::Bool(true))
+    }
+    fn reject_in(body: &[Stmt]) -> Result<(), String> {
+        for st in body {
+            if matches!(st, Stmt::Mark(_)) {
+                return Err("placement marks are not allowed inside `while true` — an infinite loop cannot hop. Write the wait-loop as a spawn chain: a flow that waits, then spawns her next iteration and returns".into());
+            }
+            match st {
+                Stmt::If(_, t, e) => {
+                    reject_in(t)?;
+                    if let Some(e) = e {
+                        reject_in(e)?;
+                    }
+                }
+                Stmt::Match(_, arms) => {
+                    for a in arms {
+                        reject_in(&a.body)?;
+                    }
+                }
+                Stmt::While(c, b) if is_true(c) => reject_in(b)?,
+                Stmt::While(_, b) => check_no_loop_marks(b)?,
+                Stmt::Cast(_, b) => reject_in(b)?,
+                // for bodies carry iterator state that survives piece
+                // splits (go_b proves it), so marks stay legal there.
+                Stmt::For(_, _, _, b) => check_no_loop_marks(b)?,
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+    fn check(ss: &[Stmt]) -> Result<(), String> {
+        for s in ss {
+            match s {
+                Stmt::While(c, b) if is_true(c) => reject_in(b)?,
+                Stmt::While(_, b) => check(b)?,
+                Stmt::For(_, _, _, b) => check(b)?,
+                Stmt::If(_, t, e) => {
+                    check(t)?;
+                    if let Some(e) = e {
+                        check(e)?;
+                    }
+                }
+                Stmt::Match(_, arms) => {
+                    for a in arms {
+                        check(&a.body)?;
+                    }
+                }
+                Stmt::Cast(_, b) => check(b)?,
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+    check(ss)
+}
+
 /// Lambda bodies are separate flow bodies, checked when they compile.
 fn check_no_cast_marks(ss: &[Stmt]) -> Result<(), String> {
     /// Inside a cast: no mark at any depth.
@@ -1280,6 +1357,18 @@ fn emit_expr(cg: &mut Cg, fb: &mut Fb, ctr: &mut Counters, e: &Expr) -> Result<(
             fb.emit(Instr::MakeArray(items.len() as u16));
         }
         Expr::Fn(params, body) => emit_lambda(cg, fb, ctr, params, body)?,
+        Expr::Spawn(e) => {
+            // callee + args, then Spawn leaves the child flow id on the stack
+            let Expr::Call(f, args) = e.as_ref() else {
+                return Err("spawn expects a function call".into());
+            };
+            emit_expr(cg, fb, ctr, f)?;
+            for a in args {
+                emit_expr(cg, fb, ctr, a)?;
+            }
+            fb.emit(Instr::MakeArray(args.len() as u16));
+            fb.emit(Instr::Spawn);
+        }
     }
     Ok(())
 }
@@ -1466,6 +1555,7 @@ impl Renamer {
                 Box::new(self.expr(f)),
                 args.iter().map(|a| self.expr(a)).collect(),
             ),
+            Expr::Spawn(e) => Expr::Spawn(Box::new(self.expr(e))),
             Expr::Unary(op, a) => Expr::Unary(op, Box::new(self.expr(a))),
             Expr::Binary(op, a, b) => {
                 Expr::Binary(op, Box::new(self.expr(a)), Box::new(self.expr(b)))
@@ -2013,6 +2103,7 @@ fn emit_flow_body(
     body: &[Stmt],
 ) -> Result<(), String> {
     check_no_cast_marks(body)?;
+    check_no_loop_marks(body)?;
     let cfg = CfgBuilder::new(prefix).build(body)?;
     let la = liveness(&cfg);
     let mut piece_defs: Vec<BTreeSet<String>> = vec![BTreeSet::new(); cfg.pieces.len()];
@@ -2208,6 +2299,8 @@ fn emit_simple(
             }
             fb.emit(Instr::MakeArray(args.len() as u16));
             fb.emit(Instr::Spawn);
+            // statement position: discard the child handle
+            fb.emit(Instr::Pop);
         }
         Simple::Cast(target, body) => {
             px.ctr.cast_n += 1;
@@ -2728,6 +2821,8 @@ fn emit_stmts(cg: &mut Cg, fb: &mut Fb, ctr: &mut Counters, ss: &[Stmt]) -> Resu
                 }
                 fb.emit(Instr::MakeArray(args.len() as u16));
                 fb.emit(Instr::Spawn);
+                // statement position: discard the child handle
+                fb.emit(Instr::Pop);
             }
             Stmt::Expr(e) => {
                 emit_expr(cg, fb, ctr, e)?;

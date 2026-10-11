@@ -120,8 +120,45 @@ impl Platform for SimPlatform<'_> {
         args: Vec<Value>,
         _prog: &Rc<Program>,
     ) -> Option<Result<Value, String>> {
+        // store.wait parks through the wait registry, not the query path:
+        // append flow id + the flow's read seq so the park is atomic with
+        // the applied-seq check inside the binding.
         self.store.as_mut().map(|b| b.native(id, args))
     }
+
+    fn store_wait(
+        &mut self,
+        path: Value,
+        flow: &str,
+        read_seq: u64,
+        origin: &str,
+    ) -> Option<Result<Value, String>> {
+        let b = self.store.as_mut()?;
+        Some(b.wait(path, flow, read_seq, origin))
+    }
+
+    fn cancel_waiter(&mut self, flow: &str) {
+        if let Some(b) = self.store.as_mut() {
+            b.cancel_waiter(flow);
+        }
+    }
+
+    fn cancel_waiters_of_origin(&mut self, sid: &str) {
+        if let Some(b) = self.store.as_mut() {
+            b.cancel_waiters_of_origin(sid);
+        }
+    }
+
+    fn last_read_seq(&self) -> u64 {
+        self.store.as_ref().and_then(|b| b.applied().ok()).unwrap_or(0)
+    }
+
+    fn drain_woken(&mut self) -> Vec<String> {
+        let w = self.store.as_mut().map(|b| b.drain_woken()).unwrap_or_default();
+        w
+    }
+
+    fn resume_waiter(&mut self, _flow: &str, _value: Value) {}
 }
 
 pub struct Cluster {
@@ -447,6 +484,9 @@ impl Cluster {
             shared: &mut self.shared,
             store: self.store.as_mut(),
         };
+        // Closing a tab ends its flows: parked waiters and hop-suspended
+        // server flows owned by this session die before the hook runs.
+        self.server.kill_origin(&mut platform, addr);
         self.server.session_disconnect(&mut platform, addr, &user);
     }
 
@@ -596,6 +636,11 @@ impl Cluster {
         }
     }
 
+    /// Flow ids parked on the server VM (wait-loop panels sleep here).
+    pub fn server_parked(&self) -> Vec<String> {
+        self.server.parked_flows()
+    }
+
     /// Every VM must have zero suspended flows once the queue is drained; a
     /// leaked flow means a reply was lost or misrouted.
     pub fn assert_quiescent(&self) {
@@ -640,9 +685,23 @@ impl Cluster {
     }
 
     /// Append an event directly (a server-only append, as if from a
-    /// server-origin flow).
+    /// server-origin flow). Parked waiters the commit wakes are resumed
+    /// before returning — the courier delivers even off-flow.
     pub fn append(&mut self, event: Value) -> Result<Value, String> {
-        self.binding().native(NativeId::StoreAppend, vec![event])
+        let out = self.binding().native(NativeId::StoreAppend, vec![event]);
+        let woken = self.binding().drain_woken();
+        if !woken.is_empty() {
+            let mut platform = SimPlatform {
+                label: "server".into(),
+                is_server: true,
+                shared: &mut self.shared,
+                store: self.store.as_mut(),
+            };
+            for flow in woken {
+                self.server.resume_waiter_flow(&mut platform, &flow, Value::str("changed"));
+            }
+        }
+        out
     }
 
     pub fn store_get(&mut self, path: Value) -> Result<Value, String> {

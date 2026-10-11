@@ -57,6 +57,7 @@ pub mod query;
 pub mod runtime;
 mod schema;
 mod shape;
+pub mod watch;
 
 use std::path::Path as FsPath;
 use std::sync::Arc;
@@ -75,6 +76,7 @@ pub use query::{
 pub use runtime::{JsonlLog, Meta, Record, Runtime, Tx};
 pub use schema::{Deque, Leaf, List, Map, Schema, Sum, Summable};
 pub use shape::{Describe, Shape};
+pub use watch::{prefix_overlap, watch_hit, watch_prefix, write_range, WatchRange};
 
 /// Errors returned by durable operations.
 #[derive(Error, Debug)]
@@ -161,6 +163,13 @@ impl Write {
     /// The underlying reified operation.
     pub fn op(&self) -> &Op {
         &self.op
+    }
+
+    /// The key ranges this write touches: exact keys for point ops,
+    /// whole-subtree prefixes for collection pushes and prefix deletes.
+    /// The courier's waking set — what a commit reports about itself.
+    pub fn ranges(&self) -> Vec<WatchRange> {
+        vec![watch::write_range(self)]
     }
 
     /// Consume the write, yielding its operation.
