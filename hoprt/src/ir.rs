@@ -130,7 +130,7 @@ pub enum SchemaDef {
     Record(Vec<(String, SchemaDef)>),
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Program {
     pub consts: Vec<Value>,
     pub fns: Vec<Function>,
