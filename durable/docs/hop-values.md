@@ -56,6 +56,7 @@ strings; anything else is a runtime error. The total order above is the
 ## Maps
 
 - Keys must be scalar. Aggregate keys are a runtime error at insertion.
+  (CBOR itself allows any key type; scalar-only is Hop's ruling on top.)
 - Maps iterate in key order (the total order above). This makes `for k, v
   in pairs m` deterministic — a nondeterminism Lua had and Hop does not.
 - This is the order of *in-memory* maps. Maps read back from the store
@@ -63,6 +64,18 @@ strings; anything else is a runtime error. The total order above is the
   RocksDB, so shorter keys sort first); see `durable/src/codec.rs`.
 - Absent key reads as `nil`; assigning `nil` deletes the key. Absence and
   nil-value are indistinguishable, matching the wire and the store.
+
+### Closed maps (what `record` means)
+
+There is no `record` value kind — that is deliberate. CBOR has maps (major
+type 5), not records, and Hop follows: a "record" is a **map whose keys
+are statically known**, declared in the schema alongside the open `map`
+kind. The language sees a map either way; the declaration only tells the
+store to lay those fields out as declaration-order field-id prefixes (the
+same small-int-keys trick COSE and CWT use) instead of one blob with text
+keys. Reads materialize maps; the schema is where typos get caught.
+Inside a blob there are likewise only maps — a blob "struct" is a map
+with an optional known-keys refinement, never a second struct system.
 
 ## Arrays
 
@@ -91,6 +104,11 @@ the semantic, the payload is plain data. The runtime knows rich operations
 for standard tags (vendored libraries supply *behavior*, never
 *representation*); unknown tags still flow, compare, and persist — you
 can carry a value you don't understand.
+
+On the wire every tag is CBOR tag 27 carrying `["<tag>", payload]` — one
+rule, no special cases. Native CBOR tag numbers (`#inst` → tag 1,
+`#uuid` → tag 37) are a later interop translation at system boundaries,
+not a second representation: internally the string name always wins.
 
 Starter registry:
 
