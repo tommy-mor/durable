@@ -11,6 +11,11 @@
 use crate::{codec, Error, Result};
 
 /// Runtime description of a durable location's shape.
+///
+/// `Record` is a closed map, not a second value kind: the language only
+/// ever sees maps (CBOR has maps, not records), and the field list tells
+/// the store to lay those known keys out as declaration-order field-id
+/// prefixes instead of one blob. Reads materialize plain maps.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Shape {
     Leaf,
