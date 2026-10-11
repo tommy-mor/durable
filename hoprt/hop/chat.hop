@@ -5,11 +5,11 @@
 //
 //   cargo run -p hoprt --bin hopd -- hoprt/hop/chat.hop
 
-server let schema = store.record([
-  ["rooms", store.map(store.record([
-    ["messages", store.list(store.leaf)]
-  ]))]
-]);
+schema {
+  rooms: map<record {
+    messages: list<leaf>
+  }>
+}
 
 fn reduce(event) {
   match event {

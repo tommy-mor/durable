@@ -45,6 +45,9 @@ fn main() -> ExitCode {
     for w in &prog.warnings {
         eprintln!("hopc: warning: {w}");
     }
+    if let Some(s) = prog.schema_listing() {
+        eprintln!("schema: {s}");
+    }
     let mut listing = prog.listing();
     if explain {
         listing.push_str(&prog.explain_listing());

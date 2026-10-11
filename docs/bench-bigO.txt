@@ -1,0 +1,49 @@
+durable BigO benchmarks — filed 2026-10-11, for another time.
+
+Claim to prove: every durable structure keeps its in-memory BigO when the
+dataset is too big to fit in memory. Where it doesn't, document the actual
+behavior next to the promise (design.md should report measured, not hoped).
+
+Why naive RocksDB microbenchmarks lie:
+- block cache + memtable serve hot reads without touching disk; small
+  datasets benchmark the cache, not the structure.
+- compaction state changes scan and merge-fold costs over a run.
+- WAL fsync dominates small-write latency; group commit must be measured
+  separately from single appends.
+- Sum reads fold accumulated merge operands: write pressure silently taxes
+  later reads until compaction.
+
+Methodology (honest numbers only):
+- datasets >> RAM (5-10x), or shrink the block cache (~8MB) and do a cold
+  reopen before each read phase.
+- log-log plots, N = 1e3..1e7, p50/p99 per op, with in-memory baselines on
+  the same ops (Vec, VecDeque, BTreeMap) so slopes are comparable.
+- separate phases, each with stated durability: single append (SyncWal),
+  batch of K appends / append_batch group commit (one fsync), point read,
+  full scan/iter, rebuild from tape, verify.
+- record compaction counts alongside; never report write throughput without
+  saying what compaction debt it bought.
+
+Expectations to confirm (from code, not yet measured):
+- list push: O(1) amortized — len read once per (collection, end) group at
+  commit (Batch::resolve_appends), N element puts + one len put, one WAL
+  flush for the batch.
+- list point read: O(1) — one len get + one element get.
+- list<leaf> full read: O(N) in ONE prefix scan (scan_leaf_children). Good.
+- list<record> full read: O(N*F) point gets (children + per-field
+  materialize). Same BigO, worse constant — confirm the gap, consider a
+  scan path if it matters.
+- map put/get by key: O(1) key math + one point op. keys()/iteration:
+  O(physical keys) prefix scan with first-segment dedup.
+- deque push/pop both ends: O(1), never renumbers (list pop-front is O(N)
+  by contrast — keep that contrast in the docs).
+- sum add: O(1) blind merge, zero reads. sum read: O(merge operands since
+  last compaction) — measure read slowdown under sustained merge pressure.
+- record field write: O(fields written); never whole-record read-modify-
+  write (that is the blob's job — see the leaf/blob schema discussion).
+- rebuild: O(tape) replay; verify: ~2x rebuild + sorted dump compare.
+
+Deliverables: one graph per structure + a table of actuals folded into
+durable/docs/design.md ("measured on <date>, <sizes>, cold cache").
+Open questions: merge-accumulation vs read latency curves; compaction debt
+under sustained append; block-cache sizing guidance for hopd operators.

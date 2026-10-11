@@ -5,7 +5,24 @@
 //!
 //! ```text
 //! item  := "server" "let" name "=" expr ";"        server-side global
+//!        | "schema" "{" field ("," field)* ","? "}"  store schema (core construct)
 //!        | "fn" name "(" params ")" block
+//! field := name ":" type
+//! type  := "leaf" | "sum" | "blob" "<" btype ">"
+//!        | "map" "<" type ">" | "map" "<" key "," type ">"
+//!        | "list" "<" type ">" | "deque" "<" type ">"
+//!        | "record" "{" field ("," field)* ","? "}"
+//! key   := "any" | "string" | "int" | "float" | "bool" | "bytes"
+//! btype := "any" | "string" | "int" | "float" | "bool" | "bytes"
+//!        | "array" "<" btype ">" | "map" "<" btype ">"
+//!        | "map" "<" key "," btype ">" | "map" "{" bfield* "}"
+//! bfield:= name ":" btype                         (closed CBOR map)
+//! ```
+//!
+//! CBOR wins: `record` lives only outside blobs (a closed map with
+//! field-id layout); inside `blob<…>` structs are `map { … }` (text keys,
+//! one opaque key). `list`/`map` with angle brackets are keyspace
+//! collections; `array`/`map` in blob position are CBOR kinds.
 //! stmt  := "let" name "=" expr ";"
 //!        | "server" "!" "(" ")" ";"                placement mark
 //!        | "browser" "!" "(" ")" ";"               placement mark (→ origin)
@@ -47,7 +64,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use crate::ir::{BinOp, Function, HopExplain, Instr, Program, UnOp};
+use crate::ir::{BinOp, BlobDef, Function, HopExplain, Instr, KeyDef, Program, SchemaDef, UnOp};
 use crate::value::Value;
 
 // ---------------------------------------------------------------------------
@@ -67,6 +84,7 @@ enum Tok {
     LBracket,
     RBracket,
     Comma,
+    Colon,
     Semi,
     Bang,
     Dot,
@@ -129,6 +147,17 @@ fn lex(src: &str) -> Result<Vec<Tok>, String> {
             '&' if two('&') => { out.push(Tok::AndAnd); i += 2 }
             '|' if two('|') => { out.push(Tok::OrOr); i += 2 }
             ':' => {
+                // `:keyword` (no space) is a string literal; a bare `:`
+                // followed by space/punctuation is the schema field colon.
+                let is_kw = i + 1 < cs.len()
+                    && (cs[i + 1].is_ascii_alphanumeric()
+                        || cs[i + 1] == '_'
+                        || cs[i + 1] == '-');
+                if !is_kw {
+                    out.push(Tok::Colon);
+                    i += 1;
+                    continue;
+                }
                 i += 1;
                 let start = i;
                 while i < cs.len() && (cs[i].is_ascii_alphanumeric() || cs[i] == '_' || cs[i] == '-') {
@@ -255,6 +284,7 @@ enum Stmt {
 #[derive(Debug)]
 enum Item {
     ServerLet(String, Expr),
+    Schema(SchemaDef),
     Fn(String, Vec<String>, Vec<Stmt>),
 }
 
@@ -324,10 +354,161 @@ impl Parser {
         Ok(params)
     }
 
+    fn schema_fields(&mut self) -> Result<Vec<(String, SchemaDef)>, String> {
+        self.expect(Tok::LBrace)?;
+        let mut out = Vec::new();
+        while !matches!(self.peek(), Some(Tok::RBrace)) {
+            let name = self.ident()?;
+            self.expect(Tok::Colon)?;
+            let t = self.schema_type()?;
+            out.push((name, t));
+            if matches!(self.peek(), Some(Tok::Comma)) {
+                self.pos += 1;
+            }
+        }
+        self.expect(Tok::RBrace)?;
+        Ok(out)
+    }
+
+    fn is_key_name(s: &str) -> bool {
+        matches!(s, "any" | "string" | "int" | "float" | "bool" | "bytes")
+    }
+
+    fn key_def(&mut self) -> Result<KeyDef, String> {
+        match self.next()? {
+            Tok::Ident(s) => match s.as_str() {
+                "any" => Ok(KeyDef::Any),
+                "string" => Ok(KeyDef::String),
+                "int" => Ok(KeyDef::Int),
+                "float" => Ok(KeyDef::Float),
+                "bool" => Ok(KeyDef::Bool),
+                "bytes" => Ok(KeyDef::Bytes),
+                other => Err(format!("unknown map key type {other:?}")),
+            },
+            t => Err(format!("expected a map key type, got {t:?}")),
+        }
+    }
+
+    /// After `map <`: a key form iff the next two tokens are a key-type
+    /// name followed by a comma; otherwise it is the value form.
+    fn map_has_key(&self) -> bool {
+        matches!(self.peek(), Some(Tok::Ident(s)) if Self::is_key_name(s))
+            && matches!(self.peek2(), Some(Tok::Comma))
+    }
+
+    fn schema_type(&mut self) -> Result<SchemaDef, String> {
+        match self.next()? {
+            Tok::Ident(s) => match s.as_str() {
+                "leaf" => Ok(SchemaDef::Leaf),
+                "sum" => Ok(SchemaDef::Sum),
+                "blob" => {
+                    self.expect(Tok::Lt)?;
+                    let b = self.blob_type()?;
+                    self.expect(Tok::Gt)?;
+                    Ok(SchemaDef::Blob(b))
+                }
+                "map" => {
+                    self.expect(Tok::Lt)?;
+                    if self.map_has_key() {
+                        let key = self.key_def()?;
+                        self.expect(Tok::Comma)?;
+                        let of = Box::new(self.schema_type()?);
+                        self.expect(Tok::Gt)?;
+                        Ok(SchemaDef::Map { key, of })
+                    } else {
+                        let of = Box::new(self.schema_type()?);
+                        self.expect(Tok::Gt)?;
+                        Ok(SchemaDef::Map { key: KeyDef::Any, of })
+                    }
+                }
+                "list" => {
+                    self.expect(Tok::Lt)?;
+                    let of = Box::new(self.schema_type()?);
+                    self.expect(Tok::Gt)?;
+                    Ok(SchemaDef::List(of))
+                }
+                "deque" => {
+                    self.expect(Tok::Lt)?;
+                    let of = Box::new(self.schema_type()?);
+                    self.expect(Tok::Gt)?;
+                    Ok(SchemaDef::Deque(of))
+                }
+                "record" => {
+                    let fields = self.schema_fields()?;
+                    Ok(SchemaDef::Record(fields))
+                }
+                other => Err(format!("unknown schema type {other:?}")),
+            },
+            t => Err(format!("expected a schema type, got {t:?}")),
+        }
+    }
+
+    fn blob_type(&mut self) -> Result<BlobDef, String> {
+        match self.next()? {
+            Tok::Ident(s) => match s.as_str() {
+                "any" => Ok(BlobDef::Any),
+                "string" => Ok(BlobDef::String),
+                "int" => Ok(BlobDef::Int),
+                "float" => Ok(BlobDef::Float),
+                "bool" => Ok(BlobDef::Bool),
+                "bytes" => Ok(BlobDef::Bytes),
+                "array" => {
+                    self.expect(Tok::Lt)?;
+                    let of = Box::new(self.blob_type()?);
+                    self.expect(Tok::Gt)?;
+                    Ok(BlobDef::Array(of))
+                }
+                "map" => {
+                    if matches!(self.peek(), Some(Tok::LBrace)) {
+                        self.pos += 1; // {
+                        let mut fields = Vec::new();
+                        while !matches!(self.peek(), Some(Tok::RBrace)) {
+                            let name = self.ident()?;
+                            self.expect(Tok::Colon)?;
+                            let t = self.blob_type()?;
+                            fields.push((name, t));
+                            if matches!(self.peek(), Some(Tok::Comma)) {
+                                self.pos += 1;
+                            }
+                        }
+                        self.expect(Tok::RBrace)?;
+                        Ok(BlobDef::Closed(fields))
+                    } else {
+                        self.expect(Tok::Lt)?;
+                        if self.map_has_key() {
+                            let key = self.key_def()?;
+                            self.expect(Tok::Comma)?;
+                            let of = Box::new(self.blob_type()?);
+                            self.expect(Tok::Gt)?;
+                            Ok(BlobDef::Map { key, of })
+                        } else {
+                            let of = Box::new(self.blob_type()?);
+                            self.expect(Tok::Gt)?;
+                            Ok(BlobDef::Map { key: KeyDef::Any, of })
+                        }
+                    }
+                }
+                "record" => Err("record lives outside blobs; inside blob<…> use map { … }".into()),
+                "list" | "deque" => {
+                    Err(format!("{s} is keyspace syntax; inside blob<…> use array<…>"))
+                }
+                "leaf" => Err("leaf is keyspace syntax; inside blob<…> use any (leaf = blob<any>)".into()),
+                "sum" => Err("sum lives outside blobs; inside blob<…> use int or float".into()),
+                "blob" => Err("blob<…> does not nest; describe the CBOR shape directly".into()),
+                other => Err(format!("unknown blob type {other:?}")),
+            },
+            t => Err(format!("expected a blob type, got {t:?}")),
+        }
+    }
+
     fn items(&mut self) -> Result<Vec<Item>, String> {
         let mut out = Vec::new();
         while self.peek().is_some() {
-            if self.at_kw("server") {
+            if self.at_kw("schema") {
+                self.eat_kw("schema")?;
+                let fields = self.schema_fields()?;
+                out.push(Item::Schema(SchemaDef::Record(fields)));
+            } else if self.at_kw("server") {
                 self.eat_kw("server")?;
                 self.eat_kw("let")?;
                 let name = self.ident()?;
@@ -1803,6 +1984,10 @@ struct Px<'a> {
     /// every locally-bound name in the whole function (warning analysis)
     all_defs: BTreeSet<String>,
     reply_vars: Vec<BTreeSet<String>>,
+    /// pieces that can return: contain a `return`, or mark into a piece
+    /// that can. Their replies carry a `ret` tag so a far piece's return
+    /// stops the caller instead of resuming it.
+    can_ret: Vec<bool>,
     /// vars map each hop piece expects, recorded when its mark is emitted
     ship: Vec<BTreeSet<String>>,
     preds: Vec<Vec<usize>>,
@@ -1839,7 +2024,22 @@ fn emit_flow_body(
         }
     }
     // reply vars are computed at each mark, where the ship set exists:
-    // LiveIn(resume) ∩ (defs of the piece ∪ what crossed into it)
+    // LiveIn(resume) ∩ (defs of the piece ∪ what crossed into it).
+    //
+    // can_ret is computed up front instead: a piece can return if it
+    // contains a `return`, or marks into a piece that can. Children
+    // always have higher indices than their parents (assigned when the
+    // mark is built), so one reverse pass covers nesting.
+    let mut can_ret = vec![false; cfg.pieces.len()];
+    for pi in (1..cfg.pieces.len()).rev() {
+        for b in rpo(&cfg, pi) {
+            match &cfg.blocks[b].term {
+                Term::Return(_) => can_ret[pi] = true,
+                Term::Mark { piece, .. } if can_ret[*piece] => can_ret[pi] = true,
+                _ => {}
+            }
+        }
+    }
     let mut px = Px {
         cg,
         ctr,
@@ -1848,6 +2048,7 @@ fn emit_flow_body(
         piece_defs,
         all_defs,
         reply_vars: vec![BTreeSet::new(); cfg.pieces.len()],
+        can_ret,
         ship: vec![BTreeSet::new(); cfg.pieces.len()],
         preds: preds(&cfg),
         loop_slots: HashMap::new(),
@@ -2080,10 +2281,19 @@ fn emit_simple(
 
 /// The reply of a reply-carrying piece: `{ value, vars }` where vars are
 /// the caller-continuation's live locals this piece defined. The value is
-/// already on the stack.
-fn emit_reply_wrap(px: &mut Px, fb: &mut Fb, pi: usize) -> Result<(), String> {
+/// already on the stack. Pieces that can return tag it `{ ret, value,
+/// vars }` instead — always wrapped, even when `vars` is empty — so the
+/// mark can tell "the function returned" from "resume me".
+fn emit_reply_wrap(px: &mut Px, fb: &mut Fb, pi: usize, ret: bool) -> Result<(), String> {
     let h = fb.hidden_local();
     fb.emit(Instr::StoreLocal(h));
+    let mut n = 2;
+    if px.can_ret[pi] {
+        let k = px.cg.k_str("ret");
+        fb.emit(Instr::Const(k));
+        fb.emit(if ret { Instr::True } else { Instr::False });
+        n = 3;
+    }
     let value_k = px.cg.k_str("value");
     fb.emit(Instr::Const(value_k));
     fb.emit(Instr::LoadLocal(h));
@@ -2101,8 +2311,35 @@ fn emit_reply_wrap(px: &mut Px, fb: &mut Fb, pi: usize) -> Result<(), String> {
         }
     }
     fb.emit(Instr::MakeMap(rv.len() as u16));
-    fb.emit(Instr::MakeMap(2));
+    fb.emit(Instr::MakeMap(n));
     Ok(())
+}
+
+/// Rebind the reply vars from the wrapper already in local `h`.
+fn emit_rebind(
+    px: &mut Px,
+    fb: &mut Fb,
+    scope: &mut BTreeMap<String, u16>,
+    h: u16,
+    rv: &BTreeSet<String>,
+) {
+    let vars_k = px.cg.k_str("vars");
+    for v in rv {
+        fb.emit(Instr::LoadLocal(h));
+        fb.emit(Instr::GetField(vars_k));
+        let vk = px.cg.k_str(v);
+        fb.emit(Instr::GetField(vk));
+        let slot = match px.slots.get(v) {
+            Some(&s) => s,
+            None => {
+                let s = fb.def_local(v);
+                px.slots.insert(v.clone(), s);
+                s
+            }
+        };
+        fb.emit(Instr::StoreLocal(slot));
+        scope.insert(v.clone(), slot);
+    }
 }
 
 fn emit_term(
@@ -2213,6 +2450,39 @@ fn emit_term(
             px.ship[piece] = ship;
             let k = px.cg.k_str(&px.cfg.pieces[piece].hop_id);
             fb.emit(Instr::At(k));
+            if px.can_ret[piece] {
+                // the far piece may have returned: check the tag. On
+                // `ret`, the origin unwraps the value and returns from the
+                // whole function; a nested hop forwards the wrapper
+                // verbatim up a level (its parent expects this shape
+                // because can_ret propagated to it too). Otherwise resume
+                // normally, rebinding from h.vars. The tail-mark shortcut
+                // is skipped here: in a nested piece it would forward the
+                // child's vars as if they were this piece's own.
+                let h = fb.hidden_local();
+                fb.emit(Instr::StoreLocal(h));
+                // did the far side return?
+                fb.emit(Instr::LoadLocal(h));
+                let ret_k = px.cg.k_str("ret");
+                fb.emit(Instr::GetField(ret_k));
+                let j_resume = fb.jump_placeholder(Instr::JumpIfFalse);
+                if pi == 0 {
+                    // origin: unwrap and return from the whole function
+                    fb.emit(Instr::LoadLocal(h));
+                    let value_k = px.cg.k_str("value");
+                    fb.emit(Instr::GetField(value_k));
+                } else {
+                    // nested hop: forward the wrapper verbatim, ret = true.
+                    fb.emit(Instr::LoadLocal(h));
+                }
+                fb.emit(Instr::Return);
+                fb.patch_to_here(j_resume);
+                // normal resume: rebind reply vars from h.vars, then on
+                emit_rebind(px, fb, scope, h, &rv);
+                let j = fb.jump_placeholder(Instr::Jump);
+                px.fixups.push((j, cont));
+                return Ok(());
+            }
             let cont_trivial = px.cfg.blocks[cont].stmts.is_empty()
                 && matches!(px.cfg.blocks[cont].term, Term::Exit);
             let rv = px.reply_vars[piece].clone();
@@ -2229,23 +2499,7 @@ fn emit_term(
                 // far piece defined that the continuation still needs
                 let h = fb.hidden_local();
                 fb.emit(Instr::StoreLocal(h));
-                let vars_k = px.cg.k_str("vars");
-                for v in &rv {
-                    fb.emit(Instr::LoadLocal(h));
-                    fb.emit(Instr::GetField(vars_k));
-                    let vk = px.cg.k_str(v);
-                    fb.emit(Instr::GetField(vk));
-                    let slot = match px.slots.get(v) {
-                        Some(&s) => s,
-                        None => {
-                            let s = fb.def_local(v);
-                            px.slots.insert(v.clone(), s);
-                            s
-                        }
-                    };
-                    fb.emit(Instr::StoreLocal(slot));
-                    scope.insert(v.clone(), slot);
-                }
+                emit_rebind(px, fb, scope, h, &rv);
                 let j = fb.jump_placeholder(Instr::Jump);
                 px.fixups.push((j, cont));
             }
@@ -2255,15 +2509,17 @@ fn emit_term(
                 Some(e) => emit_expr(px.cg, fb, px.ctr, e)?,
                 None => fb.emit(Instr::Nil),
             }
-            if pi > 0 && !px.reply_vars[pi].is_empty() {
-                emit_reply_wrap(px, fb, pi)?;
+            let wrap = px.can_ret[pi] || !px.reply_vars[pi].is_empty();
+            if pi > 0 && wrap {
+                emit_reply_wrap(px, fb, pi, true)?;
             }
             fb.emit(Instr::Return);
         }
         Term::Exit => {
-            if pi > 0 && !px.reply_vars[pi].is_empty() {
+            let wrap = px.can_ret[pi] || !px.reply_vars[pi].is_empty();
+            if pi > 0 && wrap {
                 fb.emit(Instr::Nil);
-                emit_reply_wrap(px, fb, pi)?;
+                emit_reply_wrap(px, fb, pi, false)?;
             } else {
                 // falling off = reply nil, same value as the old chain's
                 // trailing segment
@@ -2489,9 +2745,16 @@ pub fn compile(src: &str) -> Result<Program, String> {
     let items = parser.items()?;
 
     let mut cg = Cg::default();
+    let mut schema: Option<SchemaDef> = None;
 
     for item in &items {
         match item {
+            Item::Schema(def) => {
+                if schema.is_some() {
+                    return Err("duplicate schema block — declare schema { … } once".into());
+                }
+                schema = Some(def.clone());
+            }
             Item::ServerLet(name, e) => {
                 let mut ctr = Counters {
                     fn_name: format!("let:{name}"),
@@ -2527,12 +2790,19 @@ pub fn compile(src: &str) -> Result<Program, String> {
         }
     }
 
+    if schema.is_some() && cg.server_lets.iter().any(|(n, _)| n == "schema") {
+        return Err(
+            "schema { … } conflicts with `server let schema` — use one or the other".into(),
+        );
+    }
+
     Ok(Program {
         consts: cg.consts,
         fns: cg.fns,
         hops: cg.hops,
         named: cg.named,
         server_lets: cg.server_lets,
+        schema,
         explain: cg.explain,
         warnings: cg.warnings,
     })

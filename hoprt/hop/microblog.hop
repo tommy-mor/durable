@@ -7,18 +7,18 @@
 //
 //   cargo run -p hoprt --bin hopd -- hoprt/hop/microblog.hop
 
-server let schema = store.record([
-  ["users", store.map(store.record([
-    ["name", store.leaf]
-  ]))],
-  ["followers", store.map(store.list(store.leaf))],
-  ["posts", store.map(store.record([
-    ["author", store.leaf],
-    ["text", store.leaf]
-  ]))],
-  ["timelines", store.map(store.list(store.leaf))],
-  ["post_count", store.sum]
-]);
+schema {
+  users: map<record {
+    name: leaf
+  }>,
+  followers: map<list<leaf>>,
+  posts: map<record {
+    author: leaf,
+    text: leaf
+  }>,
+  timelines: map<list<leaf>>,
+  post_count: sum
+}
 
 fn reduce(event) {
   match event {
