@@ -7,10 +7,17 @@
 //! whose result did not change (a wasted repaint).
 //!
 //!   cargo test -p durable --test invalidation_lab -- --nocapture
+//!
+//! Parts 1–3 attack query semantics (collecting views, one-way checks,
+//! registration races) on the `Lab` schema. Part 4 attacks the codec and
+//! layout layer (sibling disjointness at every varint width, tag confusion,
+//! hostile keys) plus a schema-walk fuzz over four shapes — ported from the
+//! courier overlap suite, which this file absorbs and replaces.
 
 use ciborium::value::Integer;
 use ciborium::Value;
-use durable::{dynpath, query, Db, Describe, Deque, Durability, Durable, Expr, Leaf, List, Map, Nav, Op, Predicate, Query, Shape, Sum, Write};
+use durable::{dynpath, navs_for, query, Db, Describe, Deque, Durability, Durable, Expr, Leaf, List, Map, Nav, Op, Predicate, Query, Shape, Sum, Write};
+use proptest::prelude::*;
 use tempfile::TempDir;
 
 #[derive(Durable)]
@@ -568,4 +575,598 @@ fn register_after_read_race() {
     println!("      -> stale until the next unrelated write under the same prefix");
     assert_ne!(shown, now);
     assert!(!flagged_at_commit);
+}
+
+// ── part 4: codec and layout soundness ─────────────────────────────────────
+// Ported from the courier overlap suite (now absorbed here). Parts 1–3 show
+// prefix+overlap never misses on query semantics; this part shows the byte
+// prefixes themselves are trustworthy: siblings are disjoint at every
+// uvarint width, tags keep field-0 / map-key-0 / list-index-0 apart, and a
+// schema-walk fuzz asserts `changed ⟹ overlap` across four shapes.
+//
+// Note on the check: `Range::prefix(a).overlaps(&Range::prefix(b))` below is
+// exactly `a.starts_with(b) || b.starts_with(a)` — two prefix ranges either
+// nest or are disjoint, so the one-liner *is* interval overlap. The `Range`
+// machinery stays because part 1 also needs point keys.
+
+/// The one-line bridge, stated plainly.
+fn px_overlap(a: &[u8], b: &[u8]) -> bool {
+    a.starts_with(b) || b.starts_with(a)
+}
+
+fn cn(i: i64) -> Value {
+    Value::Integer(Integer::from(i))
+}
+
+fn cshapes() -> Vec<(&'static str, Shape)> {
+    vec![
+        (
+            "users",
+            Shape::record(vec![
+                (
+                    "users".into(),
+                    Shape::map(Shape::record(vec![
+                        ("name".into(), Shape::Leaf),
+                        ("age".into(), Shape::Leaf),
+                    ])),
+                ),
+                ("total".into(), Shape::Sum),
+                ("title".into(), Shape::Leaf),
+            ]),
+        ),
+        (
+            "feed",
+            Shape::record(vec![
+                ("feed".into(), Shape::list(Shape::Leaf)),
+                ("scores".into(), Shape::map(Shape::Sum)),
+                (
+                    "meta".into(),
+                    Shape::record(vec![
+                        ("cursor".into(), Shape::Leaf),
+                        ("n".into(), Shape::Sum),
+                    ]),
+                ),
+            ]),
+        ),
+        (
+            "mixed",
+            Shape::record(vec![
+                ("dq".into(), Shape::deque(Shape::Leaf)),
+                ("m".into(), Shape::map(Shape::list(Shape::Leaf))),
+                (
+                    "r".into(),
+                    Shape::record(vec![
+                        ("a".into(), Shape::Leaf),
+                        ("b".into(), Shape::Leaf),
+                    ]),
+                ),
+            ]),
+        ),
+        (
+            "deep",
+            Shape::record(vec![(
+                "l".into(),
+                Shape::list(Shape::map(Shape::record(vec![("x".into(), Shape::Leaf)]))),
+            )]),
+        ),
+    ]
+}
+
+#[test]
+fn codec_siblings_disjoint_at_all_varint_widths() {
+    // 17000 fields so field ids cross uvarint widths (0, 1, 127, 128,
+    // 16383, 16384): a shorter id encoding must never prefix a longer one.
+    let fields: Vec<(String, Shape)> =
+        (0..17000).map(|ii| (format!("f{ii}"), Shape::Leaf)).collect();
+    let schema = Shape::record(vec![
+        ("wide".into(), Shape::record(fields)),
+        ("m".into(), Shape::map(Shape::Leaf)),
+        ("l".into(), Shape::list(Shape::Leaf)),
+    ]);
+
+    let wide = dynpath::resolve(&schema, None, &[Nav::Field("wide".into())])
+        .unwrap()
+        .prefix;
+    let mut kids = Vec::new();
+    for ii in [0u64, 1, 5, 126, 127, 128, 129, 1000, 16383, 16384, 16999] {
+        let navs = vec![Nav::Field("wide".into()), Nav::Field(format!("f{ii}"))];
+        let p = dynpath::resolve(&schema, None, &navs).unwrap().prefix;
+        assert!(px_overlap(&p, &wide), "child must overlap its parent");
+        kids.push(p);
+    }
+    for (aa, a) in kids.iter().enumerate() {
+        for b in &kids[aa + 1..] {
+            assert!(!px_overlap(a, b), "sibling fields overlap: {a:?} vs {b:?}");
+        }
+    }
+    let m = dynpath::resolve(&schema, None, &[Nav::Field("m".into())])
+        .unwrap()
+        .prefix;
+    let l = dynpath::resolve(&schema, None, &[Nav::Field("l".into())])
+        .unwrap()
+        .prefix;
+    assert!(!px_overlap(&wide, &m));
+    assert!(!px_overlap(&wide, &l));
+    assert!(!px_overlap(&m, &l));
+}
+
+#[test]
+fn codec_tags_and_hostile_keys_stay_disjoint() {
+    // field id 0 encodes as [0x00]; a list index opens with TAG_INDEX
+    // (0x00); map key int 0 encodes as CBOR [0x00]. As bare segments they
+    // share prefixes — as length-prefixed child keys they must not.
+    let schema = Shape::record(vec![
+        ("rec".into(), Shape::record(vec![("f0".into(), Shape::Leaf)])),
+        ("map".into(), Shape::map(Shape::Leaf)),
+        ("list".into(), Shape::list(Shape::Leaf)),
+    ]);
+    let f0 = dynpath::resolve(
+        &schema,
+        None,
+        &[Nav::Field("rec".into()), Nav::Field("f0".into())],
+    )
+    .unwrap()
+    .prefix;
+    let k0 = dynpath::resolve(&schema, None, &[Nav::Field("map".into()), Nav::Key(cn(0))])
+        .unwrap()
+        .prefix;
+    let i0 = dynpath::resolve(
+        &schema,
+        None,
+        &[Nav::Field("list".into()), Nav::Index(0)],
+    )
+    .unwrap()
+    .prefix;
+    assert!(!px_overlap(&f0, &k0), "field-id 0 vs map-key 0: {f0:?} vs {k0:?}");
+    assert!(!px_overlap(&f0, &i0), "field-id 0 vs list-idx 0: {f0:?} vs {i0:?}");
+    assert!(!px_overlap(&k0, &i0), "map-key 0 vs list-idx 0: {k0:?} vs {i0:?}");
+
+    // …and hostile key bytes (empty, 0x00/0x01-led, long) stay disjoint.
+    let mut keys = vec![cn(0), cn(1), cn(127), cn(256), t(""), t("a"), t("ab")];
+    keys.push(Value::Bytes(vec![0x00]));
+    keys.push(Value::Bytes(vec![0x01, 0x02]));
+    let mut ps = Vec::new();
+    for kk in &keys {
+        ps.push(
+            dynpath::resolve(&schema, None, &[Nav::Field("map".into()), Nav::Key(kk.clone())])
+                .unwrap()
+                .prefix,
+        );
+    }
+    for (aa, a) in ps.iter().enumerate() {
+        for b in &ps[aa + 1..] {
+            assert!(!px_overlap(a, b), "map keys overlap: {a:?} vs {b:?}");
+        }
+    }
+}
+
+#[test]
+fn codec_delete_prefix_hits_parent_not_sibling() {
+    let schema = cshapes()[0].1.clone();
+    let w = dynpath::delete(
+        &schema,
+        None,
+        &navs_for(&schema, &[t("users"), t("alice")]).unwrap(),
+    )
+    .unwrap();
+    let ws = std::slice::from_ref(&w);
+    let hit = |steps: &[Value]| {
+        let navs = navs_for(&schema, steps).unwrap();
+        flag_bidir(&Range::prefix(&read_prefix(&schema, &navs)), ws)
+    };
+    for steps in [
+        vec![t("users")],
+        vec![t("users"), t("alice")],
+        vec![t("users"), t("alice"), t("name")],
+    ] {
+        assert!(hit(&steps), "delete must hit {steps:?}");
+    }
+    assert!(!hit(&[t("users"), t("bob")]));
+    assert!(!hit(&[t("title")]));
+}
+
+#[test]
+fn codec_sum_merge_overlaps_its_point_read() {
+    let schema = cshapes()[0].1.clone();
+    let navs = navs_for(&schema, &[t("total")]).unwrap();
+    let w = dynpath::add(&schema, None, &navs, &cn(1)).unwrap();
+    let ws = std::slice::from_ref(&w);
+    assert!(flag_bidir(&Range::prefix(&read_prefix(&schema, &navs)), ws));
+    let other = navs_for(&schema, &[t("title")]).unwrap();
+    assert!(!flag_bidir(&Range::prefix(&read_prefix(&schema, &other)), ws));
+}
+
+#[test]
+fn codec_missing_key_creation_overlaps() {
+    // A read of an absent key answers Null from the location, not the
+    // storage: the location prefix is the read set, so creating it hits.
+    let (_d, db) = open();
+    let schema = cshapes()[0].1.clone();
+    let navs = navs_for(&schema, &[t("users"), t("nobody")]).unwrap();
+    let q = Query::new(navs.clone());
+    assert_eq!(query::subtree(&db, &schema, &q).unwrap(), Value::Null);
+    let w = dynpath::put(
+        &schema,
+        None,
+        &navs,
+        &Value::Map(vec![(t("name"), t("zed"))]),
+    )
+    .unwrap();
+    let name_navs = navs_for(&schema, &[t("users"), t("nobody"), t("name")]).unwrap();
+    assert!(flag_bidir(&Range::prefix(&read_prefix(&schema, &name_navs)), &w));
+    db.apply(&w, Durability::DisableWal).unwrap();
+    assert_eq!(
+        query::subtree(&db, &schema, &q).unwrap(),
+        Value::Map(vec![(t("name"), t("zed")), (t("age"), Value::Null)])
+    );
+}
+
+#[test]
+fn codec_list_push_overlaps_point_and_range_reads() {
+    let (_d, db) = open();
+    let schema = cshapes()[1].1.clone();
+    let at = |steps: &[Value]| navs_for(&schema, steps).unwrap();
+    let w = dynpath::push(&schema, None, &at(&[t("feed")]), &t("hello")).unwrap();
+    db.apply(std::slice::from_ref(&w), Durability::DisableWal).unwrap();
+
+    let ws = std::slice::from_ref(&w);
+    assert!(flag_bidir(&Range::prefix(&read_prefix(&schema, &at(&[t("feed")]))), ws));
+    assert!(flag_bidir(
+        &Range::prefix(&read_prefix(&schema, &at(&[t("feed"), cn(0)]))),
+        ws
+    ));
+    assert!(!flag_bidir(
+        &Range::prefix(&read_prefix(&schema, &at(&[t("scores"), t("a")]))),
+        ws
+    ));
+    // deque in the SAME schema family lives under a disjoint prefix.
+    let mixed = cshapes()[2].1.clone();
+    let dw = dynpath::push(
+        &mixed,
+        None,
+        &navs_for(&mixed, &[t("dq")]).unwrap(),
+        &cn(9),
+    )
+    .unwrap();
+    let ra = navs_for(&mixed, &[t("r"), t("a")]).unwrap();
+    assert!(!flag_bidir(
+        &Range::prefix(&read_prefix(&mixed, &ra)),
+        std::slice::from_ref(&dw)
+    ));
+}
+
+#[test]
+fn codec_root_matches_everything() {
+    // The empty prefix is every key's prefix: a root read overlaps all
+    // writes. Trivial, but load-bearing — the match-all subscription.
+    assert!(px_overlap(&[], &[0x01]));
+    assert!(px_overlap(&[0x01], &[]));
+    assert!(px_overlap(&[], &[]));
+}
+
+// ── part 4b: schema-walk fuzz over four shapes ─────────────────────────────
+// Complements part 2's query-heavy fuzz on `Lab` with shape-heavy coverage:
+// random walks down records/maps/lists/deques, half the reads aimed at the
+// write so pairs interact (uncorrelated fuzzing proves nothing).
+
+struct CodecRng(u64);
+
+impl CodecRng {
+    fn next(&mut self, nn: u64) -> u64 {
+        // xorshift64*: deterministic per seed, no new deps.
+        let mut x = self.0 | 1;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.0 = x;
+        (x.wrapping_mul(0x2545F4914F6CDD1D) >> 11) % nn.max(1)
+    }
+}
+
+fn cgen_scalar_leaf(r: &mut CodecRng) -> Value {
+    match r.next(4) {
+        0 => cn(r.next(6) as i64),
+        1 => t(["", "a", "b"][r.next(3) as usize]),
+        2 => Value::Bool(r.next(2) == 0),
+        _ => Value::Null,
+    }
+}
+
+fn cgen_scalar(r: &mut CodecRng) -> Value {
+    match r.next(6) {
+        0 => cn(r.next(6) as i64),
+        1 => t(["", "a", "b", "x"][r.next(4) as usize]),
+        2 => Value::Bool(r.next(2) == 0),
+        3 => Value::Null,
+        4 => Value::Array((0..r.next(3)).map(|_| cgen_scalar_leaf(r)).collect()),
+        _ => Value::Map(
+            (0..r.next(3))
+                .map(|ii| (t(["p", "q"][ii as usize % 2]), cgen_scalar_leaf(r)))
+                .collect(),
+        ),
+    }
+}
+
+fn ckey_pool(r: &mut CodecRng) -> Value {
+    match r.next(6) {
+        0 => cn(r.next(4) as i64),
+        1 => t(["a", "b", ""][r.next(3) as usize]),
+        2 => Value::Bool(true),
+        3 => cn(127),
+        4 => cn(128),
+        _ => t("user"),
+    }
+}
+
+/// Random walk down the schema. `for_write` stops at put/add/push/del
+/// targets; reads may descend into leaf interiors (in-memory).
+fn cwalk(r: &mut CodecRng, shape: &Shape, steps: &mut Vec<Value>, for_write: bool) {
+    let mut cur = shape;
+    for _ in 0..4 {
+        match cur {
+            Shape::Record { fields } => {
+                if fields.is_empty() || (for_write && r.next(3) == 0) {
+                    return;
+                }
+                let ii = r.next(fields.len() as u64) as usize;
+                steps.push(t(&fields[ii].0));
+                cur = &fields[ii].1;
+            }
+            Shape::Map { of } => {
+                if for_write && r.next(3) == 0 {
+                    return;
+                }
+                steps.push(ckey_pool(r));
+                cur = of;
+            }
+            Shape::List { of } | Shape::Deque { of } => {
+                if for_write && r.next(3) == 0 {
+                    return;
+                }
+                steps.push(cn(r.next(5) as i64));
+                cur = of;
+            }
+            Shape::Leaf | Shape::Sum => return,
+        }
+    }
+}
+
+fn cshape_at<'a>(shape: &'a Shape, navs: &[Nav]) -> Option<&'a Shape> {
+    let mut cur = shape;
+    for nav in navs {
+        match (cur, nav) {
+            (Shape::Record { fields: fs }, Nav::Field(name)) => {
+                cur = &fs.iter().find(|(nn, _)| nn == name)?.1;
+            }
+            (Shape::Map { of }, Nav::Key(_)) | (Shape::Map { of }, Nav::Field(_)) => cur = of,
+            (Shape::List { of }, Nav::Index(_))
+            | (Shape::Deque { of }, Nav::Index(_))
+            | (Shape::List { of }, Nav::Key(_))
+            | (Shape::Deque { of }, Nav::Key(_)) => cur = of,
+            _ => return None,
+        }
+    }
+    Some(cur)
+}
+
+fn cshape_at_one<'a>(shape: &'a Shape, nav: &Nav) -> Option<&'a Shape> {
+    match (shape, nav) {
+        (Shape::Record { fields: fs }, Nav::Field(name)) => {
+            fs.iter().find(|(nn, _)| nn == name).map(|(_, s)| s)
+        }
+        (Shape::Map { of }, Nav::Key(_)) | (Shape::Map { of }, Nav::Field(_)) => Some(of),
+        (Shape::List { of }, Nav::Index(_))
+        | (Shape::Deque { of }, Nav::Index(_))
+        | (Shape::List { of }, Nav::Key(_))
+        | (Shape::Deque { of }, Nav::Key(_)) => Some(of),
+        (Shape::Leaf, _) => Some(shape),
+        _ => None,
+    }
+}
+
+fn cgen_put_record(r: &mut CodecRng, fs: &[(String, Shape)]) -> Value {
+    let mut pairs = Vec::new();
+    for (name, _) in fs {
+        if r.next(2) == 0 {
+            pairs.push((t(name), cgen_scalar_leaf(r)));
+        }
+    }
+    Value::Map(pairs)
+}
+
+/// Plant a collecting nav at the first collection node of a nav run
+/// (independent-side reads).
+fn cplant_collector(r: &mut CodecRng, schema: &Shape, rnavs: &mut Vec<Nav>) {
+    let mut cut = None;
+    let mut cur = schema;
+    for (ii, nav) in rnavs.iter().enumerate() {
+        match (cur, nav) {
+            (Shape::Map { .. } | Shape::List { .. } | Shape::Deque { .. }, _) => {
+                cut = Some(ii);
+                break;
+            }
+            (s, nn) => match cshape_at_one(s, nn) {
+                Some(next) => cur = next,
+                None => break,
+            },
+        }
+    }
+    if let Some(ii) = cut {
+        let coll = match r.next(7) {
+            0 => Nav::All,
+            1 => Nav::Entries,
+            2 => Nav::Keys,
+            3 => Nav::Values,
+            4 => Nav::First,
+            5 => Nav::Slice {
+                start: Some(r.next(3)),
+                end: if r.next(2) == 0 {
+                    Some(1 + r.next(3))
+                } else {
+                    None
+                },
+            },
+            _ => Nav::Where(durable::Predicate::Eq(
+                durable::Expr::Field("name".into()),
+                durable::Expr::Lit(t("a")),
+            )),
+        };
+        rnavs.truncate(ii + 1);
+        rnavs.push(coll);
+    }
+}
+
+fn cread_eval(db: &Db, schema: &Shape, qq: &Query, collecting: bool) -> Option<String> {
+    let v = if collecting {
+        query::select(db, schema, qq).ok().map(|vs| format!("{vs:?}"))?
+    } else {
+        match qq.navs.len() % 3 {
+            0 => query::subtree(db, schema, qq).ok().map(|vv| format!("{vv:?}"))?,
+            1 => query::one(db, schema, qq).ok().map(|vv| format!("{vv:?}"))?,
+            _ => query::has(db, schema, qq).ok().map(|vv| format!("{vv:?}"))?,
+        }
+    };
+    Some(v)
+}
+
+fn crun_fuzz(seed: u64) -> (u64, u64, u64) {
+    let (_d, db) = open();
+    let schemas = cshapes();
+    let mut changed_n = 0u64;
+    let mut overlap_n = 0u64;
+    let mut iters = 0u64;
+
+    for round in 0..300 {
+        let mut r = CodecRng(seed.wrapping_add((round as u64).wrapping_mul(0x9E3779B97F4A7C15)));
+        let schema = &schemas[r.next(schemas.len() as u64) as usize].1;
+
+        // ---- random write ----
+        let mut wsteps = Vec::new();
+        cwalk(&mut r, schema, &mut wsteps, true);
+        let wnavs = match navs_for(schema, &wsteps) {
+            Ok(nn) => nn,
+            Err(_) => continue,
+        };
+        let target = match cshape_at(schema, &wnavs) {
+            Some(s) => s,
+            None => continue,
+        };
+        let writes: Vec<Write> = match r.next(5) {
+            0 => match target {
+                Shape::Leaf => match dynpath::put(schema, None, &wnavs, &cgen_scalar(&mut r)) {
+                    Ok(w) => w,
+                    Err(_) => continue,
+                },
+                Shape::Sum => match dynpath::put(schema, None, &wnavs, &cn(r.next(10) as i64)) {
+                    Ok(w) => w,
+                    Err(_) => continue,
+                },
+                Shape::Record { .. } => {
+                    let Shape::Record { fields: fs } = target else { continue };
+                    match dynpath::put(schema, None, &wnavs, &cgen_put_record(&mut r, fs)) {
+                        Ok(w) => w,
+                        Err(_) => continue,
+                    }
+                }
+                _ => continue,
+            },
+            1 => match target {
+                Shape::Sum => match dynpath::add(schema, None, &wnavs, &cn(1 + r.next(5) as i64)) {
+                    Ok(w) => vec![w],
+                    Err(_) => continue,
+                },
+                _ => continue,
+            },
+            2 => match dynpath::push(schema, None, &wnavs, &cgen_scalar_leaf(&mut r)) {
+                Ok(w) => vec![w],
+                Err(_) => continue,
+            },
+            3 => match dynpath::delete(schema, None, &wnavs) {
+                Ok(w) => vec![w],
+                Err(_) => continue,
+            },
+            _ => match dynpath::clear(schema, None, &wnavs) {
+                Ok(w) => vec![w],
+                Err(_) => continue,
+            },
+        };
+        if writes.is_empty() {
+            continue;
+        }
+
+        // ---- random read: half the time, read AT the write so the pair
+        // interacts; otherwise wander independently for the negative side.
+        let rnavs: Vec<Nav> = if r.next(2) == 0 && !wnavs.is_empty() {
+            let cut = r.next(wnavs.len() as u64 + 1) as usize;
+            let mut v: Vec<Nav> = wnavs[..cut.min(wnavs.len())].to_vec();
+            if r.next(3) == 0 {
+                if let Some(s) = cshape_at(schema, &v) {
+                    match s {
+                        Shape::Map { .. } | Shape::List { .. } | Shape::Deque { .. } => {
+                            v.push(match r.next(3) {
+                                0 => Nav::All,
+                                1 => Nav::Entries,
+                                _ => Nav::Values,
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            v
+        } else {
+            let mut rsteps = Vec::new();
+            cwalk(&mut r, schema, &mut rsteps, false);
+            let mut v = match navs_for(schema, &rsteps) {
+                Ok(nn) => nn,
+                Err(_) => continue,
+            };
+            if r.next(3) == 0 {
+                cplant_collector(&mut r, schema, &mut v);
+            }
+            v
+        };
+        let qq = Query::new(rnavs.clone());
+        let collecting = qq.is_collecting();
+        let before = match cread_eval(&db, schema, &qq, collecting) {
+            Some(v) => v,
+            None => continue,
+        };
+
+        if db.apply(&writes, Durability::DisableWal).is_err() {
+            continue;
+        }
+        let after = match cread_eval(&db, schema, &qq, collecting) {
+            Some(v) => v,
+            None => continue,
+        };
+        iters += 1;
+
+        let changed = before != after;
+        let hit = flag_bidir(&Range::prefix(&read_prefix(&schema, &rnavs)), &writes);
+        if changed {
+            changed_n += 1;
+            assert!(
+                hit,
+                "MISSED INVALIDATION\nschema steps write={wsteps:?} read navs={rnavs:?}\nbefore={before:?}\nafter={after:?}"
+            );
+        }
+        if hit {
+            overlap_n += 1;
+        }
+    }
+    (iters, changed_n, overlap_n)
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 64, .. ProptestConfig::default() })]
+    #[test]
+    fn codec_fuzz_changed_implies_overlap(seed in any::<u64>()) {
+        let (iters, changed, overlapped) = crun_fuzz(seed);
+        // Every seed must exercise real changes, or the fuzz is vacuous.
+        prop_assert!(iters > 40, "too few iterations: {iters}");
+        prop_assert!(changed > 0, "no read ever changed — fuzz writes nothing?");
+        // …and overlap must fire (else the courier never repaints).
+        prop_assert!(overlapped > 0, "overlap never fired — read sets broken?");
+    }
 }

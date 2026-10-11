@@ -255,7 +255,8 @@ the design above.
   parent resumes its continuation. In a loop it keeps hopping after the
   return. Fix: replies from pieces that can return carry a `ret` flag, and
   each mark checks it (forwarding up through nested pieces). Reproduced with
-  a probe test; not yet fixed.
+  a probe test; fixed on `cursor/early-return-770a` (PR #8) with a 4-test
+  `hoprt/tests/early_return.rs` suite — this note predates the fix.
 - **Identity should be stamped on events at ingest, like `seq`.** `append`
   stamps `seq` and `ts_ms` but not who. Ranking's votes carry no voter and
   take scope/winner/loser from the client. Agent passes `uid` from browser
