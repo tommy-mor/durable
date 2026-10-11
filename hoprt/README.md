@@ -13,12 +13,12 @@ server, the simulated cluster for tests, and the module batteries.
 ## The smallest app
 
 ```hop
-server let schema = store.record([
-  ["todos", store.list(store.record([
-    ["text", store.leaf],
-    ["done", store.leaf]
-  ]))]
-]);
+schema {
+  todos: list<record {
+    text: leaf,
+    done: leaf
+  }>
+}
 
 fn reduce(event) {
   match event {
@@ -50,8 +50,9 @@ fn todo_view(todos) {
 }
 ```
 
-An `hop` file declares **items**: `server let` (a global evaluated once on
-the server at boot — config, constants) and `fn` (flows).
+An `hop` file declares **items**: `schema { … }` (the store's shape —
+see below), `server let` (a global evaluated once on the server at boot
+— config, constants) and `fn` (flows).
 
 A **flow** is a function that may cross the network. Flows originate in the
 browser (a button's `onclick`, `on_connect`, `spawn`) or in the server
@@ -102,14 +103,14 @@ only way state changes is `store.append(event)` inside a server flow; your
 **reduce** function folds events into the projection.
 
 ```hop
-server let schema = store.record([
-  ["guardian", store.record([
-    ["ticks", store.sum],        // a counter; missing reads as 0
-    ["err", store.leaf]          // a scalar; missing reads as nil
-  ])],
-  ["files", store.map(store.record([...]))],   // a map of records
-  ["feed", store.list(store.leaf)]             // an append-only list
-]);
+schema {
+  guardian: record {
+    ticks: sum,        // a counter; missing reads as 0
+    err: leaf          // a scalar; missing reads as nil
+  },
+  files: map<record { ... }>,   // a map of records
+  feed: list<leaf>              // an append-only list
+}
 
 fn reduce(event) {
   match event {
@@ -123,7 +124,10 @@ fn reduce(event) {
 
 Reads are path-based: `store(["files", path])`, `store.items(["files"])`
 (map entries as records with the key merged in as `id` — ready for
-`for i, f in ...` rendering). Store maps iterate in *encoded key* order: a
+`for i, f in ...` rendering). Map keys are `any` by default; naming a
+key kind (`map<string, …>`) validates reducer writes, as do `blob<…>`
+shapes for opaque CBOR values (`map` inside, `record` outside — see
+`durable/docs/hop-store.md`). Store maps iterate in *encoded key* order: a
 key's bytes are length-prefixed in RocksDB, so shorter keys come first
 (`"b"` before `"aa"`). This differs from the VM's value order for
 in-memory maps; sort explicitly when display order matters.

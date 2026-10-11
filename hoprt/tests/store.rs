@@ -105,3 +105,151 @@ fn rebuild_from_tape_matches_live() {
     let created = host.store_get(arr(vec![s("stats"), s("created")])).unwrap();
     assert_eq!(created, i(2));
 }
+
+// ---------------------------------------------------------------------------
+// First-class `schema { … }`: map inside blobs, record outside, key kinds
+// ---------------------------------------------------------------------------
+
+const BLOCKED: &str = r#"
+schema {
+  todos: map<int, record { text: leaf, done: leaf }>,
+  stats: record { created: sum, completed: sum }
+}
+
+fn reduce(event) {
+  match event {
+    add { id, text } => {
+      store(["todos", id, store.set({ text = text, done = false })]);
+      store(["stats", "created", store.add(1)]);
+    }
+  }
+}
+"#;
+
+fn event(kind: &str, fields: Vec<(Value, Value)>) -> Value {
+    let mut entries: Vec<(Value, Value)> = vec![(Value::str("type"), Value::str(kind))];
+    entries.extend(fields);
+    Value::map(entries.into_iter().collect())
+}
+
+#[test]
+fn schema_block_binds_writes_and_verifies() {
+    let mut host = Cluster::new(&["A"], BLOCKED, false).expect("host");
+    host.append(event("add", vec![(s("id"), i(7)), (s("text"), s("milk"))]))
+        .unwrap();
+    let text = host.store_get(arr(vec![s("todos"), i(7), s("text")])).unwrap();
+    assert_eq!(text, s("milk"));
+    let created = host.store_get(arr(vec![s("stats"), s("created")])).unwrap();
+    assert_eq!(created, i(1));
+    host.verify().unwrap();
+}
+
+#[test]
+fn schema_listing_renders_nested_generics() {
+    let prog = hoprt::compiler::compile(BLOCKED).expect("compile");
+    assert_eq!(
+        prog.schema_listing().as_deref(),
+        Some(
+            "schema { todos: map<int, record { text: leaf, done: leaf }>, \
+             stats: record { created: sum, completed: sum } }"
+        )
+    );
+}
+
+#[test]
+fn map_key_violations_fail_at_append() {
+    let mut host = Cluster::new(&["A"], BLOCKED, false).expect("host");
+    // id is a string; todos wants int keys — the reducer fails fast.
+    let err = host
+        .append(event("add", vec![(s("id"), s("oops")), (s("text"), s("milk"))]))
+        .expect_err("string key into map<int> should fail");
+    assert!(err.contains("must be int"), "{err}");
+}
+
+const BLOBBED: &str = r#"
+schema {
+  threads: map<record {
+    title: leaf,
+    msgs: list<blob<map {
+      role: string,
+      text: string,
+      call_id: string
+    }>>
+  }>
+}
+
+fn reduce(event) {
+  match event {
+    say { tid, text } => {
+      store(["threads", tid, "msgs", store.push({ role = "user", text = text })]);
+    }
+    bad { tid } => {
+      store(["threads", tid, "msgs", store.push({ role = "user", text = "hi", call_id = 42 })]);
+    }
+    extra { tid } => {
+      store(["threads", tid, "msgs", store.push({ role = "user", text = "hi", nick = "bob" })]);
+    }
+  }
+}
+"#;
+
+#[test]
+fn blob_values_validate_absent_fields_and_extras() {
+    let mut host = Cluster::new(&["A"], BLOBBED, false).expect("host");
+    // absent call_id is fine (absent fields read as nil)…
+    host.append(event("say", vec![(s("tid"), i(1)), (s("text"), s("hello"))]))
+        .unwrap();
+    // …and unknown fields are tolerated (forward compat)…
+    host.append(event("extra", vec![(s("tid"), i(1))])).unwrap();
+    let first = host
+        .store_get(arr(vec![s("threads"), i(1), s("msgs"), i(0)]))
+        .unwrap();
+    assert_eq!(first.get_field("role"), s("user"));
+    assert_eq!(first.get_field("text"), s("hello"));
+    host.verify().unwrap();
+}
+
+#[test]
+fn blob_shape_violations_fail_at_append() {
+    let mut host = Cluster::new(&["A"], BLOBBED, false).expect("host");
+    // call_id is declared string; 42 is not.
+    let err = host
+        .append(event("bad", vec![(s("tid"), i(1))]))
+        .expect_err("int call_id into string field should fail");
+    assert!(err.contains("must be string"), "{err}");
+}
+
+#[test]
+fn schema_syntax_errors() {
+    let cases = vec![
+        (
+            "unknown type",
+            "schema { a: frobnicate }\nfn reduce(event) { return event; }",
+            "unknown schema type",
+        ),
+        (
+            "record in blob",
+            "schema { a: blob<record { x: any }> }\nfn reduce(event) { return event; }",
+            "inside blob",
+        ),
+        (
+            "list in blob",
+            "schema { a: blob<list<any>> }\nfn reduce(event) { return event; }",
+            "inside blob",
+        ),
+        (
+            "duplicate block",
+            "schema { a: leaf }\nschema { b: leaf }\nfn reduce(event) { return event; }",
+            "duplicate schema block",
+        ),
+        (
+            "legacy conflict",
+            "schema { a: leaf }\nserver let schema = store.leaf;\nfn reduce(event) { return event; }",
+            "conflicts with `server let schema`",
+        ),
+    ];
+    for (name, src, want) in cases {
+        let err = hoprt::compiler::compile(src).unwrap_err();
+        assert!(err.contains(want), "{name}: expected {want:?}, got {err:?}");
+    }
+}

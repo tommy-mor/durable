@@ -95,14 +95,47 @@ fn reduce(event) {
 }
 ```
 
+## Declaring the schema
+
+The schema is a core block, not a runtime value:
+
+```text
+schema {
+  todos: map<int, record { text: leaf, done: leaf }>,
+  stats: record { created: sum, completed: sum },
+  drafts: list<blob<map { role: string, text: string }>>
+}
+```
+
+Keyspace types: `leaf | sum | blob<…> | map<T> | map<K,V> | list<T> |
+deque<T> | record { … }`. Map keys are `any` by default (today's dynamic
+scalars); naming one (`string | int | float | bool | bytes`) validates
+writes and documents intent. `record` lives only here — a closed map
+with field-id layout, never a value kind.
+
+Inside `blob<…>` is the CBOR value language: `any | string | int |
+float | bool | bytes | array<T> | map<T> | map<K,V> | map { closed
+fields }`. `leaf` is `blob<any>` spelled short. Structs here are `map {
+… }` (text keys, one opaque key); `record`/`list`/`sum`/`leaf` inside a
+blob are compile errors that say so. `nil` is accepted for any blob
+type, absent closed-map fields read as `nil`, and extras are tolerated —
+a newer writer must not brick an older reader.
+
+The layout is all the engine needs; the declaration additionally
+validates reducer writes, failing fast at append: wrong map key kinds,
+and blob values that don't match. Reads stay tolerant (they must be —
+old tapes outlive new schemas), and the legacy `server let schema =
+store.record(…)` form still binds, with no validation.
+
 ## The rest of the module
 
-Field access on `store` also provides the schema shape constructors
-(`store.record`, `store.map`, `store.list`, `store.deque`, `store.leaf`,
-`store.sum`), view sugar `store.items(path)` (map entries as records with
-the key merged in as `id`), `store.has(path)` (presence — see below), and
-`store.verify()` (replay the tape, compare projections — the conformance
-check tests lean on).
+Field access on `store` also provides view sugar `store.items(path)` (map
+entries as records with the key merged in as `id`), `store.has(path)`
+(presence — see below), and `store.verify()` (replay the tape, compare
+projections — the conformance check tests lean on). The legacy schema
+form — the `store.record` / `store.map` / `store.list` / `store.deque` /
+`store.leaf` / `store.sum` shape constructors as a `server let schema`
+value — still binds, with the same layout and no write validation.
 
 ### Presence: `store.has(path)`
 

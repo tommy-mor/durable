@@ -19,22 +19,52 @@ use std::rc::Rc;
 use durable::{dynpath, Query, Runtime, Shape, Tx};
 
 use crate::interp::{self, Exec, Globals, Host, NativeOut, Outcome};
-use crate::ir::Program;
+use crate::ir::{BlobDef, KeyDef, Program, SchemaDef};
 use crate::rt::Vm;
 use crate::value::{from_cbor, from_json, to_cbor, to_json, NativeId, Value};
 
 pub struct StoreBinding {
     rt: Runtime<serde_json::Value>,
     schema: Shape,
+    /// First-class `schema { … }` declaration, when the app uses it. The
+    /// layout (`schema`) is all durable needs; this drives write-time
+    /// validation of map key kinds and blob shapes.
+    validation: Option<SchemaDef>,
+}
+
+/// Lower a first-class schema to its durable key layout. Key constraints
+/// vanish (today's maps stay dynamic) and blobs are opaque leaves — one
+/// CBOR value under one key.
+fn schema_from_def(def: &SchemaDef) -> Shape {
+    match def {
+        SchemaDef::Leaf => Shape::Leaf,
+        SchemaDef::Sum => Shape::Sum,
+        SchemaDef::Map { of, .. } => Shape::map(schema_from_def(of)),
+        SchemaDef::List(of) => Shape::list(schema_from_def(of)),
+        SchemaDef::Deque(of) => Shape::deque(schema_from_def(of)),
+        SchemaDef::Record(fields) => Shape::record(
+            fields
+                .iter()
+                .map(|(n, t)| (n.clone(), schema_from_def(t)))
+                .collect(),
+        ),
+        SchemaDef::Blob(_) => Shape::Leaf,
+    }
 }
 
 /// If the app defined `schema` and `reduce`, open the runtime and bind it.
 pub fn bind(vm: &Vm, data_dir: &Path) -> Result<Option<StoreBinding>, String> {
-    let schema_v = vm.globals.get("schema");
-    if matches!(schema_v, Value::Nil) {
-        return Ok(None);
-    }
-    let schema = value_shape(&schema_v)?;
+    let (schema, validation) = if let Some(def) = &vm.prog.schema {
+        (schema_from_def(def), Some(def.clone()))
+    } else {
+        let schema_v = vm.globals.get("schema");
+        if matches!(schema_v, Value::Nil) {
+            return Ok(None);
+        }
+        // Legacy `server let schema = store.record(…)`: same layout, no
+        // key/blob validation — old apps keep old semantics.
+        (value_shape(&schema_v)?, None)
+    };
     let Some(&reduce_idx) = vm.prog.named.get("reduce") else {
         return Err("schema is set but reduce is missing — define fn reduce(tx, event)".into());
     };
@@ -46,6 +76,7 @@ pub fn bind(vm: &Vm, data_dir: &Path) -> Result<Option<StoreBinding>, String> {
     let prog = vm.prog.clone();
     let globals_snapshot = Rc::new(vm.globals.clone());
     let schema_for_reduce = schema.clone();
+    let validation_for_reduce = validation.clone();
 
     // Runtime requires Send + Sync reducers (it is shareable across
     // threads), but this reducer wraps Rc-based interpreter state that
@@ -55,8 +86,16 @@ pub fn bind(vm: &Vm, data_dir: &Path) -> Result<Option<StoreBinding>, String> {
     unsafe impl<F> Send for AssertSingleThread<F> {}
     unsafe impl<F> Sync for AssertSingleThread<F> {}
     let reducer = AssertSingleThread(move |tx: &mut Tx, event: &serde_json::Value| {
-        run_reduce(&prog, reduce_idx, &globals_snapshot, &schema_for_reduce, tx, event)
-            .map_err(durable::Error::Reducer)
+        run_reduce(
+            &prog,
+            reduce_idx,
+            &globals_snapshot,
+            &schema_for_reduce,
+            &validation_for_reduce,
+            tx,
+            event,
+        )
+        .map_err(durable::Error::Reducer)
     });
     // capture the whole wrapper (not the `.0` field, which 2021 precise
     // capture would otherwise reach through, defeating the assertion)
@@ -67,7 +106,7 @@ pub fn bind(vm: &Vm, data_dir: &Path) -> Result<Option<StoreBinding>, String> {
 
     let rt = Runtime::open(db_path, log_path, schema.clone(), None, reducer)
         .map_err(|e| e.to_string())?;
-    Ok(Some(StoreBinding { rt, schema }))
+    Ok(Some(StoreBinding { rt, schema, validation }))
 }
 
 impl StoreBinding {
@@ -221,6 +260,7 @@ fn run_reduce(
     reduce_idx: usize,
     globals_snapshot: &Rc<Globals>,
     schema: &Shape,
+    validation: &Option<SchemaDef>,
     tx: &mut Tx,
     event: &serde_json::Value,
 ) -> Result<(), String> {
@@ -233,6 +273,7 @@ fn run_reduce(
 
     let mut host = ReduceHost {
         schema,
+        validation,
         db: tx.db().clone(),
         writes: Vec::new(),
     };
@@ -254,6 +295,7 @@ fn run_reduce(
 
 struct ReduceHost<'a> {
     schema: &'a Shape,
+    validation: &'a Option<SchemaDef>,
     db: durable::Db,
     writes: Vec<durable::Write>,
 }
@@ -287,6 +329,238 @@ impl Host for ReduceHost<'_> {
 }
 
 impl ReduceHost<'_> {
+    /// Validate a write path's map keys against the declared key kinds.
+    /// Returns the schema at the path's target for value validation.
+    /// `None` means a legacy app (no `schema { … }`): skip everything.
+    /// Reads never call this — they stay tolerant.
+    fn check_path(&self, navs: &[durable::Nav]) -> Result<Option<&SchemaDef>, String> {
+        let Some(def) = self.validation.as_ref() else {
+            return Ok(None);
+        };
+        Ok(Some(resolve_def(def, navs)?))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Write-time validation against `schema { … }`
+//
+// The layout (`Shape`) is what durable needs; this walks the richer
+// `SchemaDef` alongside the write's navs and checks what the layout
+// cannot say: map key kinds, and blob (opaque-leaf) shapes. Reads stay
+// tolerant — only reducer writes fail. Anything this accepts, durable
+// still checks (shapes, sums, indices); anything durable rejects, this
+// never rescues.
+// ---------------------------------------------------------------------------
+
+/// Walk a schema along write navs to the target, checking map keys on
+/// the way down. Collecting combinators cannot appear in a write path.
+fn resolve_def<'a>(def: &'a SchemaDef, navs: &[durable::Nav]) -> Result<&'a SchemaDef, String> {
+    let mut cur = def;
+    for nav in navs {
+        cur = match (cur, nav) {
+            (SchemaDef::Record(fields), durable::Nav::Field(name)) => fields
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, t)| t)
+                .ok_or_else(|| format!("record has no field {name:?}"))?,
+            (SchemaDef::Record(_), durable::Nav::Key(_)) => {
+                return Err("key/index on a record — address fields by name".into());
+            }
+            (
+                SchemaDef::Map { key, of },
+                durable::Nav::Key(k),
+            ) => {
+                let k = from_cbor(k).map_err(|e| format!("bad map key: {e}"))?;
+                check_key(&k, key)?;
+                of
+            }
+            (SchemaDef::Map { key, of }, durable::Nav::Field(name)) => {
+                check_key(&Value::str(name.as_str()), key)?;
+                of
+            }
+            (SchemaDef::List(of) | SchemaDef::Deque(of), durable::Nav::Index(_)) => of,
+            (SchemaDef::List(_), durable::Nav::Key(_)) => {
+                return Err("integer Key on List required; use Index".into());
+            }
+            (SchemaDef::Deque(_), durable::Nav::Key(_)) => {
+                return Err("Deque writes use Index (logical) or push/clear".into());
+            }
+            (SchemaDef::Blob(_), _) => {
+                return Err("write path entered a blob<…>; put the whole blob".into());
+            }
+            (SchemaDef::Leaf, _) => cur,
+            (SchemaDef::Sum, _) => {
+                return Err("cannot navigate into a sum".into());
+            }
+            (def, nav) => {
+                return Err(format!(
+                    "cannot navigate {nav:?} on a {}",
+                    schema_kind(def)
+                ));
+            }
+        };
+    }
+    Ok(cur)
+}
+
+fn schema_kind(def: &SchemaDef) -> &'static str {
+    match def {
+        SchemaDef::Leaf => "leaf",
+        SchemaDef::Sum => "sum",
+        SchemaDef::Map { .. } => "map",
+        SchemaDef::List(_) => "list",
+        SchemaDef::Deque(_) => "deque",
+        SchemaDef::Record(_) => "record",
+        SchemaDef::Blob(_) => "blob",
+    }
+}
+
+/// Unwrap `#tag` envelopes: a tagged key counts by its payload kind —
+/// tags travel on the value, not in the kind the schema constrains.
+fn strip_tag(mut v: &Value) -> &Value {
+    while let Value::Tagged(t) = v {
+        v = &t.1;
+    }
+    v
+}
+
+fn check_key(key: &Value, def: &KeyDef) -> Result<(), String> {
+    match def {
+        KeyDef::Any => Ok(()),
+        KeyDef::String => match strip_tag(key) {
+            Value::Str(_) => Ok(()),
+            other => Err(format!("map key must be string, got {}", other.kind())),
+        },
+        KeyDef::Int => match strip_tag(key) {
+            Value::Int(_) => Ok(()),
+            other => Err(format!("map key must be int, got {}", other.kind())),
+        },
+        KeyDef::Float => match strip_tag(key) {
+            Value::Float(_) => Ok(()),
+            other => Err(format!("map key must be float, got {}", other.kind())),
+        },
+        KeyDef::Bool => match strip_tag(key) {
+            Value::Bool(_) => Ok(()),
+            other => Err(format!("map key must be bool, got {}", other.kind())),
+        },
+        KeyDef::Bytes => match strip_tag(key) {
+            Value::Bytes(_) => Ok(()),
+            other => Err(format!("map key must be bytes, got {}", other.kind())),
+        },
+    }
+}
+
+/// Validate a `store.set` value against its target: record puts expand
+/// per field exactly like `dynpath::put_at` (absent fields read as nil
+/// either way, extras are ignored there too), and blob leaves check
+/// their CBOR shape. Whole-collection puts are durable's error.
+fn check_set(v: &Value, def: &SchemaDef) -> Result<(), String> {
+    match def {
+        SchemaDef::Leaf => Ok(()),
+        SchemaDef::Sum => match strip_tag(v) {
+            Value::Int(_) | Value::Float(_) => Ok(()),
+            other => Err(format!("sum value must be numeric, got {}", other.kind())),
+        },
+        SchemaDef::Map { .. } | SchemaDef::List(_) | SchemaDef::Deque(_) => Ok(()),
+        SchemaDef::Record(fields) => {
+            if matches!(v, Value::Nil) {
+                return Ok(());
+            }
+            let Value::Map(_) = v else {
+                return Err(format!("record value must be a map, got {}", v.kind()));
+            };
+            for (name, child) in fields {
+                let child_val = v.get_field(name);
+                if matches!(child_val, Value::Nil)
+                    && !matches!(child, SchemaDef::Leaf | SchemaDef::Blob(_))
+                {
+                    continue;
+                }
+                check_set(&child_val, child)
+                    .map_err(|e| format!("field {name:?}: {e}"))?;
+            }
+            Ok(())
+        }
+        SchemaDef::Blob(b) => check_blob(v, b),
+    }
+}
+
+/// Validate a `store.push` element: the list's element type, same value
+/// rules as `store.set` at that type.
+fn check_push(v: &Value, def: &SchemaDef) -> Result<(), String> {
+    match def {
+        SchemaDef::List(of) | SchemaDef::Deque(of) => check_set(v, of),
+        _ => Ok(()),
+    }
+}
+
+/// Validate one opaque value against its declared CBOR shape. `nil` is
+/// always accepted: absence and nil-value are one thing, matching the
+/// value model. Closed maps tolerate extras (a newer writer must not
+/// brick an older reader) and absent fields (they read as nil).
+fn check_blob(v: &Value, b: &BlobDef) -> Result<(), String> {
+    if matches!(v, Value::Nil) {
+        return Ok(());
+    }
+    match b {
+        BlobDef::Any => Ok(()),
+        BlobDef::String => match v {
+            Value::Str(_) => Ok(()),
+            other => Err(format!("blob must be string, got {}", other.kind())),
+        },
+        BlobDef::Int => match v {
+            Value::Int(_) => Ok(()),
+            other => Err(format!("blob must be int, got {}", other.kind())),
+        },
+        BlobDef::Float => match v {
+            Value::Float(_) => Ok(()),
+            other => Err(format!("blob must be float, got {}", other.kind())),
+        },
+        BlobDef::Bool => match v {
+            Value::Bool(_) => Ok(()),
+            other => Err(format!("blob must be bool, got {}", other.kind())),
+        },
+        BlobDef::Bytes => match v {
+            Value::Bytes(_) => Ok(()),
+            other => Err(format!("blob must be bytes, got {}", other.kind())),
+        },
+        BlobDef::Array(of) => {
+            let Value::Array(items) = v else {
+                return Err(format!("blob must be array, got {}", v.kind()));
+            };
+            for item in items.borrow().iter() {
+                check_blob(item, of)?;
+            }
+            Ok(())
+        }
+        BlobDef::Map { key, of } => {
+            let Value::Map(entries) = v else {
+                return Err(format!("blob must be map, got {}", v.kind()));
+            };
+            for (k, val) in entries.borrow().iter() {
+                check_key(k, key)?;
+                check_blob(val, of).map_err(|e| format!("key {k}: {e}"))?;
+            }
+            Ok(())
+        }
+        BlobDef::Closed(fields) => {
+            let Value::Map(_) = v else {
+                return Err(format!("blob must be map, got {}", v.kind()));
+            };
+            for (name, child) in fields {
+                let child_val = v.get_field(name);
+                if matches!(child_val, Value::Nil) {
+                    continue;
+                }
+                check_blob(&child_val, child)
+                    .map_err(|e| format!("field {name:?}: {e}"))?;
+            }
+            Ok(())
+        }
+    }
+}
+
+impl ReduceHost<'_> {
     fn native_value(&mut self, id: NativeId, args: Vec<Value>) -> Result<Value, String> {
         match id {
             // the same one function. Here a terminal navigator is legal:
@@ -314,6 +588,10 @@ impl ReduceHost<'_> {
                         }
                     }
                     Some(Term::Set(v)) => {
+                        let target = self.check_path(&navs)?;
+                        if let Some(def) = target {
+                            check_set(&v, def)?;
+                        }
                         let val = to_cbor(&v)?;
                         let ws = dynpath::put(self.schema, None, &navs, &val)
                             .map_err(|e| e.to_string())?;
@@ -321,6 +599,7 @@ impl ReduceHost<'_> {
                         Ok(Value::Nil)
                     }
                     Some(Term::Add(v)) => {
+                        self.check_path(&navs)?;
                         let val = to_cbor(&v)?;
                         let w = dynpath::add(self.schema, None, &navs, &val)
                             .map_err(|e| e.to_string())?;
@@ -328,6 +607,10 @@ impl ReduceHost<'_> {
                         Ok(Value::Nil)
                     }
                     Some(Term::Push(v)) => {
+                        let target = self.check_path(&navs)?;
+                        if let Some(def) = target {
+                            check_push(&v, def)?;
+                        }
                         let val = to_cbor(&v)?;
                         let w = dynpath::push(self.schema, None, &navs, &val)
                             .map_err(|e| e.to_string())?;
@@ -335,6 +618,7 @@ impl ReduceHost<'_> {
                         Ok(Value::Nil)
                     }
                     Some(Term::Del) => {
+                        self.check_path(&navs)?;
                         let w = dynpath::delete(self.schema, None, &navs)
                             .map_err(|e| e.to_string())?;
                         self.writes.push(w);

@@ -5,7 +5,24 @@
 //!
 //! ```text
 //! item  := "server" "let" name "=" expr ";"        server-side global
+//!        | "schema" "{" field ("," field)* ","? "}"  store schema (core construct)
 //!        | "fn" name "(" params ")" block
+//! field := name ":" type
+//! type  := "leaf" | "sum" | "blob" "<" btype ">"
+//!        | "map" "<" type ">" | "map" "<" key "," type ">"
+//!        | "list" "<" type ">" | "deque" "<" type ">"
+//!        | "record" "{" field ("," field)* ","? "}"
+//! key   := "any" | "string" | "int" | "float" | "bool" | "bytes"
+//! btype := "any" | "string" | "int" | "float" | "bool" | "bytes"
+//!        | "array" "<" btype ">" | "map" "<" btype ">"
+//!        | "map" "<" key "," btype ">" | "map" "{" bfield* "}"
+//! bfield:= name ":" btype                         (closed CBOR map)
+//! ```
+//!
+//! CBOR wins: `record` lives only outside blobs (a closed map with
+//! field-id layout); inside `blob<…>` structs are `map { … }` (text keys,
+//! one opaque key). `list`/`map` with angle brackets are keyspace
+//! collections; `array`/`map` in blob position are CBOR kinds.
 //! stmt  := "let" name "=" expr ";"
 //!        | "server" "!" "(" ")" ";"                placement mark
 //!        | "browser" "!" "(" ")" ";"               placement mark (→ origin)
@@ -47,7 +64,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use crate::ir::{BinOp, Function, HopExplain, Instr, Program, UnOp};
+use crate::ir::{BinOp, BlobDef, Function, HopExplain, Instr, KeyDef, Program, SchemaDef, UnOp};
 use crate::value::Value;
 
 // ---------------------------------------------------------------------------
@@ -67,6 +84,7 @@ enum Tok {
     LBracket,
     RBracket,
     Comma,
+    Colon,
     Semi,
     Bang,
     Dot,
@@ -129,6 +147,17 @@ fn lex(src: &str) -> Result<Vec<Tok>, String> {
             '&' if two('&') => { out.push(Tok::AndAnd); i += 2 }
             '|' if two('|') => { out.push(Tok::OrOr); i += 2 }
             ':' => {
+                // `:keyword` (no space) is a string literal; a bare `:`
+                // followed by space/punctuation is the schema field colon.
+                let is_kw = i + 1 < cs.len()
+                    && (cs[i + 1].is_ascii_alphanumeric()
+                        || cs[i + 1] == '_'
+                        || cs[i + 1] == '-');
+                if !is_kw {
+                    out.push(Tok::Colon);
+                    i += 1;
+                    continue;
+                }
                 i += 1;
                 let start = i;
                 while i < cs.len() && (cs[i].is_ascii_alphanumeric() || cs[i] == '_' || cs[i] == '-') {
@@ -255,6 +284,7 @@ enum Stmt {
 #[derive(Debug)]
 enum Item {
     ServerLet(String, Expr),
+    Schema(SchemaDef),
     Fn(String, Vec<String>, Vec<Stmt>),
 }
 
@@ -324,10 +354,161 @@ impl Parser {
         Ok(params)
     }
 
+    fn schema_fields(&mut self) -> Result<Vec<(String, SchemaDef)>, String> {
+        self.expect(Tok::LBrace)?;
+        let mut out = Vec::new();
+        while !matches!(self.peek(), Some(Tok::RBrace)) {
+            let name = self.ident()?;
+            self.expect(Tok::Colon)?;
+            let t = self.schema_type()?;
+            out.push((name, t));
+            if matches!(self.peek(), Some(Tok::Comma)) {
+                self.pos += 1;
+            }
+        }
+        self.expect(Tok::RBrace)?;
+        Ok(out)
+    }
+
+    fn is_key_name(s: &str) -> bool {
+        matches!(s, "any" | "string" | "int" | "float" | "bool" | "bytes")
+    }
+
+    fn key_def(&mut self) -> Result<KeyDef, String> {
+        match self.next()? {
+            Tok::Ident(s) => match s.as_str() {
+                "any" => Ok(KeyDef::Any),
+                "string" => Ok(KeyDef::String),
+                "int" => Ok(KeyDef::Int),
+                "float" => Ok(KeyDef::Float),
+                "bool" => Ok(KeyDef::Bool),
+                "bytes" => Ok(KeyDef::Bytes),
+                other => Err(format!("unknown map key type {other:?}")),
+            },
+            t => Err(format!("expected a map key type, got {t:?}")),
+        }
+    }
+
+    /// After `map <`: a key form iff the next two tokens are a key-type
+    /// name followed by a comma; otherwise it is the value form.
+    fn map_has_key(&self) -> bool {
+        matches!(self.peek(), Some(Tok::Ident(s)) if Self::is_key_name(s))
+            && matches!(self.peek2(), Some(Tok::Comma))
+    }
+
+    fn schema_type(&mut self) -> Result<SchemaDef, String> {
+        match self.next()? {
+            Tok::Ident(s) => match s.as_str() {
+                "leaf" => Ok(SchemaDef::Leaf),
+                "sum" => Ok(SchemaDef::Sum),
+                "blob" => {
+                    self.expect(Tok::Lt)?;
+                    let b = self.blob_type()?;
+                    self.expect(Tok::Gt)?;
+                    Ok(SchemaDef::Blob(b))
+                }
+                "map" => {
+                    self.expect(Tok::Lt)?;
+                    if self.map_has_key() {
+                        let key = self.key_def()?;
+                        self.expect(Tok::Comma)?;
+                        let of = Box::new(self.schema_type()?);
+                        self.expect(Tok::Gt)?;
+                        Ok(SchemaDef::Map { key, of })
+                    } else {
+                        let of = Box::new(self.schema_type()?);
+                        self.expect(Tok::Gt)?;
+                        Ok(SchemaDef::Map { key: KeyDef::Any, of })
+                    }
+                }
+                "list" => {
+                    self.expect(Tok::Lt)?;
+                    let of = Box::new(self.schema_type()?);
+                    self.expect(Tok::Gt)?;
+                    Ok(SchemaDef::List(of))
+                }
+                "deque" => {
+                    self.expect(Tok::Lt)?;
+                    let of = Box::new(self.schema_type()?);
+                    self.expect(Tok::Gt)?;
+                    Ok(SchemaDef::Deque(of))
+                }
+                "record" => {
+                    let fields = self.schema_fields()?;
+                    Ok(SchemaDef::Record(fields))
+                }
+                other => Err(format!("unknown schema type {other:?}")),
+            },
+            t => Err(format!("expected a schema type, got {t:?}")),
+        }
+    }
+
+    fn blob_type(&mut self) -> Result<BlobDef, String> {
+        match self.next()? {
+            Tok::Ident(s) => match s.as_str() {
+                "any" => Ok(BlobDef::Any),
+                "string" => Ok(BlobDef::String),
+                "int" => Ok(BlobDef::Int),
+                "float" => Ok(BlobDef::Float),
+                "bool" => Ok(BlobDef::Bool),
+                "bytes" => Ok(BlobDef::Bytes),
+                "array" => {
+                    self.expect(Tok::Lt)?;
+                    let of = Box::new(self.blob_type()?);
+                    self.expect(Tok::Gt)?;
+                    Ok(BlobDef::Array(of))
+                }
+                "map" => {
+                    if matches!(self.peek(), Some(Tok::LBrace)) {
+                        self.pos += 1; // {
+                        let mut fields = Vec::new();
+                        while !matches!(self.peek(), Some(Tok::RBrace)) {
+                            let name = self.ident()?;
+                            self.expect(Tok::Colon)?;
+                            let t = self.blob_type()?;
+                            fields.push((name, t));
+                            if matches!(self.peek(), Some(Tok::Comma)) {
+                                self.pos += 1;
+                            }
+                        }
+                        self.expect(Tok::RBrace)?;
+                        Ok(BlobDef::Closed(fields))
+                    } else {
+                        self.expect(Tok::Lt)?;
+                        if self.map_has_key() {
+                            let key = self.key_def()?;
+                            self.expect(Tok::Comma)?;
+                            let of = Box::new(self.blob_type()?);
+                            self.expect(Tok::Gt)?;
+                            Ok(BlobDef::Map { key, of })
+                        } else {
+                            let of = Box::new(self.blob_type()?);
+                            self.expect(Tok::Gt)?;
+                            Ok(BlobDef::Map { key: KeyDef::Any, of })
+                        }
+                    }
+                }
+                "record" => Err("record lives outside blobs; inside blob<…> use map { … }".into()),
+                "list" | "deque" => {
+                    Err(format!("{s} is keyspace syntax; inside blob<…> use array<…>"))
+                }
+                "leaf" => Err("leaf is keyspace syntax; inside blob<…> use any (leaf = blob<any>)".into()),
+                "sum" => Err("sum lives outside blobs; inside blob<…> use int or float".into()),
+                "blob" => Err("blob<…> does not nest; describe the CBOR shape directly".into()),
+                other => Err(format!("unknown blob type {other:?}")),
+            },
+            t => Err(format!("expected a blob type, got {t:?}")),
+        }
+    }
+
     fn items(&mut self) -> Result<Vec<Item>, String> {
         let mut out = Vec::new();
         while self.peek().is_some() {
-            if self.at_kw("server") {
+            if self.at_kw("schema") {
+                self.eat_kw("schema")?;
+                let fields = self.schema_fields()?;
+                out.push(Item::Schema(SchemaDef::Record(fields)));
+            } else if self.at_kw("server") {
                 self.eat_kw("server")?;
                 self.eat_kw("let")?;
                 let name = self.ident()?;
@@ -2489,9 +2670,16 @@ pub fn compile(src: &str) -> Result<Program, String> {
     let items = parser.items()?;
 
     let mut cg = Cg::default();
+    let mut schema: Option<SchemaDef> = None;
 
     for item in &items {
         match item {
+            Item::Schema(def) => {
+                if schema.is_some() {
+                    return Err("duplicate schema block — declare schema { … } once".into());
+                }
+                schema = Some(def.clone());
+            }
             Item::ServerLet(name, e) => {
                 let mut ctr = Counters {
                     fn_name: format!("let:{name}"),
@@ -2527,12 +2715,19 @@ pub fn compile(src: &str) -> Result<Program, String> {
         }
     }
 
+    if schema.is_some() && cg.server_lets.iter().any(|(n, _)| n == "schema") {
+        return Err(
+            "schema { … } conflicts with `server let schema` — use one or the other".into(),
+        );
+    }
+
     Ok(Program {
         consts: cg.consts,
         fns: cg.fns,
         hops: cg.hops,
         named: cg.named,
         server_lets: cg.server_lets,
+        schema,
         explain: cg.explain,
         warnings: cg.warnings,
     })

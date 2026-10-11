@@ -9,12 +9,12 @@
 //
 //   cargo run -p hoprt --bin hopd -- hoprt/hop/file_browser.hop --fs-root .
 
-server let schema = store.record([
-  ["cwd", store.leaf],        // current directory, "" = the fs root
-  ["entries", store.leaf],    // last listing: [{ name, dir }]
-  ["selected", store.leaf],   // picked file path (nil until one is chosen)
-  ["err", store.leaf]
-]);
+schema {
+  cwd: leaf,        // current directory, "" = the fs root
+  entries: leaf,    // last listing: [{ name, dir }]
+  selected: leaf,   // picked file path (nil until one is chosen)
+  err: leaf
+}
 
 fn reduce(event) {
   match event {
