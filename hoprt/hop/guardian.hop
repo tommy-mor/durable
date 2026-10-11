@@ -12,27 +12,27 @@
 //     --set slug_token=<dev-slug-token> \
 //     --fs-root /Users/tommy/programming/slug-star/slug
 
-server let schema = store.record([
-  ["guardian", store.record([
-    ["running", store.leaf],
-    ["judging", store.leaf],
-    ["judging_at", store.leaf],
-    ["view", store.leaf],
-    ["ticks", store.sum],
-    ["err", store.leaf],
-    ["prompt", store.leaf]
-  ])],
-  ["files", store.map(store.record([
-    ["url", store.leaf],
-    ["lines", store.leaf]
-  ]))],
-  ["billing", store.record([
-    ["prompt", store.sum],
-    ["completion", store.sum],
-    ["calls", store.sum]
-  ])],
-  ["feed", store.list(store.leaf)]
-]);
+schema {
+  guardian: record {
+    running: leaf,
+    judging: leaf,
+    judging_at: leaf,
+    view: leaf,
+    ticks: sum,
+    err: leaf,
+    prompt: leaf
+  },
+  files: map<record {
+    url: leaf,
+    lines: leaf
+  }>,
+  billing: record {
+    prompt: sum,
+    completion: sum,
+    calls: sum
+  },
+  feed: list<leaf>
+}
 
 server let tick_every_ms = 800;
 server let slug_url = "http://localhost:8080";

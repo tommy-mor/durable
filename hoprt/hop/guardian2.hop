@@ -13,16 +13,16 @@
 //
 //   cargo run -p hoprt --bin hopd -- hoprt/hop/guardian2.hop --set or_key=<key>
 
-server let schema = store.record([
-  ["items", store.list(store.leaf)],   // items[i] = the text under judgment
-  ["edges", store.list(store.leaf)],   // [winner, loser, weight] triples — the tape
-  ["votes", store.sum],
-  ["cursor", store.leaf],              // turbovoter schedule position
-  ["running", store.leaf],
-  ["model", store.leaf],               // selected decision model (nil = offline)
-  ["feed", store.list(store.leaf)],
-  ["err", store.leaf]
-]);
+schema {
+  items: list<leaf>,   // items[i] = the text under judgment
+  edges: list<leaf>,   // [winner, loser, weight] triples — the tape
+  votes: sum,
+  cursor: leaf,        // turbovoter schedule position
+  running: leaf,
+  model: leaf,         // selected decision model (nil = offline)
+  feed: list<leaf>,
+  err: leaf
+}
 
 server let tick_every_ms = 150;
 server let or_url = "https://openrouter.ai/api/v1/systemone";
