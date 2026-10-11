@@ -17,6 +17,7 @@ pub mod harness;
 pub mod interp;
 pub mod ir;
 pub mod modules;
+pub mod rank;
 pub mod rt;
 #[cfg(feature = "server")]
 pub mod serve;

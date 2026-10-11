@@ -317,6 +317,10 @@ impl Cluster {
                 let cwd = std::env::current_dir().ok();
                 reply(crate::serve::fs_run(&op, &path, cwd.as_deref()))
             }
+            "env" => {
+                let name = crate::value::coerce_str(&vars.get_field("name"));
+                reply(std::env::var(&name).map(Value::str).unwrap_or(Value::Nil))
+            }
             "git" => {
                 let op = crate::value::coerce_str(&vars.get_field("op"));
                 let cwd = std::env::current_dir().ok();

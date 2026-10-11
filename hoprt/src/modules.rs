@@ -65,6 +65,8 @@ fn builtin_modules() -> Vec<Module> {
         time_module(),
         fs_module(),
         git_module(),
+        env_module(),
+        crate::rank::rank_module(),
     ]
 }
 
@@ -344,8 +346,34 @@ fn str_module() -> Module {
             NativeDef { name: "str.cut", kind: NativeKind::Pure(str_cut) },
             NativeDef { name: "str.strip", kind: NativeKind::Pure(str_strip) },
             NativeDef { name: "str.replace", kind: NativeKind::Pure(str_replace) },
+NativeDef { name: "str.dirname", kind: NativeKind::Pure(str_dirname) },
+            NativeDef { name: "str.lines", kind: NativeKind::Pure(str_lines) },
         ],
     }
+}
+
+// ---------------------------------------------------------------------------
+// env — read a process environment variable. Server-side only: env is an
+// Effect, so the wasm/browser VM can never see the host's process env and an
+// API key stays out of the browser. hopd's load_dotenv feeds `.env` into the
+// process env first, so `env.get("OPENAI_API_KEY")` reads the same key the
+// llm module already trusts.
+// ---------------------------------------------------------------------------
+
+fn env_module() -> Module {
+    Module {
+        name: "env",
+        natives: vec![NativeDef {
+            name: "env.get",
+            kind: NativeKind::Effect { hop: "env", vars: env_vars },
+        }],
+    }
+}
+
+fn env_vars(args: Vec<Value>) -> Result<Value, String> {
+    let mut m = BTreeMap::new();
+    m.insert(Value::str("name"), args.first().cloned().unwrap_or(Value::Nil));
+    Ok(Value::map(m))
 }
 
 // ---------------------------------------------------------------------------
@@ -423,6 +451,29 @@ fn str_replace(args: Vec<Value>) -> Result<Value, String> {
     Ok(Value::str(text.replace(&from, to)))
 }
 
+/// str.lines(s) → array of lines. Splits on newlines (`str::lines`, so
+/// CRLF-safe and a trailing newline yields no phantom empty line). A whole
+/// file's text becomes a corpus to rank — the "measure every line" entrance.
+fn str_lines(args: Vec<Value>) -> Result<Value, String> {
+    let Some(s) = args.first().and_then(Value::as_str) else {
+        return Err("str.lines expects a string".into());
+    };
+    Ok(Value::array(s.lines().map(|l| Value::str(l)).collect()))
+}
+
+/// str.dirname(s) → the parent path, POSIX dirname over '/'. "a/b/c" → "a/b",
+/// "a" → "", "" → "". The file browser's "up" gesture.
+fn str_dirname(args: Vec<Value>) -> Result<Value, String> {
+    let Some(s) = args.first().and_then(Value::as_str) else {
+        return Err("str.dirname expects a string".into());
+    };
+    let parent = std::path::Path::new(s)
+        .parent()
+        .and_then(|p| p.to_str())
+        .unwrap_or("");
+    Ok(Value::str(parent))
+}
+
 // ---------------------------------------------------------------------------
 // fs — rooted file reads for agents: evidence gathering without a shell and
 // without a Python sidecar. The executor (hopd) holds the ONLY path policy:
@@ -443,6 +494,10 @@ fn fs_module() -> Module {
                 name: "fs.count_lines",
                 kind: NativeKind::Effect { hop: "fs", vars: fs_count_lines_vars },
             },
+            NativeDef {
+                name: "fs.list",
+                kind: NativeKind::Effect { hop: "fs", vars: fs_list_vars },
+            },
         ],
     }
 }
@@ -455,6 +510,12 @@ fn fs_read_vars(args: Vec<Value>) -> Result<Value, String> {
 /// fs.count_lines(path) → { ok, lines } — wc -l without the shell.
 fn fs_count_lines_vars(args: Vec<Value>) -> Result<Value, String> {
     fs_path_vars(args, "count_lines", "fs.count_lines(path)")
+}
+
+/// fs.list(path) → { ok, entries = [{ name, dir }, …] } — the directory's
+/// entries, directories first then files, each sorted.
+fn fs_list_vars(args: Vec<Value>) -> Result<Value, String> {
+    fs_path_vars(args, "list", "fs.list(path)")
 }
 
 fn fs_path_vars(args: Vec<Value>, op: &'static str, sig: &str) -> Result<Value, String> {

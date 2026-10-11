@@ -904,6 +904,7 @@ pub(crate) fn fs_resolve(root: Option<&Path>, path: &str) -> Result<PathBuf, Str
 
 /// The `fs` effect: rooted file reads. Replies { ok, text } for "read",
 /// { ok, lines } for "count_lines" (wc -l semantics: newline count),
+/// { ok, entries } for "list" (directories first, then files, each sorted),
 /// { ok: false, error } on refusal or I/O failure.
 pub(crate) fn fs_run(op: &str, path: &str, root: Option<&Path>) -> Value {
     let full = match fs_resolve(root, path) {
@@ -929,6 +930,44 @@ pub(crate) fn fs_run(op: &str, path: &str, root: Option<&Path>) -> Value {
                 result_map(vec![
                     ("ok", Value::Bool(true)),
                     ("lines", Value::Int(lines)),
+                ])
+            }
+            Err(e) => result_map(vec![
+                ("ok", Value::Bool(false)),
+                ("error", Value::str(e.to_string())),
+            ]),
+        },
+        "list" => match std::fs::read_dir(&full) {
+            Ok(rd) => {
+                let mut dirs: Vec<String> = Vec::new();
+                let mut files: Vec<String> = Vec::new();
+                for e in rd.flatten() {
+                    let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    if is_dir {
+                        dirs.push(name);
+                    } else {
+                        files.push(name);
+                    }
+                }
+                dirs.sort();
+                files.sort();
+                let mut entries: Vec<Value> = Vec::with_capacity(dirs.len() + files.len());
+                for d in dirs {
+                    entries.push(result_map(vec![
+                        ("name", Value::str(d)),
+                        ("dir", Value::Bool(true)),
+                    ]));
+                }
+                for f in files {
+                    entries.push(result_map(vec![
+                        ("name", Value::str(f)),
+                        ("dir", Value::Bool(false)),
+                    ]));
+                }
+                result_map(vec![
+                    ("ok", Value::Bool(true)),
+                    ("entries", Value::array(entries)),
                 ])
             }
             Err(e) => result_map(vec![
@@ -1055,6 +1094,14 @@ impl Effects {
                     let _ = tx.send(Ev::Effect(effect_reply(&flow, value)));
                 });
             }
+            "env" => {
+                let name = crate::value::coerce_str(&vars.get_field("name"));
+                let tx = tx.clone();
+                thread::spawn(move || {
+                    let value = std::env::var(&name).map(Value::str).unwrap_or(Value::Nil);
+                    let _ = tx.send(Ev::Effect(effect_reply(&flow, value)));
+                });
+            }
             "git" => {
                 let op = crate::value::coerce_str(&vars.get_field("op"));
                 let root = self.fs_root.clone();
@@ -1078,8 +1125,8 @@ impl Effects {
             "llm" => {
                 // one-shot completion: the whole turn in one reply
                 let body = llm_body(&vars.get_field("req"), cfg, false);
-                // BYO key: a request may carry api_key (the indexer SaaS is
-                // the user's token, per call — never env, never tape)
+                // BYO key: a request may carry api_key (the caller's token,
+                // per call — never env, never tape)
                 let mut cfg = cfg.clone();
                 if let Some(k) = vars.get_field("req").get_field("api_key").as_str() {
                     cfg.key = Some(k.to_string());
@@ -1363,6 +1410,33 @@ mod effects_tests {
         assert_eq!(
             fs_run("read", "src/nope.rs", Some(root)).get_field("ok"),
             Value::Bool(false)
+        );
+    }
+
+    #[test]
+    fn fs_list_returns_directories_first_then_files_sorted() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("zeta")).unwrap();
+        std::fs::create_dir_all(root.join("alpha")).unwrap();
+        std::fs::write(root.join("zeta.txt"), "z").unwrap();
+        std::fs::write(root.join("alpha.txt"), "a").unwrap();
+
+        let v = fs_run("list", "", Some(root));
+        assert_eq!(v.get_field("ok"), Value::Bool(true), "{v:?}");
+        let entries = v.get_field("entries");
+        let Value::Array(a) = entries else {
+            panic!("no entries in fs.list")
+        };
+        let names: Vec<String> = a
+            .borrow()
+            .iter()
+            .map(|e| e.get_field("name").as_str().expect("name").to_string())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["alpha", "zeta", "alpha.txt", "zeta.txt"],
+            "directories first, then files, each sorted"
         );
     }
 
