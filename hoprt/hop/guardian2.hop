@@ -1,0 +1,357 @@
+// guardian2.hop — the decision-model deluge. A turbovoter judges pairs of
+// fine-grained units (lines, verses, functions); every verdict is a typed,
+// calibrated `[winner, loser, weight]` edge fed into rank centrality
+// (`rank.scores`, ported from slug's Negahban–Oh–Shah chain) and rendered as
+// a live, re-sorting ranking. No slug, no iframe — the tape IS the index.
+//
+// The judge is pluggable:
+//   judge_local  — deterministic offline stand-in (longer unit = more urgent),
+//                  so the whole machine runs end to end with no keys
+//   judge_remote — POSTs a System One request to OpenRouter and reads the
+//                  calibrated choice probabilities straight off the typed answer
+// The judge posts to whatever model id you type (blank = offline stub).
+//
+//   cargo run -p hoprt --bin hopd -- hoprt/hop/guardian2.hop --set or_key=<key>
+
+server let schema = store.record([
+  ["items", store.list(store.leaf)],   // items[i] = the text under judgment
+  ["edges", store.list(store.leaf)],   // [winner, loser, weight] triples — the tape
+  ["votes", store.sum],
+  ["cursor", store.leaf],              // turbovoter schedule position
+  ["running", store.leaf],
+  ["model", store.leaf],               // selected decision model (nil = offline)
+  ["feed", store.list(store.leaf)],
+  ["err", store.leaf]
+]);
+
+server let tick_every_ms = 150;
+server let or_url = "https://openrouter.ai/api/v1/systemone";
+server let or_key = "";
+
+fn reduce(event) {
+  match event {
+    item { text } => {
+      store(["items", store.push(text)]);
+    }
+    judged { a, b, pa } => {
+      // One event per judgment; the reducer projects it into the store's
+      // shapes: both directed weighted edges (so rank.scores' pairwise
+      // normalization lands on pa), the feed line, and one vote tick. A
+      // foreign tape (another app's `judged{winner,loser,full}`) binds nil
+      // here — skip it, never crash on it.
+      if a && b && pa {
+        store(["edges", store.push([a, b, pa])]);
+        store(["edges", store.push([b, a, 1 - pa])]);
+        store(["feed", store.push("judged: " .. a .. " > " .. b .. " (" .. pa .. ")")]);
+        store(["votes", store.add(1)]);
+      }
+    }
+    cursor { next } => {
+      store(["cursor", store.set(next)]);
+    }
+    play {} => {
+      store(["running", store.set(true)]);
+    }
+    pause {} => {
+      store(["running", store.set(false)]);
+    }
+    model { slug } => {
+      store(["model", store.set(slug)]);
+    }
+    err { text } => {
+      store(["err", store.set(text)]);
+    }
+  }
+}
+
+// ---- the voter (pluggable) ----
+
+// Offline stand-in: the longer unit needs refactoring more. Deterministic,
+// no network — a real decision model replaces this through judge_remote.
+fn judge_local(a, b) {
+  let ta = store(["items", a]);
+  let tb = store(["items", b]);
+  if len(ta) >= len(tb) {
+    return { a = a, b = b, pa = 0.7 };
+  }
+  return { a = b, b = a, pa = 0.7 };
+}
+
+// Resolve the judge's API key: --set or_key wins, else OPENAI_API_KEY from the
+// process env (hopd's load_dotenv feeds .env into it). NOTE: or_key defaults to
+// "", and an EMPTY STRING is TRUTHY in hop (only nil/false are falsy) — so the
+// guard compares to "" explicitly, or the env read is silently skipped and the
+// key goes out empty (a bare 401).
+fn resolve_key() {
+  let key = or_key;
+  if key == "" || !key {
+    key = env.get("OPENAI_API_KEY");
+  }
+  if !key || key == "" {
+    return nil;
+  }
+  return key;
+}
+
+// Status probe: is a key resolvable right now? Prints OK/EMPTY, never the secret.
+fn key_status() {
+  let k = resolve_key();
+  if !k {
+    print("key=EMPTY");
+  } else {
+    print("key=OK");
+  }
+}
+
+// Ask a System One model on OpenRouter which of a/b needs it more, and read
+// its calibrated choice probabilities straight out of the typed answer.
+fn judge_remote(a, b) {
+  let ta = store(["items", a]);
+  let tb = store(["items", b]);
+  let key = resolve_key();
+  if !key {
+    store.append({ type = "err", text = "no key: --set or_key=<key> or OPENAI_API_KEY in .env" });
+    return nil;
+  }
+  let body = json.encode({
+    model = store(["model"]),
+    state = ta .. "\n=====\n" .. tb,
+    questions = {
+      pick = {
+        type = "choice",
+        instructions = "Which of these two units needs more refactoring or cleanup?",
+        criteria = { a = "the first unit", b = "the second unit" }
+      }
+    }
+  });
+  let res = http.post(or_url, body, { Authorization = "Bearer " .. key });
+  if !res.ok || res.status >= 400 {
+    let msg = res.error;
+    if !msg {
+      msg = res.body;
+    }
+    store.append({ type = "err", text = "judge: " .. msg });
+    return nil;
+  }
+  let data = json.decode(res.body);
+  let pick = data.answers.pick;
+  let pa = pick.probabilities.a;
+  if !pa {
+    store.append({ type = "err", text = "judge: no probability in answer" });
+    return nil;
+  }
+  return { a = a, b = b, pa = pa };
+}
+
+fn judge(a, b) {
+  if store(["model"]) {
+    return judge_remote(a, b);
+  }
+  return judge_local(a, b);
+}
+
+// ---- flows ----
+
+fn play() {
+  server!();
+  store.append({ type = "play" });
+  paint();
+}
+
+fn pause() {
+  server!();
+  store.append({ type = "pause" });
+  paint();
+}
+
+fn set_model() {
+  let m = dom.get("#model_pick");
+  server!();
+  store.append({ type = "model", slug = m });
+  paint();
+}
+
+// ---- corpus ingestion ----
+
+// Split text into lines and register each non-empty line as an item. This is
+// the "measure every line" entrance — a whole file becomes a corpus to sort.
+// A plain server helper (no server!() mark — the caller hops and then paints),
+// so `load` can call it mid-flow without re-entering a placement boundary.
+fn load_lines(text) {
+  let lines = str.lines(text);
+  for i, line in lines {
+    if line != "" {
+      store.append({ type = "item", text = line });
+    }
+  }
+}
+
+// Read a real file (rooted by hopd's --fs-root) and sort its lines.
+fn load() {
+  let p = dom.get("#file_pick");
+  server!();
+  let r = fs.read(p);
+  if !r.ok {
+    store.append({ type = "err", text = "load: " .. r.error });
+    paint();
+    return;
+  }
+  load_lines(r.text);
+  paint();
+}
+
+// One full chain pass, judged server-side in one go: the deterministic core
+// of the turbovoter, also the offline button. Prints the current leader.
+fn run_all() {
+  server!();
+  let items = store(["items"]);
+  if !items || len(items) < 2 {
+    return;
+  }
+  let n = len(items);
+  let c = 0;
+  while c < n - 1 {
+    let r = judge(c, c + 1);
+    if r {
+      store.append({ type = "judged", a = r.a, b = r.b, pa = r.pa });
+    }
+    c = c + 1;
+  }
+  let edges = store(["edges"]);
+  if !edges {
+    edges = [];
+  }
+  let res = rank.scores(n, edges);
+  print("top=" .. res.order[0]);
+  paint();
+}
+
+// The scheduler-driven loop: judge one pair per tick, forever. In production
+// hopd fires this server-side every tick_every_ms; `run_all` above is the
+// offline/test stand-in for the same judge → edge → rank core.
+fn tick() {
+  if !store(["running"]) {
+    return;
+  }
+  let items = store(["items"]);
+  if !items || len(items) < 2 {
+    return;
+  }
+  let n = len(items);
+  // The schedule: a chain (spanning tree) over the items — connectivity first,
+  // and a path tree is reversible, so rank centrality recovers the true order
+  // exactly rather than settling on a cycle that folds back on itself.
+  let c = store(["cursor"]);
+  if !c {
+    c = 0;
+  }
+  let a = c;
+  let b = a + 1;
+  let next = c + 1;
+  if next >= n - 1 {
+    next = 0;
+  }
+  store.append({ type = "cursor", next = next });
+  let r = judge(a, b);
+  if !r {
+    return;
+  }
+  store.append({ type = "judged", a = r.a, b = r.b, pa = r.pa });
+  paint();
+}
+
+// ---- view (pure render; all data computed server-side in paint) ----
+
+fn rank_rows_view(rank_rows) {
+  let rows = [];
+  for i, row in rank_rows {
+    push(rows, [:li, { class = "entry" }, row[0] .. " · " .. row[1]]);
+  }
+  return rows;
+}
+
+fn model_picker(model) {
+  return [:div, { class = "row settings" },
+    [:input, {
+      id = "model_pick",
+      placeholder = "model: " .. (model || "jev-latest (blank = offline stub)"),
+      onchange = fn(e) { set_model(); }
+    }]
+  ];
+}
+
+fn feed_view(feed) {
+  let out = [];
+  if feed {
+    let n = len(feed);
+    let start = n - 12;
+    if start < 0 {
+      start = 0;
+    }
+    let k = n - 1;
+    while k >= start {
+      push(out, [:pre, { class = "tick" }, feed[k]]);
+      k = k - 1;
+    }
+  }
+  return out;
+}
+
+fn view(running, votes, model, err, feed, rank_rows) {
+  let state = "⏸ paused";
+  if running {
+    state = "● judging";
+  }
+  let parts = [];
+  push(parts, [:h1, {}, "guardian2 · sorted judgment index"]);
+  push(parts, [:p, { class = "meta" }, state .. " · " .. votes .. " votes · " .. (model || "offline stub")]);
+  if err {
+    push(parts, [:p, { class = "err" }, err]);
+  }
+  push(parts, [:div, { class = "row" },
+    [:button, { onclick = fn(e) { play(); } }, "play"],
+    [:button, { onclick = fn(e) { pause(); } }, "pause"]
+  ]);
+  push(parts, [:div, { class = "row" },
+    [:input, { id = "file_pick", placeholder = "file (relative to --fs-root)" }],
+    [:button, { onclick = fn(e) { load(); } }, "load file"]
+  ]);
+  push(parts, model_picker(model));
+  push(parts, [:h2, {}, "ranking · live"]);
+  push(parts, [:ol, {}, rank_rows_view(rank_rows)]);
+  push(parts, [:h2, {}, "deluge"]);
+  push(parts, feed_view(feed));
+  return [:div, {}, parts];
+}
+
+fn paint() {
+  let items = store(["items"]);
+  if !items {
+    items = [];
+  }
+  let n = len(items);
+  let edges = store(["edges"]);
+  if !edges {
+    edges = [];
+  }
+  let r = rank.scores(n, edges);
+  let rank_rows = [];
+  for i, idx in r.order {
+    push(rank_rows, [idx, items[idx], r.scores[idx]]);
+  }
+  let votes = store(["votes"]);
+  let model = store(["model"]);
+  let err = store(["err"]);
+  let feed = store(["feed"]);
+  if !feed {
+    feed = [];
+  }
+  let running = store(["running"]);
+  cast browsers {
+    hui.render("#app", view(running, votes, model, err, feed, rank_rows));
+  }
+}
+
+fn on_connect(sid) {
+  paint();
+}

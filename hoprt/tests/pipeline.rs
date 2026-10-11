@@ -3,6 +3,7 @@
 //! packets, transcripts, and rendered output — never on VM internals.
 
 use hoprt::harness::Cluster;
+use hoprt::value::Value;
 
 fn run(src: &str) -> Vec<String> {
     let mut host = Cluster::new(&["A", "B"], src, false).expect("cluster");
@@ -251,6 +252,124 @@ fn module_natives_mount_as_globals() {
     assert!(all.contains("llm=map stream=native call=native"), "{all}");
     assert!(all.contains("bash=native markdown=native"), "{all}");
     assert!(all.contains("str=map has=native"), "{all}");
+}
+
+#[test]
+fn rank_scores_native_ranks_edges() {
+    // rank.scores turns a flood of [winner, loser, weight] edges into a
+    // stationary distribution: item 3 beats everyone 2:1, so it must come out
+    // on top and the solver must report convergence.
+    let src = r#"
+        fn go() {
+          let r = rank.scores(4, [[3,0,2.0],[0,3,1.0],[3,1,2.0],[1,3,1.0],[3,2,2.0],[2,3,1.0]]);
+          if r.scores[3] > r.scores[0] && r.scores[3] > r.scores[1] && r.scores[3] > r.scores[2] && r.converged {
+            print("rank ok");
+          } else {
+            print("rank bad");
+          }
+        }
+    "#;
+    let mut host = Cluster::new(&["A"], src, false).expect("cluster");
+    host.fire("A", "go");
+    host.pump();
+    let all = host.log().join("\n");
+    assert!(all.contains("rank ok"), "{all}");
+}
+
+#[test]
+fn guardian2_offline_deluge_ranks_longest_first() {
+    // The whole turbovoter loop, offline and deterministic: seed a monotone
+    // corpus (each line longer than the last), run the chain schedule across
+    // it, and rank centrality must crown the longest item (#6) — edges land on
+    // the tape as [winner, loser, weight] triples, the store is the index.
+    let src = include_str!("../hop/guardian2.hop");
+    let mut host = Cluster::new(&["A"], src, false).expect("cluster");
+    host.fire_args(
+        "server",
+        "load_lines",
+        vec![Value::str(
+            "x\nlet a = 1;\nlet ab = 1; let bc = 2;\nlet abc = 1; let bcd = 2; let cde = 3;\nlet line4 grows longer so the ordered intent cannot possibly be mistaken;\nlet line5 keeps growing even longer still, and the ordering stays unmistakable as a rule;\nlet line6 is deliberately the longest of all of them, so the turbovoter must crown it number one;",
+        )],
+    );
+    host.pump();
+    // run_all judges the full chain server-side (offline judge → edges on the
+    // tape → rank.scores) and prints the current leader.
+    host.fire("A", "run_all");
+    host.pump();
+    let all = host.log().join("\n");
+    assert!(all.contains("top=6"), "longest item should rank #1: {all}");
+    // paint/view must render clean on a fresh store — no unhandled flow error
+    // and the ranked list lands in the DOM.
+    assert!(!all.contains("unhandled"), "unhandled flow error:\n{all}");
+    let app = host.dom("A", "#app");
+    assert!(app.contains("ranking"), "view did not render the ranking: {app}");
+}
+
+#[test]
+fn guardian2_sorts_a_files_lines_offline() {
+    // Ingest a "file" line by line (str.lines), then let the offline deluge
+    // sort it: six lines of strictly increasing length must come out longest
+    // first — rank centrality over the tape, no key, no slug.
+    let src = include_str!("../hop/guardian2.hop");
+    let mut host = Cluster::new(&["A"], src, false).expect("cluster");
+    host.fire_args(
+        "server",
+        "load_lines",
+        vec![Value::str("x\nlet a;\nlet ab;\nlet abc;\nlet abcd;\nlet abcde;")],
+    );
+    host.pump();
+    host.fire("A", "run_all");
+    host.pump();
+    let all = host.log().join("\n");
+    assert!(all.contains("top=5"), "longest line should rank #1: {all}");
+}
+
+#[test]
+fn guardian2_resolves_key_from_env_when_or_key_empty() {
+    // Regression: `server let or_key = ""` is an EMPTY STRING, and empty
+    // strings are truthy in hop — the old `if !key` guard never branched to
+    // env.get, so the key went out empty (a bare 401). resolve_key must compare
+    // to "" and fall through to the process env.
+    let src = include_str!("../hop/guardian2.hop");
+    let mut host = Cluster::new(&["A"], src, false).expect("cluster");
+
+    std::env::remove_var("OPENAI_API_KEY");
+    host.fire_args("server", "key_status", vec![]);
+    host.pump();
+
+    std::env::set_var("OPENAI_API_KEY", "sk-or-test");
+    host.fire_args("server", "key_status", vec![]);
+    host.pump();
+    std::env::remove_var("OPENAI_API_KEY");
+
+    let all = host.log().join("\n");
+    assert!(all.contains("key=EMPTY"), "unset key did not report EMPTY:\n{all}");
+    assert!(all.contains("key=OK"), "set key did not resolve from env:\n{all}");
+}
+
+#[test]
+fn file_browser_lists_drills_and_returns() {
+    // The harness's fs roots at the test process cwd (the hoprt crate), so
+    // `src` and `Cargo.toml` are real entries to browse.
+    let src = include_str!("../hop/file_browser.hop");
+    let mut host = Cluster::new(&["A"], src, false).expect("cluster");
+
+    host.fire("A", "refresh");
+    host.pump();
+    let root = host.dom("A", "#app");
+    assert!(root.contains("Cargo.toml"), "root listing missing Cargo.toml:\n{root}");
+    assert!(root.contains("src/"), "root listing missing the src dir:\n{root}");
+
+    host.fire_args("A", "open", vec![Value::str("src")]);
+    host.pump();
+    let sub = host.dom("A", "#app");
+    assert!(sub.contains("serve.rs"), "drilling into src missing serve.rs:\n{sub}");
+    assert!(sub.contains(".."), "src listing missing the up entry:\n{sub}");
+
+    host.fire_args("A", "up", vec![]);
+    host.pump();
+    let back = host.dom("A", "#app");
+    assert!(back.contains("Cargo.toml"), "up did not return to the root:\n{back}");
 }
 
 #[test]

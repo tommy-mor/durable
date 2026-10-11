@@ -36,6 +36,7 @@ target/
 
 # hopd default data dir
 hop-data/
+guardian2-data/
 
 # secrets (hopd loads this at startup)
 .env

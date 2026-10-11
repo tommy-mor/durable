@@ -692,8 +692,15 @@ fn tick() {
     return;
   }
   let verdict = json.first(out.text);
-  if type(verdict) != "map" {
-    store.append({ type = "err", text = "guardian could not parse a verdict" });
+  // json.first fishes the FIRST JSON object anywhere in the stream, so a
+  // stray `{...}` in the reasoning (a quoted snippet, an example) parses
+  // cleanly and the old code then silently voted for "a". A verdict is a
+  // verdict only when it names a real side AND carries a non-empty reason —
+  // anything else is foreign and is refused loudly, like a foreign item:
+  // never a silent default, never a vote cast on garbage.
+  let ok = type(verdict) == "map" && (verdict.winner == "a" || verdict.winner == "b") && type(verdict.why) == "string" && verdict.why != "";
+  if !ok {
+    store.append({ type = "err", text = "guardian refused a malformed verdict (no winner or why)" });
     store.append({ type = "judging", flag = false, at = nil });
     paint("", "", "");
     return;

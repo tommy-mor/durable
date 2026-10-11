@@ -253,7 +253,5 @@ the cluster is quiescent: no flow left suspended.
 - `hop/demo.hop` — the pipeline demo: marks, casts, errors, liveness.
 - `hop/guardian.hop` — a play/pausable LLM agent judging a codebase into
   slug-as-a-database, with token billing folded from the tape.
-- `hop/indexer.hop` — the indexer as a service: paste a repo and an
-  OpenRouter key, watch an agent sort it live.
 - `hop/agent.hop`, `hop/tournament.hop`, `hop/chat.hop`,
   `hop/microblog.hop`, `hop/ranking.hop` — older, smaller explorations.

@@ -23,6 +23,9 @@
 //! 6. the play button's whole judging loop — tick, GetPair, fs.read,
 //!    llm.stream, verdict, vote POST — runs end to end against a stub
 //!    slug/LLM, because it once had no coverage at all.
+//! 7. a verdict that parses as JSON but names no winner is refused, never
+//!    voted — json.first grabs the FIRST JSON object in the stream, and
+//!    the old guard silently defaulted a winnerless verdict to "a".
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -51,13 +54,31 @@ const VERDICT_SSE: &str = concat!(
     "data: [DONE]\n\n",
 );
 
+/// The malformed double: parses as one valid JSON object but carries no
+/// `winner` — the exact shape the old guard silently defaulted to "a".
+const VERDICT_MALFORMED_SSE: &str = concat!(
+    "data: {\"choices\":[{\"delta\":{\"content\":\"these read about the same\\n\"}}]}\n\n",
+    "data: {\"choices\":[{\"delta\":{\"content\":\"{\\\"why\\\":\\\"no winner in this verdict\\\"}\"}}]}\n\n",
+    "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":77,\"completion_tokens\":9,\"total_tokens\":86}}\n\n",
+    "data: [DONE]\n\n",
+);
+
 /// The stub slug: GetPair always offers the scope_rank.rs × reducer.rs
 /// bridge, GetGardenRank returns the wrapped batch shape, Post always
 /// succeeds, and the replay page is a static HTML shell. It doubles as the
-/// LLM: POST /chat/completions gets VERDICT_SSE. Every RPC body is pushed
-/// into `recorded` for assertions. Auth is ignored — the stub is not the
-/// thing under test.
+/// LLM: POST /chat/completions streams VERDICT_SSE (or whatever verdict a
+/// test passes). Every RPC body is pushed into `recorded` for assertions.
+/// Auth is ignored — the stub is not the thing under test.
 fn spawn_stub_slug(port: u16, pair_json: String, recorded: Arc<Mutex<Vec<String>>>) {
+    spawn_stub_slug_sse(port, pair_json, recorded, VERDICT_SSE);
+}
+
+fn spawn_stub_slug_sse(
+    port: u16,
+    pair_json: String,
+    recorded: Arc<Mutex<Vec<String>>>,
+    verdict_sse: &'static str,
+) {
     thread::spawn(move || {
         let server = tiny_http::Server::http(&format!("127.0.0.1:{port}"))
             .expect("stub slug bind");
@@ -87,7 +108,7 @@ fn spawn_stub_slug(port: u16, pair_json: String, recorded: Arc<Mutex<Vec<String>
                 };
                 respond(req, 200, "application/json", canned.as_bytes());
             } else if *req.method() == tiny_http::Method::Post && url.starts_with("/chat/completions") {
-                respond(req, 200, "text/event-stream", VERDICT_SSE.as_bytes());
+                respond(req, 200, "text/event-stream", verdict_sse.as_bytes());
             } else if url.starts_with("/r/") {
                 if url.contains("v=history.json") {
                     respond(req, 200, "application/json", br#"{"history":[]}"#);
@@ -176,7 +197,7 @@ fn spawn_hopd(
     let pkg = pkg_dir();
     thread::spawn(move || {
         let prog = hoprt::compiler::compile(&src).expect("compile");
-        let _ = hoprt::serve::serve(
+        if let Err(e) = hoprt::serve::serve(
             std::rc::Rc::new(prog),
             src,
             http,
@@ -188,7 +209,9 @@ fn spawn_hopd(
             Vec::new(),
             trace,
             false,
-        );
+        ) {
+            eprintln!("[spawn_hopd] serve error: {e}");
+        }
     });
     for _ in 0..100 {
         if ureq::get(&format!("http://127.0.0.1:{http}/config.json"))
@@ -608,153 +631,238 @@ async fn guardian_judges_end_to_end() {
     browser.close().await.ok();
 }
 
-// The indexer SaaS end to end: paste a repo + an OpenRouter key → real
-// git.clone of a local fixture repo → real fs scan → members registered
-// with slug (stub records it) → auto-play → the stub LLM streams a verdict
-// → the vote lands in slug → the invoice folds onto the status line. The
-// user's key never touches the tape (it rides a process global).
-const STUB_SAAS: u16 = 19746;
-const HOP_SAAS_HTTP: u16 = 19756;
-const HOP_SAAS_WS: u16 = 19757;
-
-/// indexer.hop re-pointed at the stub, same trick as guardian_source.
-fn indexer_source(slug_port: u16) -> String {
-    let src = std::fs::read_to_string(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("hop/indexer.hop"),
-    )
-    .expect("read indexer.hop");
-    src.replace(
-        "server let slug_url = \"http://localhost:8080\";",
-        &format!("server let slug_url = \"http://127.0.0.1:{slug_port}\";"),
-    )
-    .replace(
-        "server let slug_token = \"\";",
-        "server let slug_token = \"stub-token\";",
-    )
-}
+// regression 7: a verdict that parses as ONE valid JSON object but names no
+// winner must be refused, never voted. json.first fishes the FIRST JSON
+// object anywhere in the model's stream — a stray `{...}` in the reasoning
+// parses cleanly — and the old guard then silently defaulted the vote to
+// "a", poisoning the ranking with a judgment nobody actually made.
+const STUB_MALFORMED: u16 = 19748;
+const HOP_MALFORMED_HTTP: u16 = 19758;
+const HOP_MALFORMED_WS: u16 = 19759;
 
 #[tokio::test]
-async fn saas_indexes_and_judges_a_repo() {
-    // the repo under test: a real git repo on disk (cloned for real)
-    let origin = fixture_repo(&[
+async fn guardian_refuses_malformed_verdict() {
+    let recorded = Arc::new(Mutex::new(Vec::new()));
+    spawn_stub_slug_sse(
+        STUB_MALFORMED,
+        format!(
+            r#"{{"results":[{{"ok":true,"result":{{"Pair":{{
+                "left":"{SLUG_ITEM}server/src/scope_rank.rs",
+                "right":"{SLUG_ITEM}server/src/reducer.rs",
+                "left_body":"stub body","right_body":"stub body","threads":[]
+            }}}}}}]}}"#
+        ),
+        recorded.clone(),
+        VERDICT_MALFORMED_SSE,
+    );
+    let repo = fixture_repo(&[
         ("server/src/dsl.rs", 450),
         ("server/src/api/rpc.rs", 450),
         ("server/src/scope_rank.rs", 450),
         ("server/src/reducer.rs", 450),
     ]);
-    let origin_url = origin.to_string_lossy().to_string();
-    // the stub offers the bridge pair using the SaaS's OWN member urls
-    // (the clone registers files as {origin}/blob/HEAD/<path>)
-    let member = format!("{origin_url}/blob/HEAD/server/src/");
-    let recorded = Arc::new(Mutex::new(Vec::new()));
-    spawn_stub_slug(
-        STUB_SAAS,
-        format!(
-            r#"{{"results":[{{"ok":true,"result":{{"Pair":{{
-                "left":"{member}scope_rank.rs",
-                "right":"{member}reducer.rs",
-                "left_body":"stub body","right_body":"stub body","threads":[]
-            }}}}}}]}}"#
-        ),
-        recorded.clone(),
-    );
-    let ws = tempfile::tempdir().expect("workspaces");
-    let ws_root = ws.path().to_path_buf();
-    std::mem::forget(ws);
-    // the lantern: this run traces every assign, hop, and tape event to a
-    // file — the SaaS test doubles as the trace smoke test
-    let trace_dir = tempfile::tempdir().expect("trace dir");
-    let trace_path = trace_dir.path().join("exec.trace");
-    std::mem::forget(trace_dir);
     spawn_hopd(
-        indexer_source(STUB_SAAS),
-        HOP_SAAS_HTTP,
-        HOP_SAAS_WS,
-        ws_root,
+        guardian_source(STUB_MALFORMED),
+        HOP_MALFORMED_HTTP,
+        HOP_MALFORMED_WS,
+        repo,
         Some(hoprt::serve::LlmCfg {
             key: Some("stub".into()),
-            base: format!("http://127.0.0.1:{STUB_SAAS}"),
+            base: format!("http://127.0.0.1:{STUB_MALFORMED}"),
             model: Some("stub/model".into()),
         }),
-        Some(trace_path.clone()),
+        None,
     );
 
     let pw = Playwright::launch().await.expect("playwright");
     let browser = pw.chromium().launch().await.expect("chromium");
     let page = browser.new_page().await.expect("page");
     page.goto(
-        &format!("http://localhost:{HOP_SAAS_HTTP}/"),
+        &format!("http://localhost:{HOP_MALFORMED_HTTP}/"),
         GotoOptions::new().wait_until(WaitUntil::DomContentLoaded),
     )
     .await
     .expect("goto");
-    poll_js(&page, r#"document.body.innerText.includes("indexer") ? "ok" : null"#, 10).await;
+    poll_js(&page, r#"document.body.innerText.includes("vote screen") ? "ok" : null"#, 10).await;
 
-    // paste repo + key, hit the button — the whole self-serve loop fires
-    page.evaluate_value(&format!(
-        r##"document.querySelector("#rurl").value = {origin_url:?};
-           document.querySelector("#rkey").value = "user-secret-key";"##
-    ))
-    .await
-    .expect("fill form");
-    click_button(&page, "index my repo").await;
-
-    // clone + scan + registration + auto-play: a judgment lands
-    let judged = poll_js(
-        &page,
-        r#"document.body.innerText.includes("agent: server/src/scope_rank.rs > server/src/reducer.rs") ? "ok" : null"#,
-        30,
-    )
-    .await;
-    if judged != "ok" {
-        let body = page
-            .evaluate_value("document.body.innerText")
-            .await
-            .unwrap_or_default();
-        let tail = &body[body.len().saturating_sub(900)..];
-        panic!("no judgment landed after indexing; page tail:\n{tail}");
-    }
-
-    // the invoice folded onto the status line from the user's own key's meter
-    let billing = poll_js(
+    click_button(&page, "scan repo").await;
+    let pair = poll_js(
         &page,
         r#"(() => {
-            const m = document.body.innerText.match(/(\d+) in \/ (\d+) out · (\d+) calls/);
-            return m && parseInt(m[1]) >= 1234 && parseInt(m[3]) >= 1 ? "ok" : null;
+            const cards = Array.from(document.querySelectorAll(".pair-card"))
+                .map(c => c.textContent);
+            return cards.some(c => c.includes("server/src/scope_rank.rs")) ? "ok" : null;
         })()"#,
         10,
     )
     .await;
-    assert_eq!(billing, "ok", "billing line missing after the run");
+    assert_eq!(pair, "ok", "suggested pair never rendered");
 
-    // and slug saw the repo: registration + a 2:1 vote, both recorded
+    // PLAY: the loop streams the malformed verdict, the guardian refuses
+    // it loudly in the feed, and NO vote ever crosses the wire
+    click_button(&page, "play").await;
+    let refused = poll_js(
+        &page,
+        r#"document.body.innerText.includes("guardian refused a malformed verdict") ? "ok" : null"#,
+        20,
+    )
+    .await;
+    assert_eq!(refused, "ok", "malformed verdict was not refused loudly in the feed");
+    click_button(&page, "pause").await;
+
     let bodies = recorded.lock().expect("recorded");
     assert!(
-        bodies.iter().any(|b| b.contains("\"files\"") && b.contains("scope_rank.rs")),
-        "no member registration reached slug: {bodies:?}"
-    );
-    assert!(
-        bodies
-            .iter()
-            .any(|b| b.contains("judgments") && b.contains("2:1") && b.contains("stub says a")),
-        "no vote reached slug: {bodies:?}"
+        !bodies.iter().any(|b| b.contains("2:1")),
+        "a malformed verdict was voted to slug: {bodies:?}"
     );
     drop(bodies);
+    browser.close().await.ok();
+}
 
-    // the lantern: assigns, hops, and tape events all traced, greppable
-    let trace = std::fs::read_to_string(&trace_path).expect("trace file");
-    assert!(trace.contains("assign "), "trace has no assigns:\n{trace}");
-    assert!(
-        // a browser→server mark arrives as the incoming call, ship set
-        // attached (the wasm tab's own side of the hop isn't traced — the
-        // lantern lives in hopd)
-        trace.contains("recv call start_index:1 vars={"),
-        "trace has no hop arrival with its ship set:\n{trace}"
+// ---- guardian2 (the decision-model deluge, offline) ----
+
+// Regression: "load file" once did nothing in a real browser. The Cluster
+// harness stubs the store away on the browser VM, so only a real hopd + a real
+// click reveals the dom.get → fs.read → load_lines placement bug. A fixture
+// file's lines must land in the ranking.
+const G2_HTTP: u16 = 19762;
+const G2_WS: u16 = 19763;
+
+#[tokio::test]
+async fn guardian2_loads_and_ranks_a_file() {
+    // a plain fixture dir with one file — guardian2 uses fs.read, no git.
+    let dir = tempfile::tempdir().expect("fixture dir");
+    let root = dir.path().to_path_buf();
+    std::fs::write(
+        root.join("fixture.txt"),
+        "x\nlet a;\nlet ab;\nlet abc;\nlet abcd;\nlet abcde;",
+    )
+    .expect("write fixture");
+    std::mem::forget(dir);
+
+    // the lantern: everything the load flow does, one greppable line each.
+    let trace_dir = tempfile::tempdir().expect("trace dir");
+    let trace = trace_dir.path().join("g2.trace");
+    std::mem::forget(trace_dir);
+    spawn_hopd(
+        include_str!("../hop/guardian2.hop").to_string(),
+        G2_HTTP,
+        G2_WS,
+        root,
+        None,
+        Some(trace.clone()),
     );
-    assert!(
-        // tape keys serialize alphabetically; "judged" is the event type
-        trace.contains("\"type\":\"judged\""),
-        "trace has no judged tape event:\n{trace}"
+
+    let pw = Playwright::launch().await.expect("playwright");
+    let browser = pw.chromium().launch().await.expect("chromium");
+    let page = browser.new_page().await.expect("page");
+    page.goto(
+        &format!("http://localhost:{G2_HTTP}/"),
+        GotoOptions::new().wait_until(WaitUntil::DomContentLoaded),
+    )
+    .await
+    .expect("goto");
+    poll_js(&page, r#"document.body.innerText.includes("ranking") ? "ok" : null"#, 10).await;
+
+    // type the fixture path and click load
+    page.evaluate_value(r##"document.querySelector("#file_pick").value = "fixture.txt";"##)
+        .await
+        .expect("set input");
+    click_button(&page, "load file").await;
+
+    // the fixture's lines must appear in the ranking list
+    let loaded = poll_js(
+        &page,
+        r#"document.body.innerText.includes("let abcde;") ? "ok" : null"#,
+        10,
+    )
+    .await;
+    if loaded != "ok" {
+        let body = page
+            .evaluate_value("document.body.innerText")
+            .await
+            .unwrap_or_default();
+        let tr = std::fs::read_to_string(&trace).unwrap_or_default();
+        panic!(
+            "load file did not load the fixture lines.\npage:\n{body}\nlantern tail:\n{}",
+            &tr[tr.len().saturating_sub(3000)..]
+        );
+    }
+    browser.close().await.ok();
+}
+
+// The file browser in a real tab: real fs.root, real clicks — list, drill into
+// a folder, pick a file, back out. The harness can hide browser-side placement
+// bugs; only Chromium catches them.
+const FB_HTTP: u16 = 19764;
+const FB_WS: u16 = 19765;
+
+#[tokio::test]
+async fn file_browser_drills_and_picks_in_browser() {
+    let dir = tempfile::tempdir().expect("fixture dir");
+    let root = dir.path().to_path_buf();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/nested.rs"), "fn nested() {}").unwrap();
+    std::fs::write(root.join("readme.txt"), "hi").unwrap();
+    std::mem::forget(dir);
+
+    spawn_hopd(
+        include_str!("../hop/file_browser.hop").to_string(),
+        FB_HTTP,
+        FB_WS,
+        root,
+        None,
+        None,
     );
+
+    let pw = Playwright::launch().await.expect("playwright");
+    let browser = pw.chromium().launch().await.expect("chromium");
+    let page = browser.new_page().await.expect("page");
+    page.goto(
+        &format!("http://localhost:{FB_HTTP}/"),
+        GotoOptions::new().wait_until(WaitUntil::DomContentLoaded),
+    )
+    .await
+    .expect("goto");
+    let listing =
+        poll_js(&page, r#"document.body.innerText.includes("readme.txt") ? "ok" : null"#, 10).await;
+    assert_eq!(listing, "ok", "browser never listed the root directory");
+
+    // drill into src, pick nested.rs
+    let clicked = page
+        .evaluate_value(r##"(() => {
+            const b = Array.from(document.querySelectorAll("button")).find(x => x.textContent.includes("src/"));
+            if (b) { b.click(); return "ok"; } return "no";
+        })()"##)
+        .await
+        .expect("click dir");
+    if clicked != "ok" {
+        let txt = page
+            .evaluate_value("document.body.innerText")
+            .await
+            .unwrap_or_default();
+        panic!("src dir not clickable. body:\n{txt}");
+    }
+    poll_js(&page, r#"document.body.innerText.includes("nested.rs") ? "ok" : null"#, 10).await;
+    let picked = page
+        .evaluate_value(r##"(() => {
+            const b = Array.from(document.querySelectorAll("button")).find(x => x.textContent.includes("nested.rs"));
+            if (b) { b.click(); return "ok"; } return "no";
+        })()"##)
+        .await
+        .expect("click file");
+    assert_eq!(picked, "ok", "nested.rs was not clickable");
+    poll_js(&page, r#"document.body.innerText.includes("selected: src/nested.rs") ? "ok" : null"#, 10).await;
+
+    // back out to the root
+    let back = page
+        .evaluate_value(r##"(() => {
+            const b = Array.from(document.querySelectorAll("button")).find(x => x.textContent.trim() === "..");
+            if (b) { b.click(); return "ok"; } return "no";
+        })()"##)
+        .await
+        .expect("click up");
+    assert_eq!(back, "ok", "the .. entry was not clickable");
+    poll_js(&page, r#"document.body.innerText.includes("readme.txt") ? "ok" : null"#, 10).await;
     browser.close().await.ok();
 }

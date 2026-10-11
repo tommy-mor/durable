@@ -1,0 +1,188 @@
+// file_browser.hop — a rooted file browser. It lists one directory at a time
+// (directories first, then files, each sorted), lets you drill into folders
+// and back up with `..`, and pick a file (highlighted). The "concise picker"
+// the guardian feeds its corpus from.
+//
+// Built on two hop primitives: fs.list (sorted directory entries) and
+// str.dirname (the "up" gesture — fs.read refuses `..`, so the browser walks
+// a plain string path instead of relying on the filesystem for navigation).
+//
+//   cargo run -p hoprt --bin hopd -- hoprt/hop/file_browser.hop --fs-root .
+
+server let schema = store.record([
+  ["cwd", store.leaf],        // current directory, "" = the fs root
+  ["entries", store.leaf],    // last listing: [{ name, dir }]
+  ["selected", store.leaf],   // picked file path (nil until one is chosen)
+  ["err", store.leaf]
+]);
+
+fn reduce(event) {
+  match event {
+    set_cwd { path } => {
+      store(["cwd", store.set(path)]);
+    }
+    set_entries { entries } => {
+      store(["entries", store.set(entries)]);
+    }
+    pick { path } => {
+      store(["selected", store.set(path)]);
+    }
+    err { text } => {
+      store(["err", store.set(text)]);
+    }
+  }
+}
+
+// ---- flows ----
+
+// Server helper: move to `path`, list it, repaint. No server!() mark — the
+// callers (open/up/refresh) hop once, then call this where they already are.
+fn goto_path(path) {
+  store.append({ type = "set_cwd", path = path });
+  let r = fs.list(path);
+  if !r.ok {
+    store.append({ type = "err", text = r.error });
+    store.append({ type = "set_entries", entries = [] });
+  } else {
+    store.append({ type = "err", text = nil });
+    store.append({ type = "set_entries", entries = r.entries });
+  }
+  paint();
+}
+
+fn open(name) {
+  server!();
+  let cwd = store(["cwd"]);
+  if !cwd {
+    cwd = "";
+  }
+  let child = name;
+  if cwd != "" {
+    child = cwd .. "/" .. name;
+  }
+  goto_path(child);
+}
+
+fn up() {
+  server!();
+  let cwd = store(["cwd"]);
+  if !cwd {
+    cwd = "";
+  }
+  if cwd == "" {
+    return;
+  }
+  goto_path(str.dirname(cwd));
+}
+
+fn refresh() {
+  server!();
+  let cwd = store(["cwd"]);
+  if !cwd {
+    cwd = "";
+  }
+  goto_path(cwd);
+}
+
+fn pick(name) {
+  server!();
+  let cwd = store(["cwd"]);
+  if !cwd {
+    cwd = "";
+  }
+  let full = name;
+  if cwd != "" {
+    full = cwd .. "/" .. name;
+  }
+  store.append({ type = "pick", path = full });
+  paint();
+}
+
+// ---- view (pure render; data computed server-side in paint) ----
+
+fn css() {
+  return "button { display:block; width:100%; text-align:left; font:inherit; border:none; background:none; padding:2px 10px; margin:0; cursor:pointer; border-radius:4px; } "
+    .. "button:hover { background:#e8ecff; } "
+    .. ".bar { display:flex; align-items:center; gap:10px; margin-bottom:8px; } "
+    .. ".bar button { width:auto; background:#eee; } "
+    .. ".crumb { font-family:monospace; color:#555; flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; } "
+    .. ".up { color:#777; } "
+    .. ".dir { font-weight:600; } "
+    .. ".file { color:#333; padding-left:22px; } "
+    .. ".file.sel { background:#fff3c4; } "
+    .. ".sel { color:#070; font-family:monospace; margin:4px 0; } "
+    .. ".err { color:#a00; }";
+}
+
+fn entry_rows(cwd, entries, selected) {
+  let rows = [];
+  if cwd != "" {
+    push(rows, [:button, { class = "entry up", onclick = fn(e) { up(); } }, ".."]);
+  }
+  for i, ent in entries {
+    let full = ent.name;
+    if cwd != "" {
+      full = cwd .. "/" .. ent.name;
+    }
+    // NOTE: the lambda parameter must NOT shadow `ent` — `fn(e) { open(e.name) }`
+    // would capture the click event's (nil) name, not the entry's.
+    if ent.dir {
+      push(rows, [:button, { class = "entry dir", onclick = fn(ev) { open(ent.name); } }, "▸ " .. ent.name .. "/"]);
+    } else {
+      let cls = "entry file";
+      if selected == full {
+        cls = "entry file sel";
+      }
+      push(rows, [:button, { class = cls, onclick = fn(ev) { pick(ent.name); } }, "· " .. ent.name]);
+    }
+  }
+  return rows;
+}
+
+fn view(cwd, entries, selected, err) {
+  let parts = [];
+  push(parts, [:style, {}, css()]);
+  let path = cwd;
+  if path == "" {
+    path = "/";
+  }
+  push(parts, [:div, { class = "bar" },
+    [:span, { class = "crumb" }, path],
+    [:button, { onclick = fn(e) { refresh(); } }, "⟳"]
+  ]);
+  if selected {
+    push(parts, [:p, { class = "sel" }, "selected: " .. selected]);
+  }
+  if err {
+    push(parts, [:p, { class = "err" }, err]);
+  }
+  push(parts, [:div, { class = "entries" }, entry_rows(cwd, entries, selected)]);
+  return [:div, {}, parts];
+}
+
+fn paint() {
+  let cwd = store(["cwd"]);
+  if !cwd {
+    cwd = "";
+  }
+  let entries = store(["entries"]);
+  if !entries {
+    entries = [];
+  }
+  let selected = store(["selected"]);
+  let err = store(["err"]);
+  cast browsers {
+    hui.render("#app", view(cwd, entries, selected, err));
+  }
+}
+
+fn on_connect(sid) {
+  // on_connect runs server-side; it must NOT call a server!()-marked flow like
+  // `refresh` (that re-hops server→server and silently drops the work — the
+  // same wound the guardian's `load` carried). Talk to the plain helper.
+  let cwd = store(["cwd"]);
+  if !cwd {
+    cwd = "";
+  }
+  goto_path(cwd);
+}
