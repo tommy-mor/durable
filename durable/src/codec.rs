@@ -130,6 +130,41 @@ pub fn order_u64(index: u64) -> [u8; 8] {
     index.to_be_bytes()
 }
 
+// ---------------------------------------------------------------------------
+// Self-describing child segments
+// ---------------------------------------------------------------------------
+//
+// A child segment is `[TAG] ++ payload`, so a scanned key reveals its own
+// addressing scheme — list-index vs map-key — with no schema in hand. Order is
+// preserved because the tag is a constant one-byte prefix and the payload keeps
+// its order-preserving encoding (big-endian index / CBOR key).
+
+/// Child addressing: an order-preserving list index (`order_u64` follows).
+pub const TAG_INDEX: u8 = 0x00;
+/// Child addressing: a CBOR-encoded map key follows.
+pub const TAG_KEY: u8 = 0x01;
+
+/// A self-describing list-index child segment: `[TAG_INDEX] ++ order_u64(i)`.
+pub fn index_segment(index: u64) -> Vec<u8> {
+    let mut s = Vec::with_capacity(9);
+    s.push(TAG_INDEX);
+    s.extend_from_slice(&order_u64(index));
+    s
+}
+
+/// A self-describing map-key child segment: `[TAG_KEY] ++ key`.
+pub fn key_segment(key: &[u8]) -> Vec<u8> {
+    let mut s = Vec::with_capacity(1 + key.len());
+    s.push(TAG_KEY);
+    s.extend_from_slice(key);
+    s
+}
+
+/// Read the addressing tag off a child segment payload (`None` if empty).
+pub fn segment_tag(seg: &[u8]) -> Option<u8> {
+    seg.first().copied()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,5 +227,33 @@ mod tests {
         for pair in values.windows(2) {
             assert!(order_i64(pair[0]) < order_i64(pair[1]));
         }
+    }
+
+    #[test]
+    fn tagged_segments_self_describe_and_keep_index_order() {
+        // List indices must sort numerically even though each child segment now
+        // opens with a TAG_INDEX byte: the tag is a constant prefix and the u64
+        // payload is big-endian, so byte order still equals numeric order.
+        let mut keys: Vec<(u64, Vec<u8>)> = [100u64, 2, 11, 0, 10, 1]
+            .iter()
+            .map(|i| (*i, child_key(b"", &index_segment(*i))))
+            .collect();
+        keys.sort_by(|a, b| a.1.cmp(&b.1));
+
+        let mut got = Vec::new();
+        for (_, key) in &keys {
+            let (seg, _) = read_segment(&key[1..]).expect("index child segment"); // skip DATA
+            assert_eq!(segment_tag(seg), Some(TAG_INDEX), "index child not tagged");
+            assert_eq!(seg.len(), 9, "tag byte + 8 index bytes");
+            let idx = u64::from_be_bytes(seg[1..].try_into().expect("8 bytes"));
+            got.push(idx);
+        }
+        assert_eq!(got, vec![0u64, 1, 2, 10, 11, 100], "tag disturbed index order");
+
+        // A map key reveals its own tag: one scan, no schema, tells index from key.
+        let k = child_key(b"", &key_segment(b"username"));
+        let (seg, _) = read_segment(&k[1..]).expect("key child segment");
+        assert_eq!(segment_tag(seg), Some(TAG_KEY));
+        assert_eq!(&seg[1..], b"username");
     }
 }
