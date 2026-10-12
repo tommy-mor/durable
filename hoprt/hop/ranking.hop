@@ -81,22 +81,20 @@ fn vote(scope, winner, loser) {
   store.append({ type = "vote", scope = scope, winner = winner, loser = loser });
 }
 
-// One panel per tab on the tools scope: show, wait on the scope, chain.
-// Writers append and return; the panel wakes itself.
+// One panel per tab on the tools scope: show, wait on the scope, show
+// again. Writers append and return; the panel wakes itself.
 fn ranking_panel() {
   server!();
-  let votes = store(["scopes", "tools", "votes"]);
-  let edges = store(["scopes", "tools", "edges", store.entries]);
-  if !votes {
-    votes = 0;
-  }
-  let me = session();
-  browser!();
-  hui.render("#app", ranking_view("tools", votes, edges));
-  server!();
-  store.wait(["scopes", "tools"]);
-  cast session(me) {
-    spawn ranking_panel();
+  while true {
+    let votes = store(["scopes", "tools", "votes"]);
+    let edges = store(["scopes", "tools", "edges", store.entries]);
+    if !votes {
+      votes = 0;
+    }
+    browser!();
+    hui.render("#app", ranking_view("tools", votes, edges));
+    server!();
+    store.wait(["scopes", "tools"]);
   }
 }
 

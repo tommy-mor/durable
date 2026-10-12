@@ -17,12 +17,6 @@
 //!        | "array" "<" btype ">" | "map" "<" btype ">"
 //!        | "map" "<" key "," btype ">" | "map" "{" bfield* "}"
 //! bfield:= name ":" btype                         (closed CBOR map)
-//! ```
-//!
-//! CBOR wins: `record` lives only outside blobs (a closed map with
-//! field-id layout); inside `blob<…>` structs are `map { … }` (text keys,
-//! one opaque key). `list`/`map` with angle brackets are keyspace
-//! collections; `array`/`map` in blob position are CBOR kinds.
 //! stmt  := "let" name "=" expr ";"
 //!        | "server" "!" "(" ")" ";"                placement mark
 //!        | "browser" "!" "(" ")" ";"               placement mark (→ origin)
@@ -41,11 +35,20 @@
 //!        | "fn" "(" params ")" block               lambda; may contain marks
 //! ```
 //!
+//! CBOR wins: `record` lives only outside blobs (a closed map with
+//! field-id layout); inside `blob<…>` structs are `map { … }` (text keys,
+//! one opaque key). `list`/`map` with angle brackets are keyspace
+//! collections; `array`/`map` in blob position are CBOR kinds.
+//!
 //! Compilation of a marked function: the body lowers to a control-flow
 //! graph of basic blocks (see the CFG pipeline below). A placement mark is
 //! a call edge — the current piece parks at `At` and resumes when the far
 //! piece replies — so marks are legal anywhere a flow body reaches:
-//! branches, loops, match arms. What crosses each hop is LiveIn of the far
+//! branches, loops (`while true` included), match arms. A mark back to the
+//! side that parked the current piece *closes* it in straight-line code;
+//! inside a branch, arm, or loop body the piece itself entered, it opens a
+//! nested piece instead, so the body rejoins the piece it started in (its
+//! join block or loop header lives there). What crosses each hop is LiveIn of the far
 //! piece's entry block, computed by backwards liveness over the graph;
 //! what comes back in a reply is the continuation's live vars the far
 //! piece defined. Hop functions register under stable hop ids

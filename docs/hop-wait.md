@@ -5,7 +5,10 @@ landed as: `durable::watch` (the shipped bridge), `store.wait(path)` with
 prefix-overlap waking, `spawn` handles + `cancel` / `cancel_origin`, tab
 close ending flows, and the read-seq riding every hop and reply. Still
 open: general `wait([...])`, the morph-race rule, the dev lint, Rust
-reducers. Details at the bottom.*
+reducers. Details at the bottom — including corrections: panels are
+plain loops (the spawn-chain workaround rested on a misdiagnosed compiler
+crash), cancellation releases both halves of a flow, and parked flows
+only hear from the party they await.*
 
 *Original landing note (design, not spec): written after a long night of
 going around the problem from every side. This records the path, not just
@@ -181,7 +184,9 @@ instead of slipping through.
 ### Lifecycle
 
 `spawn chat_panel(room)` returns a handle. Switching rooms is a story that
-cancels the old panel and spawns a new one. Closing a tab ends its flows.
+cancels the old panel and spawns a new one — both halves of her: the
+server half asleep in the wait and the browser half parked on the hop
+that started her. Closing a tab ends its flows.
 Tab state stops needing a home: "which room am I in" is the argument of
 the panel flow currently running.
 
@@ -308,23 +313,41 @@ the design above.
 - **Cancel is handles + origins.** `spawn` is an expression (the child flow
   id); `cancel(handle)` kills one; `cancel_origin()` kills all my server
   flows (no arg = my session). Tab close kills by origin before the
-  disconnect hook. A cancelled waiter simply never wakes.
+  disconnect hook. A cancelled waiter simply never wakes. *Correction:*
+  as first shipped, killing the server half stranded the browser half —
+  one dead parked frame per room switch for the life of the tab — and a
+  tab's own `cancel(h)` never reached the server. A `cancel` packet now
+  carries the death across; only the flow's own tab may send one.
 - **read-seq rides everywhere.** Every store read stamps the flow's commit
   point; it rides hop packets AND replies, max-merged per flow. Miss the
   reply half and browser hops clobber the stamp to 0 — every wait wakes
   instantly in an infinite render chain (found live, fixed).
-- **Panels are spawn chains, not loops.** `while true` with marks panics
-  the CFG backend (missing fixup address), so the compiler rejects marks
-  inside `while true` with a clear error. Bounded loops and for-loops
-  with marks are fine. The panel shape: show, wait, cast-spawn the next
-  iteration browser-side, return. The cast-spawn matters: a server-spawned
-  child has Nil origin, so her `browser!()` dies — chain through your own
-  session.
+- **Panels are loops after all.** As first shipped, this said `while true`
+  with marks panics the backend, rejected marks there, and rewrote every
+  panel as a spawn chain. The diagnosis was wrong. The crash was any body
+  — `if`, `match`, `for`, `while cond`, `while true` — that hops *back* to
+  the side it was entered on: the mark closed the piece the body started
+  in, stranding its join block or loop header. So the guard blocked loop
+  shapes that worked and let bounded ones crash. Fixed in the compiler (a
+  mark back inside a nested body opens a nested piece); the guard is gone
+  and the panels are the story this doc set out to write:
+  `server!(); while true { read; browser!(); render; server!(); store.wait(path); }`.
+  On the wire the server now *calls* the tab with each render — no chain
+  casts, no re-spawns.
+- **Far-side writes come home.** Found with the above: a far piece that
+  writes a function local before reading it didn't ship it, wrote a VM
+  global instead, and the reply clobbered the caller's copy with nil.
+  A function's own variables are now locals in every piece.
+- **Identity rides every packet, not just calls.** hopd stamped identity
+  on call/cast only; a reply or error from any socket resumed whatever
+  flow it named, and flow ids are guessable. Now the transport stamps
+  `from` everywhere and a parked flow only hears from the party she
+  awaits — a waiter, only from the store.
 - **Coarse watches are honest.** Dashboards that read the whole store
   (guardian2, microblog) watch the root (`store.wait([])`). Precision, as
   designed, will live in reducer-kept indexes, not a smarter bridge.
 - **Direct appends drain too.** The harness `append` resumes woken waiters
   inline — otherwise store-only tests would never observe a wake.
-- **Replies have side effects on arrival order.** A woken panel's
-  done-reply and chain cast land in the same server pass as the writer's
-  reply — socket tests must accept any order.
+- **Arrival order within a server pass is not a contract.** A woken
+  panel's render call lands in the same server pass as the writer's
+  reply — socket tests must accept either order.

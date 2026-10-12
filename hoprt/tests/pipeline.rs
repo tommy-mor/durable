@@ -90,7 +90,7 @@ fn liveness_ships_only_what_the_remainder_uses() {
 #[test]
 fn todo_app_runs_on_simulated_cluster() {
     // Wait-shape: writers append and return; each tab's panel wakes itself.
-    // Open boards first (one live panel iteration per tab, parked), then
+    // Open boards first (one live panel per tab, asleep in the wait), then
     // write. Toggle through the flow the onclick calls.
     let src = include_str!("../hop/todo.hop");
     let mut host = Cluster::new(&["A", "B"], src, false).expect("cluster");
