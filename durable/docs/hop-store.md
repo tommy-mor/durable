@@ -145,7 +145,7 @@ true for **containers**: a missing map, record, list, or deque reads `nil`
 anyway detects absence; no extra seek.) **Scalars keep their natural
 defaults**: a missing leaf reads `nil`, a missing sum reads `0` — a
 counter's empty state is zero, so ordinary counter reads need no guard.
-Writes cannot help with presence either way: nested writes auto-vivify by
+Writes cannot help with presence either way: nested writes create missing parents by
 key prefix (`files/x/wins.add(1)` creates a partial record for `x` without
 ceremony), because blind-merge writes must never read first.
 

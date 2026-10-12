@@ -41,7 +41,7 @@ pub fn store_field(name: &str) -> Option<Value> {
         "items" => Value::Native(NativeId::StoreItems),
         "verify" => Value::Native(NativeId::StoreVerify),
         // presence: "is any leaf at or under this path non-null?" — the only
-        // honest existence check in an auto-vivifying keyspace
+        // honest existence check in a keyspace where writes create parents
         "has" => Value::Native(NativeId::StoreHas),
         // park until a commit touches this subtree — the wait verb.
         // A story shows, waits, shows again; nothing listens unnamed.

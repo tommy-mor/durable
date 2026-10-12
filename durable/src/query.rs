@@ -279,7 +279,7 @@ pub fn one(db: &Db, schema: &Shape, query: &Query) -> Result<Option<Value>> {
 /// Presence is probed in the raw keyspace, never materialized: schema
 /// defaults (a missing Sum reads as 0) and empty-record subtrees cannot
 /// masquerade as existence, and the cost is one seek, not a subtree read.
-/// In a store where nested writes auto-vivify by key prefix, this is the
+/// In a store where nested writes create missing parents by key prefix, this is the
 /// only honest existence check.
 pub fn has(db: &Db, schema: &Shape, query: &Query) -> Result<bool> {
     if query.is_collecting() {

@@ -272,7 +272,7 @@ impl StoreBinding {
                 Ok(Value::Bool(true))
             }
             NativeId::StoreHas => {
-                // Presence in an auto-vivifying keyspace is semantic, not
+                // Presence in a parent-creating keyspace is semantic, not
                 // structural: probed in the raw keyspace (durable::query::has),
                 // so a missing record's empty-map read and a missing sum's
                 // zero default cannot masquerade as existence.
