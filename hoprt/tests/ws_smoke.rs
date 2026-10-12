@@ -5,10 +5,11 @@
 //! riding hop replies (not broadcasts), and identity stamping — all across
 //! real TCP, all binary.
 //!
-//! Wire shape of the wait world: the tab sends calls, the server answers
-//! with replies whose vars carry the render data; writers get bare replies;
-//! chain links arrive as casts the tab answers by sending the next
-//! iteration's first hop.
+//! Wire shape of the wait world: the tab opens her panel with one call;
+//! from then on the server *calls her* with each fresh render (the panel
+//! loop hops to the browser), she answers, and the panel sleeps again.
+//! Writers get bare replies. Forged answers and cancels from another tab
+//! are dropped at the server.
 
 use std::net::TcpStream;
 use std::thread;
@@ -83,12 +84,26 @@ fn reply(flow: &str, value: Value) -> Value {
     ])
 }
 
-/// Snapshot array out of a panel reply's vars.
+/// Snapshot array out of a panel render call's vars.
 fn snap_of(pkt: &Value) -> Vec<Value> {
-    match pkt.get_field("value").get_field("vars").get_field("snapshot") {
+    assert_eq!(pkt.get_field("kind"), s("call"), "a render is a call: {pkt}");
+    assert_eq!(pkt.get_field("hop"), s("todo_panel:2"), "the panel's browser piece: {pkt}");
+    match pkt.get_field("vars").get_field("snapshot") {
         Value::Array(a) => a.borrow().clone(),
         other => panic!("snapshot is {other}: {pkt}"),
     }
+}
+
+/// Read packets until one matches, collecting the rest (order across a
+/// server pass is not part of the contract).
+fn recv_n(ws: &mut Ws, n: usize) -> Vec<Value> {
+    (0..n).map(|_| recv(ws)).collect()
+}
+
+fn find<'a>(pkts: &'a [Value], kind: &str, flow: &str) -> &'a Value {
+    pkts.iter()
+        .find(|p| p.get_field("kind") == s(kind) && p.get_field("flow") == s(flow))
+        .unwrap_or_else(|| panic!("no {kind} for {flow} in {pkts:?}"))
 }
 
 #[test]
@@ -130,60 +145,26 @@ fn hopd_serves_the_todo_app_over_real_sockets() {
     assert_eq!(pkt.get_field("kind"), s("reply"));
     assert_eq!(pkt.get_field("flow"), s("A#1"));
 
-    // … the spawn runs panel browser-side: her first server hop …
+    // … then spawns her panel, whose loop lives on the server …
     send(&mut a, &call("A#2", "todo_panel:1", &[]));
-    // … answered with the render data: the empty board
-    let pkt = recv(&mut a);
-    assert_eq!(pkt.get_field("flow"), s("A#2"));
-    assert_eq!(snap_of(&pkt).len(), 0, "empty board renders: {pkt}");
+    // … and the server calls the tab with the first render: an empty board.
+    let render = recv(&mut a);
+    assert_eq!(render.get_field("flow"), s("A#2"));
+    assert_eq!(snap_of(&render).len(), 0, "empty board renders: {render}");
+    // The tab "renders" and answers; the panel goes to sleep in store.wait.
+    send(&mut a, &reply("A#2", Value::Nil));
 
-    // ── the browser piece "renders", then hops back to wait …
-    let me = pkt
-        .get_field("value")
-        .get_field("vars")
-        .get_field("me")
-        .as_str()
-        .unwrap()
-        .to_string();
-    send(&mut a, &call("A#2", "todo_panel:2", &[("me", s(me.as_str()))]));
-    // … and nothing comes back: she parked in store.wait (read timeout
-    // would fire — so send the write on a NEW flow instead of reading)
-    // ── A "types a todo": the writer appends and gets a bare reply. Three
-    // packets land in one server pass, any order: the writer reply (A#3),
-    // the woken panel's done-reply (A#2 returns after chaining), and the
-    // chain cast spawning iteration 2.
+    // ── A "types a todo": the writer gets a bare reply, and the woken panel
+    // calls A with the new board. One server pass, either order.
     send(&mut a, &call("A#3", "add_todo:1", &[("text", s("buy milk"))]));
-    let (mut replies, mut casts) = (Vec::new(), Vec::new());
-    for _ in 0..3 {
-        let pkt = recv(&mut a);
-        match pkt.get_field("kind").as_str() {
-            Some("reply") => replies.push(pkt),
-            Some("cast") => casts.push(pkt),
-            other => panic!("unexpected packet: {other:?} {pkt}"),
-        }
-    }
-    assert!(replies.iter().any(|p| p.get_field("flow") == s("A#3")), "writer reply");
-    // ── the woken panel chains: a cast arrives spawning the next iteration …
-    assert_eq!(casts.len(), 1, "one chain cast");
-    assert_eq!(casts[0].get_field("hop"), s("todo_panel:c1"));
-    // … the tab spawns her browser-side: first server hop of iteration 2 …
-    send(&mut a, &call("A#4", "todo_panel:1", &[]));
-    let pkt = recv(&mut a);
-    assert_eq!(pkt.get_field("flow"), s("A#4"));
-    let items = snap_of(&pkt);
-    assert_eq!(items.len(), 1, "woken panel re-reads: {pkt}");
+    let pkts = recv_n(&mut a, 2);
+    find(&pkts, "reply", "A#3");
+    let items = snap_of(find(&pkts, "call", "A#2"));
+    assert_eq!(items.len(), 1, "woken panel re-reads");
     assert_eq!(items[0].get_field("text"), s("buy milk"));
-    let me = pkt
-        .get_field("value")
-        .get_field("vars")
-        .get_field("me")
-        .as_str()
-        .unwrap()
-        .to_string();
-    send(&mut a, &call("A#4", "todo_panel:2", &[("me", s(me.as_str()))]));
-    // parked again — silence. On to tab B.
+    send(&mut a, &reply("A#2", Value::Nil));
 
-    // ── tab B joins late: hello, boot cast, same dance, but her panel
+    // ── tab B joins late: hello, boot cast, same dance; her first render
     // reads the existing board (replay from the tape, not a push)
     let mut b = connect_with_retry();
     let hello = recv(&mut b);
@@ -194,20 +175,24 @@ fn hopd_serves_the_todo_app_over_real_sockets() {
     let pkt = recv(&mut b);
     assert_eq!(pkt.get_field("flow"), s("B#1"));
     send(&mut b, &call("B#2", "todo_panel:1", &[]));
-    let pkt = recv(&mut b);
-    assert_eq!(snap_of(&pkt).len(), 1, "late tab sees the board: {pkt}");
-    let me = pkt
-        .get_field("value")
-        .get_field("vars")
-        .get_field("me")
-        .as_str()
-        .unwrap()
-        .to_string();
-    send(&mut b, &call("B#2", "todo_panel:2", &[("me", s(me.as_str()))]));
+    let render = recv(&mut b);
+    assert_eq!(snap_of(&render).len(), 1, "late tab sees the board: {render}");
+    send(&mut b, &reply("B#2", Value::Nil));
+
+    // ── B attacks A's sleeping panel: a forged answer, a forged error, and
+    // a forged cancel, all naming A#2. hopd stamps `from: "B"`; the server
+    // drops all three. If any landed, A's panel would be dead or resumed
+    // with junk, and the toggle below wouldn't reach her.
+    send(&mut b, &reply("A#2", s("pwned")));
+    send(
+        &mut b,
+        &map(&[("kind", s("error")), ("flow", s("A#2")), ("to", s("server")), ("err", s("pwned"))]),
+    );
+    send(&mut b, &map(&[("kind", s("cancel")), ("flow", s("A#2")), ("to", s("server"))]));
 
     // ── B toggles item 0 (forged origin: hopd stamps the connection's id).
-    // The writer's bare reply goes to B, not the forged A; then BOTH tabs
-    // get chain casts and re-render with done=true.
+    // The writer's bare reply goes to B, not the forged A; both panels wake
+    // and re-render with done=true.
     send(
         &mut b,
         &map(&[
@@ -220,47 +205,15 @@ fn hopd_serves_the_todo_app_over_real_sockets() {
             ("reply_to", s("A")),
         ]),
     );
-    // B's socket gets three packets, any order: her writer reply (B#3),
-    // her panel's done-reply, and her chain cast.
-    let (mut b_replies, mut b_cast) = (Vec::new(), None);
-    for _ in 0..3 {
-        let pkt = recv(&mut b);
-        match pkt.get_field("kind").as_str() {
-            Some("reply") => b_replies.push(pkt),
-            Some("cast") => b_cast = Some(pkt),
-            other => panic!("unexpected packet: {other:?} {pkt}"),
-        }
-    }
-    assert!(b_replies.iter().any(|p| p.get_field("flow") == s("B#3")), "writer reply to B");
-    assert_eq!(b_cast.as_ref().expect("chain cast to B").get_field("hop"), s("todo_panel:c1"));
+    let pkts = recv_n(&mut b, 2);
+    find(&pkts, "reply", "B#3");
+    let items = snap_of(find(&pkts, "call", "B#2"));
+    assert_eq!(items[0].get_field("done"), Value::Bool(true), "B sees the toggle");
+    send(&mut b, &reply("B#2", Value::Nil));
 
-    // A's socket gets two packets, either order: her panel's done-reply
-    // and her chain cast.
-    let (mut a_replies, mut a_cast) = (Vec::new(), None);
-    for _ in 0..2 {
-        let pkt = recv(&mut a);
-        match pkt.get_field("kind").as_str() {
-            Some("reply") => a_replies.push(pkt),
-            Some("cast") => a_cast = Some(pkt),
-            other => panic!("unexpected packet: {other:?} {pkt}"),
-        }
-    }
-    assert_eq!(a_cast.as_ref().expect("chain cast to A").get_field("hop"), s("todo_panel:c1"));
-
-    // Each tab spawns her next iteration and re-reads done=true.
-    for (tab, ws, flow) in [("B", &mut b, "B#4"), ("A", &mut a, "A#5")] {
-        send(ws, &call(flow, "todo_panel:1", &[]));
-        let pkt = recv(ws);
-        let items = snap_of(&pkt);
-        assert_eq!(items.len(), 1, "{tab} re-reads");
-        assert_eq!(items[0].get_field("done"), Value::Bool(true), "{tab} sees the toggle");
-        let me = pkt
-            .get_field("value")
-            .get_field("vars")
-            .get_field("me")
-            .as_str()
-            .unwrap()
-            .to_string();
-        send(ws, &call(flow, "todo_panel:2", &[("me", s(me.as_str()))]));
-    }
+    let render = recv(&mut a);
+    assert_eq!(render.get_field("flow"), s("A#2"), "A's panel survived B's forgeries: {render}");
+    let items = snap_of(&render);
+    assert_eq!(items[0].get_field("done"), Value::Bool(true), "A sees the toggle");
+    send(&mut a, &reply("A#2", Value::Nil));
 }

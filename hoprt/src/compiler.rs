@@ -17,12 +17,6 @@
 //!        | "array" "<" btype ">" | "map" "<" btype ">"
 //!        | "map" "<" key "," btype ">" | "map" "{" bfield* "}"
 //! bfield:= name ":" btype                         (closed CBOR map)
-//! ```
-//!
-//! CBOR wins: `record` lives only outside blobs (a closed map with
-//! field-id layout); inside `blob<…>` structs are `map { … }` (text keys,
-//! one opaque key). `list`/`map` with angle brackets are keyspace
-//! collections; `array`/`map` in blob position are CBOR kinds.
 //! stmt  := "let" name "=" expr ";"
 //!        | "server" "!" "(" ")" ";"                placement mark
 //!        | "browser" "!" "(" ")" ";"               placement mark (→ origin)
@@ -41,11 +35,20 @@
 //!        | "fn" "(" params ")" block               lambda; may contain marks
 //! ```
 //!
+//! CBOR wins: `record` lives only outside blobs (a closed map with
+//! field-id layout); inside `blob<…>` structs are `map { … }` (text keys,
+//! one opaque key). `list`/`map` with angle brackets are keyspace
+//! collections; `array`/`map` in blob position are CBOR kinds.
+//!
 //! Compilation of a marked function: the body lowers to a control-flow
 //! graph of basic blocks (see the CFG pipeline below). A placement mark is
 //! a call edge — the current piece parks at `At` and resumes when the far
 //! piece replies — so marks are legal anywhere a flow body reaches:
-//! branches, loops, match arms. What crosses each hop is LiveIn of the far
+//! branches, loops (`while true` included), match arms. A mark back to the
+//! side that parked the current piece *closes* it in straight-line code;
+//! inside a branch, arm, or loop body the piece itself entered, it opens a
+//! nested piece instead, so the body rejoins the piece it started in (its
+//! join block or loop header lives there). What crosses each hop is LiveIn of the far
 //! piece's entry block, computed by backwards liveness over the graph;
 //! what comes back in a reply is the continuation's live vars the far
 //! piece defined. Hop functions register under stable hop ids
@@ -977,73 +980,10 @@ fn refs_stmts(ss: &[Stmt], out: &mut BTreeSet<String>) {
     }
 }
 
-/// Marks are legal anywhere a flow body reaches — branches, loops, match
-/// arms — EXCEPT cast bodies: a cast is a fire-and-forget message whose
-/// body already runs on the target, so a hop inside it has no meaning.
-/// Infinite-loop bodies may not contain placement marks: a `while true`
-/// back-edge has no exit edge, so a mark inside one strands the CFG backend
-/// (missing fixup address — a panic). Bounded loops carry their
-/// iterator/condition state across pieces fine (while_mark and go_b prove
-/// it). Until infinite loops compile across hops, write the wait-loop as a
-/// spawn chain instead: a flow that shows, waits, then spawns her next
-/// iteration and returns. Same story, no loop keyword, marks stay linear.
-fn check_no_loop_marks(ss: &[Stmt]) -> Result<(), String> {
-    fn is_true(e: &Expr) -> bool {
-        matches!(e, Expr::Bool(true))
-    }
-    fn reject_in(body: &[Stmt]) -> Result<(), String> {
-        for st in body {
-            if matches!(st, Stmt::Mark(_)) {
-                return Err("placement marks are not allowed inside `while true` — an infinite loop cannot hop. Write the wait-loop as a spawn chain: a flow that waits, then spawns her next iteration and returns".into());
-            }
-            match st {
-                Stmt::If(_, t, e) => {
-                    reject_in(t)?;
-                    if let Some(e) = e {
-                        reject_in(e)?;
-                    }
-                }
-                Stmt::Match(_, arms) => {
-                    for a in arms {
-                        reject_in(&a.body)?;
-                    }
-                }
-                Stmt::While(c, b) if is_true(c) => reject_in(b)?,
-                Stmt::While(_, b) => check_no_loop_marks(b)?,
-                Stmt::Cast(_, b) => reject_in(b)?,
-                // for bodies carry iterator state that survives piece
-                // splits (go_b proves it), so marks stay legal there.
-                Stmt::For(_, _, _, b) => check_no_loop_marks(b)?,
-                _ => {}
-            }
-        }
-        Ok(())
-    }
-    fn check(ss: &[Stmt]) -> Result<(), String> {
-        for s in ss {
-            match s {
-                Stmt::While(c, b) if is_true(c) => reject_in(b)?,
-                Stmt::While(_, b) => check(b)?,
-                Stmt::For(_, _, _, b) => check(b)?,
-                Stmt::If(_, t, e) => {
-                    check(t)?;
-                    if let Some(e) = e {
-                        check(e)?;
-                    }
-                }
-                Stmt::Match(_, arms) => {
-                    for a in arms {
-                        check(&a.body)?;
-                    }
-                }
-                Stmt::Cast(_, b) => check(b)?,
-                _ => {}
-            }
-        }
-        Ok(())
-    }
-    check(ss)
-}
+/// Marks are legal anywhere a flow body reaches — branches, loops
+/// (`while true` included), match arms — EXCEPT cast bodies: a cast is a
+/// fire-and-forget message whose body already runs on the target, so a hop
+/// inside it has no meaning.
 
 /// Lambda bodies are separate flow bodies, checked when they compile.
 fn check_no_cast_marks(ss: &[Stmt]) -> Result<(), String> {
@@ -1726,6 +1666,10 @@ struct CfgBuilder {
     match_n: usize,
     /// (piece, resume block) parked by each open mark, innermost last
     stack: Vec<(usize, usize)>,
+    /// stack depth at entry to the innermost lexical statement list. A mark
+    /// back to the parked side may only *close* a piece opened inside that
+    /// list; below the floor it opens a nested piece instead (see `mark`).
+    floor: usize,
 }
 
 impl CfgBuilder {
@@ -1742,6 +1686,7 @@ impl CfgBuilder {
             loop_n: 0,
             match_n: 0,
             stack: vec![],
+            floor: 0,
         }
     }
 
@@ -1772,6 +1717,13 @@ impl CfgBuilder {
     /// order and control resumes in the caller's piece.
     fn stmts(&mut self, ss: &[Stmt], cur0: usize, p0: usize) -> Result<usize, String> {
         let depth = self.stack.len();
+        let outer_floor = std::mem::replace(&mut self.floor, depth);
+        let r = self.stmts_in(ss, cur0, p0, depth);
+        self.floor = outer_floor;
+        r
+    }
+
+    fn stmts_in(&mut self, ss: &[Stmt], cur0: usize, p0: usize, depth: usize) -> Result<usize, String> {
         let mut cur = cur0;
         let mut p = p0;
         for s in ss {
@@ -1870,11 +1822,22 @@ impl CfgBuilder {
     /// A placement mark. Marks alternate sides: a mark to the side of the
     /// piece that parked us ends this piece (its reply resumes the parked
     /// frame); any other mark parks the current piece and opens a new one.
+    ///
+    /// Ending a piece is only sound when that piece was opened inside the
+    /// current lexical statement list (stack deeper than `floor`). A branch,
+    /// arm, or loop body entered *in* piece `p` must rejoin `p` — its join
+    /// block or loop header lives there — so a mark back to the parked side
+    /// inside such a body opens a nested piece instead: `p` stays parked,
+    /// the body runs over there, and when the body ends (or marks back) the
+    /// nested piece replies and control is home again in `p`. Closing `p`
+    /// there would strand the join/back-edge in a piece that already
+    /// replied (the old "no entry found for key" emitter panic).
     fn mark(&mut self, side: Side, cur: usize, p: usize) -> Result<(usize, usize), String> {
         if side == self.pieces[p].side {
             return Err(format!("{}: mark to the side already executing", self.prefix));
         }
-        if let Some(&(parent, cont)) = self.stack.last() {
+        if self.stack.len() > self.floor {
+            let &(parent, cont) = self.stack.last().expect("stack deeper than floor");
             if self.pieces[parent].side == side {
                 self.stack.pop();
                 self.seal(cur, Term::Exit);
@@ -2073,6 +2036,10 @@ struct Px<'a> {
     piece_defs: Vec<BTreeSet<String>>,
     /// every locally-bound name in the whole function (warning analysis)
     all_defs: BTreeSet<String>,
+    /// the function's own variables: params/captures and every `let`,
+    /// loop, and match-field binding. Such a name is a local in every
+    /// piece — never a VM global — even where it did not ship.
+    bound: BTreeSet<String>,
     reply_vars: Vec<BTreeSet<String>>,
     /// pieces that can return: contain a `return`, or mark into a piece
     /// that can. Their replies carry a `ret` tag so a far piece's return
@@ -2103,7 +2070,6 @@ fn emit_flow_body(
     body: &[Stmt],
 ) -> Result<(), String> {
     check_no_cast_marks(body)?;
-    check_no_loop_marks(body)?;
     let cfg = CfgBuilder::new(prefix).build(body)?;
     let la = liveness(&cfg);
     let mut piece_defs: Vec<BTreeSet<String>> = vec![BTreeSet::new(); cfg.pieces.len()];
@@ -2112,6 +2078,26 @@ fn emit_flow_body(
         for v in &la.defs[i] {
             piece_defs[b.piece].insert(v.clone());
             all_defs.insert(v.clone());
+        }
+    }
+    let mut bound: BTreeSet<String> = fb.scope.iter().map(|(n, _)| n.clone()).collect();
+    for b in &cfg.blocks {
+        for st in &b.stmts {
+            match st {
+                Simple::Let(n, _) => {
+                    bound.insert(n.clone());
+                }
+                Simple::MatchFields(_, fields) => {
+                    for (_, local) in fields {
+                        bound.insert(local.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Term::ForNext { k, v, .. } = &b.term {
+            bound.insert(k.clone());
+            bound.insert(v.clone());
         }
     }
     // reply vars are computed at each mark, where the ship set exists:
@@ -2138,6 +2124,7 @@ fn emit_flow_body(
         live_in: &la.live_in,
         piece_defs,
         all_defs,
+        bound,
         reply_vars: vec![BTreeSet::new(); cfg.pieces.len()],
         can_ret,
         ship: vec![BTreeSet::new(); cfg.pieces.len()],
@@ -2198,6 +2185,24 @@ fn emit_piece(px: &mut Px, fb: &mut Fb, pi: usize) -> Result<(), String> {
             let k = px.cg.k_str(v);
             fb.emit(Instr::GetField(k));
             let slot = fb.def_local(v);
+            fb.emit(Instr::StoreLocal(slot));
+            entry_scope.insert(v.clone(), slot);
+            px.slots.insert(v.clone(), slot);
+        }
+        // The function's own variables stay locals here even when they
+        // didn't ship. A far-side write before any read (`status =
+        // "saved"` with nothing reading `status` first) is not live on
+        // entry, so it doesn't cross; without a local it would land in a
+        // VM global, the reply would carry nothing, and the caller's
+        // rebind would clobber her copy with nil.
+        let own: Vec<String> = px.piece_defs[pi]
+            .iter()
+            .filter(|n| px.bound.contains(*n) && !ship.contains(*n))
+            .cloned()
+            .collect();
+        for v in own {
+            fb.emit(Instr::Nil);
+            let slot = fb.def_local(&v);
             fb.emit(Instr::StoreLocal(slot));
             entry_scope.insert(v.clone(), slot);
             px.slots.insert(v.clone(), slot);

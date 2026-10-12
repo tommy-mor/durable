@@ -137,20 +137,19 @@ fn publish() {
   store.append({ type = "post", sid = session(), text = text });
 }
 
-// One panel per tab: show my feed, wait until the store moves, spawn the
-// next iteration. Root watch — the view reads users, timelines, and posts
+// One panel per tab: show my feed, wait until the store moves, show it
+// again. Root watch — the view reads users, timelines, and posts
 // together, so the whole store is the honest watch.
 fn feed_panel() {
   let me = session();
   server!();
-  let users = store.items(["users"]);
-  let feed = gather_timeline(me);
-  browser!();
-  hui.render("#app", blog_view(me, users, feed));
-  server!();
-  store.wait([]);
-  cast session(me) {
-    spawn feed_panel();
+  while true {
+    let users = store.items(["users"]);
+    let feed = gather_timeline(me);
+    browser!();
+    hui.render("#app", blog_view(me, users, feed));
+    server!();
+    store.wait([]);
   }
 }
 

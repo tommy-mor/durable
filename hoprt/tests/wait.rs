@@ -172,7 +172,7 @@ const CHAT: &str = include_str!("../hop/chat.hop");
 #[test]
 fn chat_panels_wake_per_room_without_broadcast() {
     let mut host = Cluster::new(&["A", "B"], CHAT, false).expect("cluster");
-    // Both tabs open the lobby. Each runs her own panel iteration, parked.
+    // Both tabs open the lobby. Each runs her own panel, asleep in the wait.
     host.fire_args("A", "open_room", vec![s("lobby")]);
     host.fire_args("B", "open_room", vec![s("lobby")]);
     host.pump();
@@ -184,7 +184,7 @@ fn chat_panels_wake_per_room_without_broadcast() {
     host.fire_args("B", "open_room", vec![s("random")]);
     host.pump();
     assert!(host.dom("B", "#app").contains("room random"), "B moved rooms");
-    assert_eq!(host.server_parked().len(), 2, "still exactly two live iterations");
+    assert_eq!(host.server_parked().len(), 2, "still exactly two live panels");
 
     // A sends to lobby (direct append = same commit path as say_in).
     host.append(

@@ -80,28 +80,23 @@ fn toggle_todo(id) {
   store.append({ type = "toggle", id = id });
 }
 
-// The panel: show the board, wait until it changes, then spawn her next
-// iteration and return. One live iteration per tab, parked in store.wait
-// while quiet. Always spawned browser-side (entry assumes it).
+// The panel: show the board, wait until it changes, show it again. One
+// live panel per tab, asleep in store.wait while the board is quiet.
 fn todo_panel() {
   server!();
-  let snapshot = store.items(["todos"]);
-  let created = store(["stats", "created"]);
-  let completed = store(["stats", "completed"]);
-  let me = session();
-  browser!();
-  hui.render("#app", todo_app(snapshot, created, completed));
-  server!();
-  store.wait(["todos"]);
-  // Next iteration must start browser-side; this piece is on the server,
-  // so hand my own session a spawn. Chain unbroken, entry correct.
-  cast session(me) {
-    spawn todo_panel();
+  while true {
+    let snapshot = store.items(["todos"]);
+    let created = store(["stats", "created"]);
+    let completed = store(["stats", "completed"]);
+    browser!();
+    hui.render("#app", todo_app(snapshot, created, completed));
+    server!();
+    store.wait(["todos"]);
   }
 }
 
 // One panel per tab. Kill strays first (reconnects double-open), then
-// spawn her browser-side so entry is correct.
+// start the panel.
 fn open_board() {
   server!();
   cancel_origin();

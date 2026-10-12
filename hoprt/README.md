@@ -78,8 +78,18 @@ control-flow graph the compiler builds from your body:
   caller still needs the value.
 
 Marks alternate sides (`server!()` while on the server is a compile
-error). A hop inside a `cast` is rejected — a cast is a fire-and-forget
-message whose body already runs on the target.
+error). In straight-line code a mark back to the side that parked you
+closes the current piece and continues there. Inside a branch, arm, or
+loop body, it opens a nested piece instead, so the body comes home to
+the piece it started in — that's what lets a loop live on the server and
+hop to the browser every iteration. A hop inside a `cast` is rejected —
+a cast is a fire-and-forget message whose body already runs on the
+target.
+
+**Identity rides the connection.** The transport stamps every packet
+with who sent it; a reply, error, or cancel only lands on a flow that is
+waiting on *that* sender (a panel asleep in `store.wait` is woken only by
+the store). Flow ids are guessable, so the id is never proof.
 
 **Debugging the network** is two instruments:
 
@@ -237,14 +247,17 @@ hopd <app.hop> [http_port] [ws_port]
   (`ok { value } => ...`), `return`.
 - `spawn f(args)` starts a flow; it runs when the current piece finishes.
   `spawn` is an expression — its value is the child's handle (flow id).
-  `cancel(handle)` kills one flow (stack and store watch); `cancel_origin()`
-  kills all my server flows (room switches, tab close does this for you).
-  `while true` bodies may not hold marks — write wait-loops as spawn
-  chains: show, `store.wait`, spawn the next iteration, return.
+  `cancel(handle)` kills one flow — both halves, wherever they're parked,
+  and her store watch; `cancel_origin()` kills all my server flows the
+  same way (room switches; closing a tab does it for you).
+- A panel is a plain loop that lives on the server:
+  `server!(); while true { read; browser!(); render; server!(); store.wait(path); }`.
 - Assignment to an unbound name sets a process global (`x = 1` with no
   `let x` in scope is a global store — useful for per-process state like
   an ephemeral API key that must never touch the tape). The flip side:
-  a typo'd local silently becomes a global.
+  a typo'd local silently becomes a global. A function's own variables
+  (params, `let`s) stay local on both sides of every hop, even when the
+  far side writes one before reading it.
 - Lambdas are closures (`fn (e) { ... }`); captures are copied at
   creation. Lambdas may contain marks — this is what makes
   `onclick = fn(e) { server!(); ... }` work.

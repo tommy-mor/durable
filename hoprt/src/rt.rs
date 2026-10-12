@@ -12,7 +12,14 @@
 //! { kind:"cast",  flow, to, hop, vars, origin, user }
 //! { kind:"reply", flow, to, value }
 //! { kind:"error", flow, to, err }
+//! { kind:"cancel", flow, to }        the other half of `flow` died
 //! ```
+//!
+//! Every packet entering the server also carries `from`, stamped by the
+//! transport, never by the sender (hopd's socket ingress, the effects
+//! executor, the harness router). A reply or error resumes a parked level
+//! only if `from` is the party that level awaits — flow ids are guessable,
+//! so the flow id alone is no proof.
 //!
 //! Reply routing is LIFO per (flow, VM): hops nest like calls. An error in
 //! a remote segment unwinds hop by hop to the flow origin. Spawned flows
@@ -124,6 +131,12 @@ struct Parked {
     exec: Exec,
     ctx: FlowCtx,
     on_complete: Complete,
+    /// Who may resume this level: the address the hop went to (a session,
+    /// "server", "@effects"), or "@wait" for a store.wait park (only the
+    /// courier wakes those, never a packet). A reply or error from anyone
+    /// else is dropped: flow ids are guessable, so without this any tab
+    /// could answer another tab's parked flow with a value of her choosing.
+    awaiting: Value,
 }
 
 /// Browser-side hiccup handler registry (hui). Per-render mint: every
@@ -324,13 +337,60 @@ impl Vm {
         self.step(platform, exec, ctx, Complete::Done);
     }
 
-    /// Cancel a spawned flow by handle: drop her parked stack (a waiter
-    /// sleeping in store.wait dies too — the platform drops her watch).
-    /// Switching rooms is a story that cancels the old panel and spawns
-    /// a new one. Returns true when a flow actually died.
+    /// Cancel a spawned flow by handle: drop her parked stack here (a
+    /// waiter sleeping in store.wait dies too — the platform drops her
+    /// watch) and tell the other side, so her other half doesn't sit
+    /// parked forever. Switching rooms is a story that cancels the old
+    /// panel and spawns a new one. Returns true when a level died here.
     pub fn cancel_flow(&mut self, platform: &mut dyn Platform, flow: &str) -> bool {
+        let (died, mut peers) = self.drop_flow(platform, flow);
+        // A tab may hold nothing parked for a flow whose live half is on
+        // the server (a server-started flow carrying her origin): her
+        // cancel still goes to the server, which checks she owns it.
+        if matches!(self.side, SideId::Browser(_)) && !peers.contains(&Value::str("server")) {
+            peers.push(Value::str("server"));
+        }
+        for to in peers {
+            self.send_cancel(platform, flow, to);
+        }
+        died
+    }
+
+    /// Drop every parked level of `flow` on this VM and her store.wait
+    /// watch. Returns whether anything was parked, and the peers she was
+    /// bound to — the parties her levels await or would reply to — which
+    /// are exactly the VMs holding her other half.
+    fn drop_flow(&mut self, platform: &mut dyn Platform, flow: &str) -> (bool, Vec<Value>) {
         platform.cancel_waiter(flow);
-        self.stacks.remove(flow).is_some()
+        let Some(stack) = self.stacks.remove(flow) else {
+            return (false, Vec::new());
+        };
+        let me = self.my_addr();
+        let mut peers: Vec<Value> = Vec::new();
+        for level in &stack {
+            let reply_to = match &level.on_complete {
+                Complete::Reply { to } => Some(to.clone()),
+                Complete::Done => None,
+            };
+            for addr in reply_to.into_iter().chain(std::iter::once(level.awaiting.clone())) {
+                let internal = matches!(addr.as_str(), Some(a) if a.starts_with('@'));
+                if !internal && addr != me && !matches!(addr, Value::Nil) && !peers.contains(&addr) {
+                    peers.push(addr);
+                }
+            }
+        }
+        (true, peers)
+    }
+
+    fn send_cancel(&self, platform: &mut dyn Platform, flow: &str, to: Value) {
+        if platform.tracing() {
+            platform.trace(format!("flow {flow} cancel -> {to}"));
+        }
+        platform.send(mk_map(vec![
+            ("kind", Value::str("cancel")),
+            ("flow", Value::str(flow)),
+            ("to", to),
+        ]));
     }
 
     /// Resume a flow parked in store.wait with a wake value: pop one
@@ -345,18 +405,19 @@ impl Vm {
         if stack.is_empty() {
             self.stacks.remove(flow);
         }
-        let Parked { mut exec, ctx, on_complete } = parked;
+        let Parked { mut exec, ctx, on_complete, .. } = parked;
         if let Some(top) = exec.frames.last_mut() {
             top.stack.push(value);
         }
         self.step(platform, exec, ctx, on_complete);
     }
 
-    /// Kill every flow whose origin session is `sid` — closing a tab ends
-    /// its flows. Server-side only; browser VMs die whole on disconnect.
-    /// Waiters die through the platform hook; hop-parked stacks drop here.
-    /// Returns how many flows died.
-    pub fn kill_origin(&mut self, platform: &mut dyn Platform, sid: &str) -> usize {
+    /// Kill every flow whose origin session is `sid`. Server-side only.
+    /// Two callers: `cancel_origin()` (a tab switching views — `notify`, so
+    /// her parked halves are released) and a tab closing (no notify: her
+    /// VM is gone whole). Waiters die through the platform hook; parked
+    /// stacks drop here. Returns how many flows died.
+    pub fn kill_origin(&mut self, platform: &mut dyn Platform, sid: &str, notify: bool) -> usize {
         platform.cancel_waiters_of_origin(sid);
         let doomed: Vec<String> = self
             .stacks
@@ -370,7 +431,12 @@ impl Vm {
             .collect();
         let n = doomed.len();
         for flow in doomed {
-            self.stacks.remove(&flow);
+            let (_, peers) = self.drop_flow(platform, &flow);
+            if notify {
+                for to in peers {
+                    self.send_cancel(platform, &flow, to);
+                }
+            }
         }
         n
     }
@@ -466,6 +532,26 @@ impl Vm {
                     ));
                     return;
                 };
+                // Only the party this level awaits may answer it. The
+                // transport stamps `from` (hopd at socket ingress, the
+                // effects executor, the harness router); the server
+                // requires it, a browser checks it when present (her only
+                // peer is the server).
+                let from = pkt.get_field("from");
+                let awaiting = &stack.last().expect("stacks never hold empty vecs").awaiting;
+                let authentic = match (&self.side, &from) {
+                    (SideId::Server, f) => f == awaiting,
+                    (SideId::Browser(_), Value::Nil) => true,
+                    (SideId::Browser(_), f) => f == awaiting,
+                };
+                if !authentic {
+                    platform.print(format!(
+                        "!! {kind} for flow {flow} from {} dropped: she awaits {}",
+                        crate::value::coerce_str(&from),
+                        crate::value::coerce_str(awaiting),
+                    ));
+                    return;
+                }
                 if platform.tracing() {
                     let detail = if kind == "reply" {
                         format!("value={}", pkt.get_field("value"))
@@ -479,7 +565,7 @@ impl Vm {
                     self.stacks.remove(&flow);
                 }
                 if kind == "reply" {
-                    let Parked { mut exec, mut ctx, on_complete } = parked;
+                    let Parked { mut exec, mut ctx, on_complete, .. } = parked;
                     // Per-flow monotonic commit point: neither side's copy
                     // may go backwards. The browser never reads the store
                     // (its copy stays 0); without this max, her next hop
@@ -506,6 +592,41 @@ impl Vm {
                     let err = pkt.get_field("err");
                     let msg = crate::value::coerce_str(&err);
                     self.dispose_error(platform, parked.ctx, parked.on_complete, msg);
+                }
+            }
+            "cancel" => {
+                // The other half of a flow died; drop ours. On the server
+                // only the flow's own tab may cancel it (a tab can't kill
+                // another tab's panels by guessing ids); a tab hears
+                // cancels only from the server. No echo back to the sender.
+                let flow = pkt.get_field("flow");
+                let flow = flow.as_str().unwrap_or("?").to_string();
+                let from = pkt.get_field("from");
+                let allowed = match &self.side {
+                    SideId::Server => self
+                        .stacks
+                        .get(&flow)
+                        .map(|stack| stack.iter().all(|l| l.ctx.origin == from))
+                        .unwrap_or(false),
+                    SideId::Browser(_) => matches!(from, Value::Nil) || from == Value::str("server"),
+                };
+                if !allowed {
+                    if self.stacks.contains_key(&flow) {
+                        platform.print(format!(
+                            "!! cancel for flow {flow} from {} dropped: not hers",
+                            crate::value::coerce_str(&from)
+                        ));
+                    }
+                    return;
+                }
+                if platform.tracing() {
+                    platform.trace(format!("flow {flow} recv cancel"));
+                }
+                let (_, peers) = self.drop_flow(platform, &flow);
+                for to in peers {
+                    if to != from {
+                        self.send_cancel(platform, &flow, to);
+                    }
                 }
             }
             other => platform.print(format!("!! unknown packet kind: {other}")),
@@ -562,7 +683,7 @@ impl Vm {
                     self.stacks
                         .entry(ctx.flow.clone())
                         .or_default()
-                        .push(Parked { exec, ctx, on_complete });
+                        .push(Parked { exec, ctx, on_complete, awaiting: Value::str("@wait") });
                     return;
                 }
                 if platform.tracing() {
@@ -574,7 +695,7 @@ impl Vm {
                 platform.send(mk_map(vec![
                     ("kind", Value::str("call")),
                     ("flow", Value::str(ctx.flow.as_str())),
-                    ("to", target),
+                    ("to", target.clone()),
                     ("hop", Value::str(hop.as_str())),
                     ("vars", vars),
                     ("origin", ctx.origin.clone()),
@@ -585,7 +706,7 @@ impl Vm {
                 self.stacks
                     .entry(ctx.flow.clone())
                     .or_default()
-                    .push(Parked { exec, ctx, on_complete });
+                    .push(Parked { exec, ctx, on_complete, awaiting: target });
             }
             RunResult::Failed(e) => self.dispose_error(platform, ctx, on_complete, e),
         }
@@ -656,7 +777,7 @@ impl Vm {
                     self.cancel_flow(platform, &flow);
                 }
                 FlowOp::CancelOrigin { sid } => {
-                    self.kill_origin(platform, &sid);
+                    self.kill_origin(platform, &sid, true);
                 }
             }
         }

@@ -319,22 +319,19 @@ fn view(running, votes, model, err, feed, rank_rows) {
   return [:div, {}, parts];
 }
 
-// The panel: show the index, wait until the store moves, then spawn her
-// next iteration and return. She watches the root — the dashboard reads
-// items, edges, votes, feed, running, model, err together, so the whole
-// store is her watch. Coarse and honest; precision later lives in the
-// schema, not in a smarter bridge.
+// The panel: show the index, wait until the store moves, show it again.
+// She watches the root — the dashboard reads items, edges, votes, feed,
+// running, model, err together, so the whole store is her watch. Coarse
+// and honest; precision later lives in the schema, not in a smarter
+// bridge.
 fn guardian_panel() {
   server!();
-  let snap = paint_data();
-  let me = session();
-  browser!();
-  hui.render("#app", view(snap.running, snap.votes, snap.model, snap.err, snap.feed, snap.rank_rows));
-  server!();
-  store.wait([]);
-  // Next iteration must start browser-side; hand my own session a spawn.
-  cast session(me) {
-    spawn guardian_panel();
+  while true {
+    let snap = paint_data();
+    browser!();
+    hui.render("#app", view(snap.running, snap.votes, snap.model, snap.err, snap.feed, snap.rank_rows));
+    server!();
+    store.wait([]);
   }
 }
 

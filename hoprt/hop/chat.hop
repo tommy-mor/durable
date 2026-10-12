@@ -5,9 +5,6 @@
 // spawns a new one — "which room am I in" is the argument of the running
 // panel flow, not a hidden input and not a tape event.
 //
-// The panel is a spawn chain, not a loop (loops can't hold marks): show,
-// wait, spawn her next iteration, return. Same story, unfolded.
-//
 //   cargo run -p hoprt --bin hopd -- hoprt/hop/chat.hop
 
 schema {
@@ -82,30 +79,23 @@ fn paint(room) {
   return { room = room, rooms = rooms, messages = messages };
 }
 
-// The panel: hop over, show the room, hop back, wait until it changes,
-// then spawn her next iteration and return. Still a story — nothing
-// listens the code didn't name. One live iteration per tab, parked in
-// store.wait while quiet. Always spawned browser-side (entry assumes it).
+// The panel: show the room, wait until it changes, show it again. Still a
+// story — nothing listens the code didn't name. One live panel per tab,
+// asleep in store.wait while the room is quiet.
 fn chat_panel(room) {
   server!();
-  let snap = paint(room);
-  let me = session();
-  browser!();
-  hui.render("#app", chat_view(snap.room, snap.rooms, snap.messages));
-  server!();
-  store.wait(["rooms", room, "messages"]);
-  // The next iteration must start browser-side (entry assumes it), but
-  // this piece is on the server with no way home except a cast: hand my
-  // own session a spawn. Origin preserved, entry correct, chain unbroken.
-  cast session(me) {
-    spawn chat_panel(room);
+  while true {
+    let snap = paint(room);
+    browser!();
+    hui.render("#app", chat_view(snap.room, snap.rooms, snap.messages));
+    server!();
+    store.wait(["rooms", room, "messages"]);
   }
 }
 
-// Switching rooms kills the tab's old panels and spawns a new one. The
-// kill runs server-side (panels live on the server, owned by my session);
-// the spawn runs browser-side (panel entry assumes a browser start... no —
-// panels are server flows: spawn her from the server piece, then come home).
+// Switching rooms kills the tab's old panel and starts a new one. The
+// kill runs server-side, where the panel sleeps (cancel_origin releases
+// her browser half too); the new panel starts here, in the tab.
 fn open_room(room) {
   server!();
   cancel_origin();
