@@ -60,6 +60,7 @@ impl Platform for SimPlatform<'_> {
         let detail = match kind.as_str().unwrap_or("?") {
             "reply" => format!("value={}", pkt.get_field("value")),
             "error" => format!("err={}", pkt.get_field("err")),
+            "cancel" => format!("flow={}", pkt.get_field("flow")),
             _ => format!(
                 "{} vars={}",
                 crate::value::coerce_str(&pkt.get_field("hop")),
@@ -489,7 +490,7 @@ impl Cluster {
         };
         // Closing a tab ends its flows: parked waiters and hop-suspended
         // server flows owned by this session die before the hook runs.
-        self.server.kill_origin(&mut platform, addr);
+        self.server.kill_origin(&mut platform, addr, false);
         self.server.session_disconnect(&mut platform, addr, &user);
     }
 

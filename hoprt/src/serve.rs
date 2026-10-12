@@ -1856,7 +1856,7 @@ pub fn serve(
                         trace: trace_file.clone(),
                     };
                     // Closing a tab ends its flows before the hook runs.
-                    let n = vm.kill_origin(&mut platform, &sid);
+                    let n = vm.kill_origin(&mut platform, &sid, false);
                     if n > 0 {
                         println!("[hopd] session {sid}: {n} flow(s) ended with the tab");
                     }
