@@ -667,6 +667,7 @@ fn effect_reply(flow: &str, value: Value) -> Vec<u8> {
             (Value::str("kind"), Value::str("reply")),
             (Value::str("flow"), Value::str(flow)),
             (Value::str("to"), Value::str("server")),
+            (Value::str("from"), Value::str(EFFECTS_ADDR)),
             (Value::str("value"), value),
         ]
         .into_iter()
@@ -681,6 +682,7 @@ fn effect_error(flow: &str, err: &str) -> Vec<u8> {
             (Value::str("kind"), Value::str("error")),
             (Value::str("flow"), Value::str(flow)),
             (Value::str("to"), Value::str("server")),
+            (Value::str("from"), Value::str(EFFECTS_ADDR)),
             (Value::str("err"), Value::str(err)),
         ]
         .into_iter()
@@ -1819,6 +1821,10 @@ pub fn serve(
                 };
                 let kind = pkt.get_field("kind");
                 let kind = kind.as_str().unwrap_or("");
+                // the socket says who sent this, whatever the packet claims:
+                // a reply or error may only answer a flow parked on *this*
+                // session (Vm::receive checks `from` against what she awaits)
+                let _ = pkt.set_field("from", Value::str(sid.as_str()));
                 if kind == "call" || kind == "cast" {
                     // never trust a claimed identity
                     let _ = pkt.set_field("origin", Value::str(sid.as_str()));

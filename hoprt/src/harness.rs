@@ -52,6 +52,9 @@ impl SimPlatform<'_> {
 
 impl Platform for SimPlatform<'_> {
     fn send(&mut self, pkt: Value) {
+        // the simulated transport stamps the sender, as hopd's socket
+        // ingress does: replies are only honored from the awaited party
+        let _ = pkt.set_field("from", Value::str(self.label.as_str()));
         let to = pkt.get_field("to");
         let kind = pkt.get_field("kind");
         let detail = match kind.as_str().unwrap_or("?") {
@@ -566,6 +569,7 @@ impl Cluster {
             match to.as_str() {
                 "@effects" => {
                     let reply = self.handle_effect(&pkt);
+                    let _ = reply.set_field("from", Value::str(crate::rt::EFFECTS_ADDR));
                     let line = format!(
                         "        ~ wire @effects -> server   reply value={}",
                         reply.get_field("value")
@@ -639,6 +643,29 @@ impl Cluster {
     /// Flow ids parked on the server VM (wait-loop panels sleep here).
     pub fn server_parked(&self) -> Vec<String> {
         self.server.parked_flows()
+    }
+
+    /// Put a raw packet on the wire as if `from` sent it — the transport
+    /// stamps the sender exactly as hopd's socket ingress does, so this is
+    /// what a hostile or buggy tab can actually do. Delivered on `pump`.
+    pub fn inject(&mut self, from: &str, pkt: Value) {
+        let _ = pkt.set_field("from", Value::str(from));
+        self.shared.emit(format!("        ~ inject {from:>6} -> {pkt}"));
+        match encode(&pkt) {
+            Ok(bytes) => self.shared.queue.push_back(bytes),
+            Err(e) => self.shared.emit(format!("!! unencodable injected packet: {e}")),
+        }
+    }
+
+    /// Flow ids parked on one tab's VM: hops awaiting a reply. A panel's
+    /// browser half parks here while her server half sleeps in store.wait;
+    /// when the server half dies, so must this.
+    pub fn browser_parked(&self, addr: &str) -> Vec<String> {
+        self.browsers
+            .iter()
+            .find(|(a, _)| a.as_str() == addr)
+            .map(|(_, vm)| vm.parked_flows())
+            .unwrap_or_default()
     }
 
     /// Every VM must have zero suspended flows once the queue is drained; a

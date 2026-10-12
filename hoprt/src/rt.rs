@@ -14,6 +14,12 @@
 //! { kind:"error", flow, to, err }
 //! ```
 //!
+//! Every packet entering the server also carries `from`, stamped by the
+//! transport, never by the sender (hopd's socket ingress, the effects
+//! executor, the harness router). A reply or error resumes a parked level
+//! only if `from` is the party that level awaits — flow ids are guessable,
+//! so the flow id alone is no proof.
+//!
 //! Reply routing is LIFO per (flow, VM): hops nest like calls. An error in
 //! a remote segment unwinds hop by hop to the flow origin. Spawned flows
 //! are scheduled and run when the current segment finishes (arguments are
@@ -124,6 +130,12 @@ struct Parked {
     exec: Exec,
     ctx: FlowCtx,
     on_complete: Complete,
+    /// Who may resume this level: the address the hop went to (a session,
+    /// "server", "@effects"), or "@wait" for a store.wait park (only the
+    /// courier wakes those, never a packet). A reply or error from anyone
+    /// else is dropped: flow ids are guessable, so without this any tab
+    /// could answer another tab's parked flow with a value of her choosing.
+    awaiting: Value,
 }
 
 /// Browser-side hiccup handler registry (hui). Per-render mint: every
@@ -345,7 +357,7 @@ impl Vm {
         if stack.is_empty() {
             self.stacks.remove(flow);
         }
-        let Parked { mut exec, ctx, on_complete } = parked;
+        let Parked { mut exec, ctx, on_complete, .. } = parked;
         if let Some(top) = exec.frames.last_mut() {
             top.stack.push(value);
         }
@@ -466,6 +478,26 @@ impl Vm {
                     ));
                     return;
                 };
+                // Only the party this level awaits may answer it. The
+                // transport stamps `from` (hopd at socket ingress, the
+                // effects executor, the harness router); the server
+                // requires it, a browser checks it when present (her only
+                // peer is the server).
+                let from = pkt.get_field("from");
+                let awaiting = &stack.last().expect("stacks never hold empty vecs").awaiting;
+                let authentic = match (&self.side, &from) {
+                    (SideId::Server, f) => f == awaiting,
+                    (SideId::Browser(_), Value::Nil) => true,
+                    (SideId::Browser(_), f) => f == awaiting,
+                };
+                if !authentic {
+                    platform.print(format!(
+                        "!! {kind} for flow {flow} from {} dropped: she awaits {}",
+                        crate::value::coerce_str(&from),
+                        crate::value::coerce_str(awaiting),
+                    ));
+                    return;
+                }
                 if platform.tracing() {
                     let detail = if kind == "reply" {
                         format!("value={}", pkt.get_field("value"))
@@ -479,7 +511,7 @@ impl Vm {
                     self.stacks.remove(&flow);
                 }
                 if kind == "reply" {
-                    let Parked { mut exec, mut ctx, on_complete } = parked;
+                    let Parked { mut exec, mut ctx, on_complete, .. } = parked;
                     // Per-flow monotonic commit point: neither side's copy
                     // may go backwards. The browser never reads the store
                     // (its copy stays 0); without this max, her next hop
@@ -562,7 +594,7 @@ impl Vm {
                     self.stacks
                         .entry(ctx.flow.clone())
                         .or_default()
-                        .push(Parked { exec, ctx, on_complete });
+                        .push(Parked { exec, ctx, on_complete, awaiting: Value::str("@wait") });
                     return;
                 }
                 if platform.tracing() {
@@ -574,7 +606,7 @@ impl Vm {
                 platform.send(mk_map(vec![
                     ("kind", Value::str("call")),
                     ("flow", Value::str(ctx.flow.as_str())),
-                    ("to", target),
+                    ("to", target.clone()),
                     ("hop", Value::str(hop.as_str())),
                     ("vars", vars),
                     ("origin", ctx.origin.clone()),
@@ -585,7 +617,7 @@ impl Vm {
                 self.stacks
                     .entry(ctx.flow.clone())
                     .or_default()
-                    .push(Parked { exec, ctx, on_complete });
+                    .push(Parked { exec, ctx, on_complete, awaiting: target });
             }
             RunResult::Failed(e) => self.dispose_error(platform, ctx, on_complete, e),
         }
