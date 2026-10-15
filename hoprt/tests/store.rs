@@ -24,7 +24,8 @@ fn todo_persists_across_reopen_and_verifies() {
 
     {
         let mut host = Cluster::with_data_dir(&["A"], TODO, false, dir.path()).expect("host");
-        host.fire("A", "sim_demo");
+        host.fire_args("A", "add_todo", vec![s("buy milk")]);
+        host.fire_args("A", "add_todo", vec![s("write the compiler")]);
         host.pump();
         host.assert_quiescent();
 
@@ -98,7 +99,8 @@ fn where_and_slice_navigators_filter_queries() {
 #[test]
 fn rebuild_from_tape_matches_live() {
     let mut host = Cluster::new(&["A"], TODO, false).expect("host");
-    host.fire("A", "sim_demo");
+    host.fire_args("A", "add_todo", vec![s("buy milk")]);
+    host.fire_args("A", "add_todo", vec![s("write the compiler")]);
     host.pump();
     host.rebuild().unwrap();
     host.verify().unwrap();

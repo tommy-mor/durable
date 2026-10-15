@@ -70,18 +70,18 @@ fn stroke(from, to) {
   }
 }
 
-// Entry points the host fires; each spawn is "a DOM event".
+// Entry points the host fires; each flow birth is "a DOM event".
 fn demo_join() {
-  spawn wb_connect();
+  flow "wb" wb_connect();
 }
 
 fn demo_flows() {
-  spawn check_handle("carol");
-  spawn check_handle("alice");
-  spawn check_handle("root");
-  spawn delete_account();
+  flow "check-carol" check_handle("carol");
+  flow "check-alice" check_handle("alice");
+  flow "check-root" check_handle("root");
+  flow "delete" delete_account();
 }
 
 fn demo_stroke() {
-  spawn stroke("(1,1)", "(2,3)");
+  flow "stroke" stroke("(1,1)", "(2,3)");
 }

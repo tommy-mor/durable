@@ -934,7 +934,8 @@ fn delete_t(tid) {
   cast browsers { refresh(); }
 }
 
-fn on_connect(sid) {
+fn on_connect() {
   let snap = snapshot(nil);
-  cast session(sid) { render(snap); }
+  let me = session();
+  cast session(me) { render(snap); }
 }

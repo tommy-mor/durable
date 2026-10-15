@@ -99,20 +99,9 @@ fn ranking_panel() {
 }
 
 fn open_board() {
-  server!();
-  cancel_origin();
-  browser!();
-  spawn ranking_panel();
+  flow "board" ranking_panel();
 }
 
-fn on_connect(sid) {
-  cast session(sid) {
-    open_board();
-  }
-}
-
-fn sim_demo() {
-  spawn vote("tools", "ripgrep", "grep");
-  spawn vote("tools", "ripgrep", "ag");
-  spawn vote("tools", "grep", "ag");
+fn on_connect() {
+  open_board();
 }

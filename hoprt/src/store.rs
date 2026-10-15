@@ -401,8 +401,8 @@ impl Host for ReduceHost<'_> {
         Err("cast is not allowed in a reducer".into())
     }
 
-    fn spawn(&mut self, _c: Value, _a: Vec<Value>) -> Result<Value, String> {
-        Err("spawn is not allowed in a reducer".into())
+    fn flow(&mut self, _k: String, _c: Value, _a: Vec<Value>) -> Result<(), String> {
+        Err("flow is not allowed in a reducer".into())
     }
 
     fn session(&mut self) -> Result<Value, String> {

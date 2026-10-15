@@ -47,12 +47,6 @@ pub enum NativeId {
     // pure: parametrized collecting navigators
     NavWhere,
     NavSlice,
-    /// Cancel a spawned flow by handle (spawn's return value). True when
-    /// a flow actually died — her stack and her store watch both drop.
-    Cancel,
-    /// Kill every flow of a session. No arg = my own session (a tab
-    /// ending its panels before spawning the next).
-    CancelOrigin,
     // context: browser side
     DomGet,
     DomSet,

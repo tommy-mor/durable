@@ -336,10 +336,7 @@ fn guardian_panel() {
 }
 
 fn open_board() {
-  server!();
-  cancel_origin();
-  browser!();
-  spawn guardian_panel();
+  flow "board" guardian_panel();
 }
 
 fn paint_data() {
@@ -368,8 +365,6 @@ fn paint_data() {
   return { running = running, votes = votes, model = model, err = err, feed = feed, rank_rows = rank_rows };
 }
 
-fn on_connect(sid) {
-  cast session(sid) {
-    open_board();
-  }
+fn on_connect() {
+  open_board();
 }

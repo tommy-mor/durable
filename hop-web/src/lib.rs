@@ -5,7 +5,7 @@
 //! frame to [`BrowserVm::receive`], and sends whatever the VM's platform
 //! emits. All protocol knowledge lives here (and in hoprt): the first
 //! frame is the `hello` carrying the session id — the VM is constructed
-//! at that moment, and any `on_connect` snapshot cast follows through the
+//! at that moment, and the tab's first panel render follows through the
 //! same receive path.
 //!
 //! Rendered hui HTML calls back through `window.__hopHandler(id)`, which

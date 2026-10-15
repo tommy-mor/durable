@@ -154,33 +154,9 @@ fn feed_panel() {
 }
 
 fn open_board() {
-  server!();
-  cancel_origin();
-  browser!();
-  spawn feed_panel();
+  flow "board" feed_panel();
 }
 
-fn on_connect(sid) {
-  cast session(sid) {
-    open_board();
-  }
-}
-
-fn sim_join(name) {
-  server!();
-  store.append({ type = "join", sid = session(), name = name });
-}
-
-fn sim_follow(who) {
-  server!();
-  store.append({ type = "follow", sid = session(), who = who });
-}
-
-fn sim_post(text) {
-  server!();
-  store.append({ type = "post", sid = session(), text = text });
-}
-
-fn sim_demo() {
-  spawn sim_join("Ada");
+fn on_connect() {
+  open_board();
 }

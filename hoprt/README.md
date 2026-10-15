@@ -55,7 +55,7 @@ see below), `server let` (a global evaluated once on the server at boot
 — config, constants) and `fn` (flows).
 
 A **flow** is a function that may cross the network. Flows originate in the
-browser (a button's `onclick`, `on_connect`, `spawn`) or in the server
+browser (a button's `onclick`, `on_connect`, a named `flow` birth) or in the server
 scheduler (`tick`).
 
 ## Placement marks: the network is punctuation
@@ -245,13 +245,18 @@ hopd <app.hop> [http_port] [ws_port]
 - Control: `if/else`, `while`, `for k, v in x` (arrays index from 0; maps
   iterate key order), `match` on `.type` with field destructuring
   (`ok { value } => ...`), `return`.
-- `spawn f(args)` starts a flow; it runs when the current piece finishes.
-  `spawn` is an expression — its value is the child's handle (flow id).
-  `cancel(handle)` kills one flow — both halves, wherever they're parked,
-  and her store watch; `cancel_origin()` kills all my server flows the
-  same way (room switches; closing a tab does it for you).
+- `flow "key" f(args)` births the named flow; it runs when the current
+  piece finishes. Birthing an already-held key atomically replaces the
+  old flow — both halves, wherever they're parked, plus her store
+  watch. That is the whole lifecycle: `open_room` is one line, reconnects
+  can't double-open, and tab close reaps what remains.
 - A panel is a plain loop that lives on the server:
   `server!(); while true { read; browser!(); render; server!(); store.wait(path); }`.
+  A hop to the side you're already on runs inline, no wire — so birth
+  site (tab or server) never changes what a panel does.
+- `on_connect()` takes no arguments and runs already owned by the
+  connecting tab: `session()` / `user()` read back what the socket
+  proved, and `flow` births inside it land under the tab.
 - Assignment to an unbound name sets a process global (`x = 1` with no
   `let x` in scope is a global store — useful for per-process state like
   an ephemeral API key that must never touch the tape). The flip side:

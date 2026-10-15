@@ -1,14 +1,10 @@
 # hop wait — how the world reaches the other tabs
 
-*Status: SHIPPED (single-path `store.wait`), 2026-10-11. The design below
-landed as: `durable::watch` (the shipped bridge), `store.wait(path)` with
-prefix-overlap waking, `spawn` handles + `cancel` / `cancel_origin`, tab
-close ending flows, and the read-seq riding every hop and reply. Still
-open: general `wait([...])`, the morph-race rule, the dev lint, Rust
-reducers. Details at the bottom — including corrections: panels are
-plain loops (the spawn-chain workaround rested on a misdiagnosed compiler
-crash), cancellation releases both halves of a flow, and parked flows
-only hear from the party they await.*
+*Status: SHIPPED (single-path `store.wait`), 2026-10-11. Superseded in
+lifecycle only: `docs/panel-lifecycle.md` (2026-10-15) replaces `spawn`
+handles + `cancel` / `cancel_origin` with the `flow "key"` birth form
+(atomic replace, no handles, zero-param addressed `on_connect`). The
+wait/courier/overlap design below stands as written.*
 
 *Original landing note (design, not spec): written after a long night of
 going around the problem from every side. This records the path, not just
@@ -183,10 +179,11 @@ instead of slipping through.
 
 ### Lifecycle
 
-`spawn chat_panel(room)` returns a handle. Switching rooms is a story that
-cancels the old panel and spawns a new one — both halves of her: the
-server half asleep in the wait and the browser half parked on the hop
-that started her. Closing a tab ends its flows.
+`flow "chat" chat_panel(room)` births the tab's panel under one key.
+Switching rooms re-births the same key: the old panel dies whole — both
+halves of her: the server half asleep in the wait and the browser half
+parked on the hop that started her — as the new one starts. Closing a
+tab ends its flows.
 Tab state stops needing a home: "which room am I in" is the argument of
 the panel flow currently running.
 

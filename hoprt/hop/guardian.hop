@@ -724,6 +724,6 @@ fn tick() {
   paint("", "", "");
 }
 
-fn on_connect(sid) {
+fn on_connect() {
   paint("", "", "");
 }

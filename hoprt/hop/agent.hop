@@ -218,7 +218,7 @@ fn run_tool(tid, cmd, call_id) {
   }
   store.append({ type = "tool_result", tid = tid, cmd = cmd, output = output, call_id = call_id });
   paint_all();
-  spawn run_turn(tid);
+  flow ("turn-" .. tid) run_turn(tid);
 }
 
 // ── human gates: the only marked functions in the file ──────────────────
@@ -237,7 +237,7 @@ fn send(tid) {
   }
   store.append({ type = "user", tid = tid, text = text });
   paint_all();
-  spawn run_turn(tid);
+  flow ("turn-" .. tid) run_turn(tid);
 }
 
 fn approve(tid) {
@@ -257,7 +257,7 @@ fn deny(tid) {
   }
   store.append({ type = "tool_denied", tid = tid, call_id = p.call_id });
   paint_all();
-  spawn run_turn(tid);
+  flow ("turn-" .. tid) run_turn(tid);
 }
 
 fn open_thread(uid, tid) {
@@ -450,9 +450,11 @@ fn paint_stream(tid, text) {
   }
 }
 
-fn on_connect(sid, uid) {
+fn on_connect() {
   // a returning user lands back in their thread; a new user gets the
-  // latest one (minting the first if the tape is empty)
+  // latest one (minting the first if the tape is empty). Identity is
+  // ambient: user() is whoever owns this tab's connection.
+  let uid = user();
   if !store(["views", uid]) {
     let next = store(["next"]) || 1;
     let tid = next - 1;
@@ -463,7 +465,7 @@ fn on_connect(sid, uid) {
     store.append({ type = "open", uid = uid, tid = tid });
   }
   if !store(["models"]) {
-    spawn fetch_models();
+    flow "models" fetch_models();
   }
   paint_user(uid);
 }

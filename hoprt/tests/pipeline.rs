@@ -97,7 +97,10 @@ fn todo_app_runs_on_simulated_cluster() {
     host.fire("A", "open_board");
     host.fire("B", "open_board");
     host.pump();
-    host.fire("A", "sim_demo");
+    // Writers append and return; the panels wake themselves. Drive the
+    // real writer flow (no test doubles in app source).
+    host.fire_args("A", "add_todo", vec![Value::str("buy milk")]);
+    host.fire_args("A", "add_todo", vec![Value::str("write the compiler")]);
     host.pump();
 
     for tab in ["A", "B"] {
@@ -567,14 +570,14 @@ fn marks_nest_inside_branches_loops_and_match_arms() {
         }
 
         fn go() {
-          spawn branch_mark(1);
-          spawn while_mark();
-          spawn for_mark();
-          spawn match_mark({ type = "ok", value = "v7" });
-          spawn match_mark({ type = "no" });
-          spawn backward_var();
-          spawn show_tail();
-          spawn merge_in_loop();
+          flow "m-branch" branch_mark(1);
+          flow "m-while" while_mark();
+          flow "m-for" for_mark();
+          flow "m-match-ok" match_mark({ type = "ok", value = "v7" });
+          flow "m-match-no" match_mark({ type = "no" });
+          flow "m-backward" backward_var();
+          flow "m-tail" show_tail();
+          flow "m-merge" merge_in_loop();
         }
     "#;
     let mut host = Cluster::new(&["A"], src, false).expect("cluster");

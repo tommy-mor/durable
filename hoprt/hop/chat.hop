@@ -1,8 +1,8 @@
 // chat.hop — rooms of messages, one panel per tab, woken by the store.
 //
 // Nested path: rooms → record → messages list. A send is one ListPush
-// under that prefix. Switching rooms kills the tab's old panels and
-// spawns a new one — "which room am I in" is the argument of the running
+// under that prefix. Switching rooms re-births the tab's panel under one
+// key — "which room am I in" is the argument of the running
 // panel flow, not a hidden input and not a tape event.
 //
 //   cargo run -p hoprt --bin hopd -- hoprt/hop/chat.hop
@@ -93,14 +93,12 @@ fn chat_panel(room) {
   }
 }
 
-// Switching rooms kills the tab's old panel and starts a new one. The
-// kill runs server-side, where the panel sleeps (cancel_origin releases
-// her browser half too); the new panel starts here, in the tab.
+// Switching rooms re-births the tab's panel under the same key: the old
+// room's panel dies whole (both halves, plus her store watch) as the new
+// one starts. "Which room am I in" is the panel's argument — no hidden
+// input, no tape event.
 fn open_room(room) {
-  server!();
-  cancel_origin();
-  browser!();
-  spawn chat_panel(room);
+  flow "chat" chat_panel(room);
 }
 
 fn open_typed_room() {
@@ -124,17 +122,6 @@ fn say_in(room) {
   store.append({ type = "say", sid = session(), room = room, text = text });
 }
 
-fn on_connect(sid) {
-  cast session(sid) {
-    open_room("lobby");
-  }
-}
-
-fn sim_say(room, text) {
-  server!();
-  store.append({ type = "say", sid = session(), room = room, text = text });
-}
-
-fn sim_demo() {
-  spawn sim_say("lobby", "hello tape");
+fn on_connect() {
+  open_room("lobby");
 }

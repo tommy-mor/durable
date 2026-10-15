@@ -1,11 +1,11 @@
-//! A flow is cancelled whole: killing one half releases the other.
+//! A flow is replaced whole: re-birthing a key releases the old flow's
+//! other half.
 //!
 //! A panel is one flow with two halves: her server half asleep in
 //! store.wait, and her browser half parked on the hop that started it.
-//! Killing only the server half (cancel_origin on a room switch) used to
-//! strand the browser half forever — one dead frame per switch, per tab,
-//! for the life of the tab. A `cancel` packet now carries the death across,
-//! in both directions, and only the flow's own tab may send one.
+//! Re-birthing her key kills both halves of the old flow — a `cancel`
+//! packet carries the death across, in both directions — and only the
+//! flow's own tab may send one.
 
 use hoprt::harness::Cluster;
 use hoprt::value::Value;
@@ -35,19 +35,7 @@ fn panel(room) {
 }
 
 fn open_room(room) {
-  server!();
-  cancel_origin();
-  browser!();
-  spawn panel(room);
-}
-
-fn open_then_close() {
-  let h = spawn panel("lobby");
-  close_later(h);
-}
-
-fn close_later(h) {
-  cancel(h);
+  flow "chat" panel(room);
 }
 
 fn say(room, text) {
@@ -79,16 +67,21 @@ fn switching_rooms_leaves_no_dead_halves() {
 }
 
 #[test]
-fn a_tab_cancelling_her_own_panel_kills_both_halves() {
+fn rebirthing_the_same_key_replaces_instead_of_duplicating() {
     let mut host = Cluster::new(&["A"], APP, false).expect("cluster");
-    host.fire("A", "open_then_close");
+    host.fire_args("A", "open_room", vec![s("lobby")]);
     host.pump();
-    assert!(host.server_parked().is_empty(), "server half died: {:?}", host.server_parked());
-    assert!(host.browser_parked("A").is_empty(), "browser half died");
-    // nothing wakes on a later write
+    let first = host.server_parked();
+    host.fire_args("A", "open_room", vec![s("lobby")]);
+    host.pump();
+    assert_eq!(host.server_parked().len(), 1, "still one server half");
+    assert_eq!(host.browser_parked("A").len(), 1, "still one browser half");
+    assert_ne!(host.server_parked(), first, "the old flow died, a new one lives");
+    // and the survivor still works: two openings plus one write wake
     host.fire_args("A", "say", vec![s("lobby"), s("hi")]);
     host.pump();
-    host.assert_quiescent();
+    let shows = host.log().iter().filter(|l| l.contains("[browser A] show lobby")).count();
+    assert_eq!(shows, 3, "{}", host.log().join("\n"));
 }
 
 #[test]

@@ -187,8 +187,9 @@ fn boom() {
   server!();
   error("test-error-surface");
 }
-fn on_connect(sid) {
-  cast session(sid) {
+fn on_connect() {
+  let me = session();
+  cast session(me) {
     hui.render("#app", [:button, { id = "boom", onclick = fn(e) { boom(); } }, "boom"]);
   }
 }

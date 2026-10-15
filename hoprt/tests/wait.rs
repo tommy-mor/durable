@@ -119,7 +119,7 @@ fn wait_sees_commit_between_read_and_park() {
 }
 
 #[test]
-fn spawn_returns_a_handle_and_cancel_kills_before_wake() {
+fn rebirth_releases_a_waiter_before_any_write() {
     let src = r##"
 schema {
   todos: map<int, leaf>
@@ -134,10 +134,12 @@ fn reduce(event) {
 fn watcher() {
   store.wait(["todos"]);
 }
+fn noop() {
+}
 fn starter() {
   server!();
-  let h = spawn watcher();
-  cancel(h);
+  flow "w" watcher();
+  flow "w" noop();
 }
 fn adder() {
   server!();
@@ -145,7 +147,8 @@ fn adder() {
 }
 "##;
     let mut host = Cluster::new(&["A"], src, false).expect("cluster");
-    // starter spawns a watcher then cancels her handle, all on the server.
+    // starter births a watcher then re-births the key with a no-op, all
+    // on the server: the replacement releases the wait before any write.
     host.fire("A", "starter");
     host.pump();
     // Nobody parked: the watcher died before any write.

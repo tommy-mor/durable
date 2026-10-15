@@ -463,8 +463,7 @@ impl Cluster {
         crate::value::coerce_str(&vm.user)
     }
 
-    /// What hopd does when a tab connects: fire `on_connect(sid, user)`
-    /// on the server VM.
+    /// What hopd does when a tab connects: run `on_connect()` owned by it.
     pub fn connect(&mut self, addr: &str) {
         let user = self.user_of(addr);
         let mut platform = SimPlatform {

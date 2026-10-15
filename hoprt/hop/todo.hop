@@ -95,22 +95,12 @@ fn todo_panel() {
   }
 }
 
-// One panel per tab. Kill strays first (reconnects double-open), then
-// start the panel.
+// One panel per tab, birthed named: a reconnect re-births the same key
+// and atomically replaces the stale panel instead of double-opening.
 fn open_board() {
-  server!();
-  cancel_origin();
-  browser!();
-  spawn todo_panel();
+  flow "board" todo_panel();
 }
 
-fn on_connect(sid) {
-  cast session(sid) {
-    open_board();
-  }
-}
-
-fn sim_demo() {
-  spawn add_todo("buy milk");
-  spawn add_todo("write the compiler");
+fn on_connect() {
+  open_board();
 }

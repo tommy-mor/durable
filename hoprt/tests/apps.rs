@@ -40,7 +40,15 @@ fn arr_len(v: &Value) -> usize {
 #[test]
 fn ranking_votes_and_decay() {
     let mut host = Cluster::new(&["A", "B"], include_str!("../hop/ranking.hop"), false).unwrap();
-    host.fire("A", "sim_demo");
+    for (winner, loser) in [("ripgrep", "grep"), ("ripgrep", "ag"), ("grep", "ag")] {
+        host.append(map(&[
+            ("type", s("vote")),
+            ("scope", s("tools")),
+            ("winner", s(winner)),
+            ("loser", s(loser)),
+        ]))
+        .unwrap();
+    }
     host.pump();
     host.assert_quiescent();
 
@@ -273,7 +281,13 @@ fn tournament_round_robin_standings_decide() {
 #[test]
 fn chat_rooms_are_isolated_lists() {
     let mut host = Cluster::new(&["A", "B"], include_str!("../hop/chat.hop"), false).unwrap();
-    host.fire("A", "sim_demo");
+    host.append(map(&[
+        ("type", s("say")),
+        ("sid", s("A")),
+        ("room", s("lobby")),
+        ("text", s("hello tape")),
+    ]))
+    .unwrap();
     host.pump();
 
     host.append(map(&[

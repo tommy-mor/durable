@@ -21,7 +21,7 @@
 //!        | "server" "!" "(" ")" ";"                placement mark
 //!        | "browser" "!" "(" ")" ";"               placement mark (→ origin)
 //!        | "cast" ("browsers"|"server"|("session"|"user") "(" expr ")") block
-//!        | "spawn" call ";"                        start a flow (an "event")
+//!        | "flow" expr call ";"                   named flow birth (replaces same key)
 //!        | "return" expr? ";"
 //!        | "if" expr block ("else" (block|if))?
 //!        | "match" expr "{" arm* "}"               dispatch on expr.type
@@ -237,8 +237,6 @@ enum Expr {
     Array(Vec<Expr>),
     /// `fn (params) { ... }` in expression position; body may contain marks
     Fn(Vec<String>, Vec<Stmt>),
-    /// `spawn f(args)` — start a flow now, evaluate to its handle (flow id).
-    Spawn(Box<Expr>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -282,7 +280,10 @@ enum Stmt {
     While(Expr, Vec<Stmt>),
     Mark(Side),
     Cast(CastTarget, Vec<Stmt>),
-    Spawn(Expr),
+    /// `flow key f(args)` — birth the named flow, replacing any same-key
+    /// flow of mine. Key and args evaluate in the caller; the callee body
+    /// never runs there (hence syntax, not a function).
+    Flow(Expr, Expr),
     Expr(Expr),
 }
 
@@ -622,14 +623,15 @@ impl Parser {
             let body = self.block()?;
             return Ok(Stmt::Cast(target, body));
         }
-        if self.at_kw("spawn") {
-            self.eat_kw("spawn")?;
+        if self.at_kw("flow") {
+            self.eat_kw("flow")?;
+            let key = self.expr()?;
             let e = self.expr()?;
             if !matches!(e, Expr::Call(..)) {
-                return Err("spawn expects a function call".into());
+                return Err("flow expects a function call after the key".into());
             }
             self.expect(Tok::Semi)?;
-            return Ok(Stmt::Spawn(e));
+            return Ok(Stmt::Flow(key, e));
         }
         // expression statement or assignment
         let e = self.expr()?;
@@ -834,15 +836,6 @@ impl Parser {
     }
 
     fn primary(&mut self) -> Result<Expr, String> {
-        // spawn expression: `spawn f(args)` evaluates to the child's handle
-        if self.at_kw("spawn") {
-            self.eat_kw("spawn")?;
-            let e = self.expr()?;
-            if !matches!(e, Expr::Call(..)) {
-                return Err("spawn expects a function call".into());
-            }
-            return Ok(Expr::Spawn(Box::new(e)));
-        }
         // lambda: `fn (params) { ... }`
         if self.at_kw("fn") {
             self.eat_kw("fn")?;
@@ -931,7 +924,6 @@ fn refs_expr(e: &Expr, out: &mut BTreeSet<String>) {
         }
         // a lambda's captures are whatever its body references
         Expr::Fn(_, body) => refs_stmts(body, out),
-        Expr::Spawn(e) => refs_expr(e, out),
         _ => {}
     }
 }
@@ -974,7 +966,10 @@ fn refs_stmts(ss: &[Stmt], out: &mut BTreeSet<String>) {
                 }
                 refs_stmts(body, out);
             }
-            Stmt::Spawn(e) => refs_expr(e, out),
+            Stmt::Flow(key, call) => {
+                refs_expr(key, out);
+                refs_expr(call, out);
+            }
             Stmt::Expr(e) => refs_expr(e, out),
         }
     }
@@ -1297,18 +1292,6 @@ fn emit_expr(cg: &mut Cg, fb: &mut Fb, ctr: &mut Counters, e: &Expr) -> Result<(
             fb.emit(Instr::MakeArray(items.len() as u16));
         }
         Expr::Fn(params, body) => emit_lambda(cg, fb, ctr, params, body)?,
-        Expr::Spawn(e) => {
-            // callee + args, then Spawn leaves the child flow id on the stack
-            let Expr::Call(f, args) = e.as_ref() else {
-                return Err("spawn expects a function call".into());
-            };
-            emit_expr(cg, fb, ctr, f)?;
-            for a in args {
-                emit_expr(cg, fb, ctr, a)?;
-            }
-            fb.emit(Instr::MakeArray(args.len() as u16));
-            fb.emit(Instr::Spawn);
-        }
     }
     Ok(())
 }
@@ -1495,7 +1478,6 @@ impl Renamer {
                 Box::new(self.expr(f)),
                 args.iter().map(|a| self.expr(a)).collect(),
             ),
-            Expr::Spawn(e) => Expr::Spawn(Box::new(self.expr(e))),
             Expr::Unary(op, a) => Expr::Unary(op, Box::new(self.expr(a))),
             Expr::Binary(op, a, b) => {
                 Expr::Binary(op, Box::new(self.expr(a)), Box::new(self.expr(b)))
@@ -1587,7 +1569,7 @@ impl Renamer {
                 self.pop();
                 Stmt::Cast(target, body)
             }
-            Stmt::Spawn(e) => Stmt::Spawn(self.expr(e)),
+            Stmt::Flow(key, call) => Stmt::Flow(self.expr(key), self.expr(call)),
             Stmt::Expr(e) => Stmt::Expr(self.expr(e)),
         }
     }
@@ -1601,7 +1583,9 @@ enum Simple {
     Let(String, Expr),
     Assign(Expr, Expr),
     Expr(Expr),
-    Spawn(Expr),
+    /// `flow key f(args)`: key and call, both evaluated in the caller
+    /// (the call's callee + args only — its body never runs there).
+    Flow(Expr, Expr),
     Cast(CastTarget, Vec<Stmt>),
     /// evaluate the collection, IterNew, zero the index (loop id-keyed)
     ForInit(usize, Expr),
@@ -1733,7 +1717,9 @@ impl CfgBuilder {
                     self.blocks[cur].stmts.push(Simple::Assign(l.clone(), r.clone()))
                 }
                 Stmt::Expr(e) => self.blocks[cur].stmts.push(Simple::Expr(e.clone())),
-                Stmt::Spawn(e) => self.blocks[cur].stmts.push(Simple::Spawn(e.clone())),
+                Stmt::Flow(key, call) => {
+                    self.blocks[cur].stmts.push(Simple::Flow(key.clone(), call.clone()))
+                }
                 Stmt::Cast(t, body) => {
                     self.blocks[cur].stmts.push(Simple::Cast(t.clone(), body.clone()))
                 }
@@ -1959,8 +1945,12 @@ fn block_use_def(b: &Block, use_: &mut BTreeSet<String>, def: &mut BTreeSet<Stri
                     def.insert(n.clone());
                 }
             }
-            Simple::Expr(e) | Simple::Spawn(e) | Simple::ForInit(_, e) | Simple::MatchHead(_, e) => {
+            Simple::Expr(e) | Simple::ForInit(_, e) | Simple::MatchHead(_, e) => {
                 note_uses(e, def, use_)
+            }
+            Simple::Flow(key, call) => {
+                note_uses(key, def, use_);
+                note_uses(call, def, use_);
             }
             Simple::Cast(t, body) => {
                 if let CastTarget::Session(e) | CastTarget::User(e) = t {
@@ -2294,18 +2284,18 @@ fn emit_simple(
             emit_expr(px.cg, fb, px.ctr, e)?;
             fb.emit(Instr::Pop);
         }
-        Simple::Spawn(e) => {
-            let Expr::Call(f, args) = e else {
-                return Err("spawn expects a function call".into());
+        Simple::Flow(key, call) => {
+            let Expr::Call(f, args) = call else {
+                return Err("flow expects a function call after the key".into());
             };
+            // key, then callee + args; Flow births the named child, no handle
+            emit_expr(px.cg, fb, px.ctr, key)?;
             emit_expr(px.cg, fb, px.ctr, f)?;
             for a in args {
                 emit_expr(px.cg, fb, px.ctr, a)?;
             }
             fb.emit(Instr::MakeArray(args.len() as u16));
-            fb.emit(Instr::Spawn);
-            // statement position: discard the child handle
-            fb.emit(Instr::Pop);
+            fb.emit(Instr::Flow);
         }
         Simple::Cast(target, body) => {
             px.ctr.cast_n += 1;
@@ -2816,18 +2806,17 @@ fn emit_stmts(cg: &mut Cg, fb: &mut Fb, ctr: &mut Counters, ss: &[Stmt]) -> Resu
                 let k = cg.k_str(&id);
                 fb.emit(Instr::Cast(k));
             }
-            Stmt::Spawn(e) => {
-                let Expr::Call(f, args) = e else {
-                    return Err("spawn expects a function call".into());
+            Stmt::Flow(key, call) => {
+                let Expr::Call(f, args) = call else {
+                    return Err("flow expects a function call after the key".into());
                 };
+                emit_expr(cg, fb, ctr, key)?;
                 emit_expr(cg, fb, ctr, f)?;
                 for a in args {
                     emit_expr(cg, fb, ctr, a)?;
                 }
                 fb.emit(Instr::MakeArray(args.len() as u16));
-                fb.emit(Instr::Spawn);
-                // statement position: discard the child handle
-                fb.emit(Instr::Pop);
+                fb.emit(Instr::Flow);
             }
             Stmt::Expr(e) => {
                 emit_expr(cg, fb, ctr, e)?;

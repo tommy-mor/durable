@@ -76,8 +76,8 @@ pub enum Instr {
     At(u32),
     /// target vars → ()  (fire and forget)
     Cast(u32),
-    /// closure → ()  (new flow on this VM)
-    Spawn,
+    /// key callee args-array → ()  (birth the named flow, replacing same key)
+    Flow,
     /// → session identity (browser: own sid; server: flow origin)
     Session,
     /// → user identity (browser: own user; server: origin's user)

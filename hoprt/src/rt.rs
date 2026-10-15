@@ -22,9 +22,10 @@
 //! so the flow id alone is no proof.
 //!
 //! Reply routing is LIFO per (flow, VM): hops nest like calls. An error in
-//! a remote segment unwinds hop by hop to the flow origin. Spawned flows
-//! are scheduled and run when the current segment finishes (arguments are
-//! evaluated eagerly at the spawn site).
+//! a remote segment unwinds hop by hop to the flow origin. Named flows
+//! birth and run when the current segment finishes (key, callee, and
+//! arguments are evaluated eagerly at the flow site; the callee body
+//! never runs in the spawner).
 
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -120,6 +121,10 @@ struct FlowCtx {
     /// it read. Rides invisibly like origin so a write landing between
     /// read and wait wakes at once instead of slipping through.
     read_seq: u64,
+    /// birth key (`flow "key" ...`), if born named. Replacement matches
+    /// on (origin, key); anonymous births (fire, tests, init) hold None
+    /// and are never replaced.
+    key: Option<String>,
 }
 
 enum Complete {
@@ -188,8 +193,6 @@ impl Vm {
             ("sort_by", NativeId::SortBy),
             ("floor", NativeId::Floor),
             ("type", NativeId::TypeOf),
-            ("cancel", NativeId::Cancel),
-            ("cancel_origin", NativeId::CancelOrigin),
         ] {
             globals.set(name, Value::Native(id));
         }
@@ -252,6 +255,7 @@ impl Vm {
                     origin: Value::Nil,
                     user: Value::Nil,
                     read_seq: 0,
+                    key: None,
                 };
                 match vm.run_exec(platform, exec, &mut ctx.clone()) {
                     RunResult::Done(v) => vm.globals.set(name, v),
@@ -286,9 +290,23 @@ impl Vm {
     }
 
     /// hopd calls this on the server VM when a session connects.
+    /// `on_connect` takes no arguments and runs already owned by the tab:
+    /// origin and user are stamped on its context (never client-claimed),
+    /// so `flow` births inside it land under the tab and `session()` /
+    /// `user()` read back what the socket proved.
     pub fn session_connect(&mut self, platform: &mut dyn Platform, sid: &str, user: &str) {
         if !matches!(self.globals.get("on_connect"), Value::Nil) {
-            self.fire(platform, "on_connect", vec![Value::str(sid), Value::str(user)]);
+            let callee = self.globals.get("on_connect");
+            let flow = self.mint_flow();
+            self.start_flow_with_id(
+                platform,
+                flow,
+                Value::str(sid),
+                Value::str(user),
+                None,
+                callee,
+                Vec::new(),
+            );
         }
     }
 
@@ -302,8 +320,8 @@ impl Vm {
     }
 
     /// Mint a fresh flow id on this side's namespace without starting anything.
-    /// Hands the spawner her handle synchronously; the child starts at the
-    /// next segment boundary under exactly this id.
+    /// Hands the birther nothing back — the child runs under this id at
+    /// the next segment boundary.
     pub fn mint_flow(&mut self) -> String {
         self.next_flow += 1;
         format!("{}#{}", self.side.addr(), self.next_flow)
@@ -311,22 +329,28 @@ impl Vm {
 
     pub fn start_flow(&mut self, platform: &mut dyn Platform, callee: Value, args: Vec<Value>) {
         let flow = self.mint_flow();
-        self.start_flow_with_id(platform, flow, callee, args);
-    }
-
-    /// Start a flow under an already-minted id (spawn's eager handle).
-    pub fn start_flow_with_id(
-        &mut self,
-        platform: &mut dyn Platform,
-        flow: String,
-        callee: Value,
-        args: Vec<Value>,
-    ) {
         let origin = match &self.side {
             SideId::Browser(s) => Value::str(s.as_str()),
             SideId::Server => Value::Nil,
         };
-        let ctx = FlowCtx { flow, origin, user: self.user.clone(), read_seq: 0 };
+        self.start_flow_with_id(platform, flow, origin, self.user.clone(), None, callee, args);
+    }
+
+    /// Start a flow under an already-minted id with explicit ownership.
+    /// `flow` births pass the spawner's origin/user so a server-born
+    /// child still belongs to the tab that caused it; anonymous births
+    /// (fire, tests, init) pass side-derived ownership and no key.
+    pub fn start_flow_with_id(
+        &mut self,
+        platform: &mut dyn Platform,
+        flow: String,
+        origin: Value,
+        user: Value,
+        key: Option<String>,
+        callee: Value,
+        args: Vec<Value>,
+    ) {
+        let ctx = FlowCtx { flow, origin, user, read_seq: 0, key };
         let exec = match Exec::call_value(&self.prog, &callee, args) {
             Ok(e) => e,
             Err(e) => {
@@ -337,23 +361,42 @@ impl Vm {
         self.step(platform, exec, ctx, Complete::Done);
     }
 
-    /// Cancel a spawned flow by handle: drop her parked stack here (a
-    /// waiter sleeping in store.wait dies too — the platform drops her
-    /// watch) and tell the other side, so her other half doesn't sit
-    /// parked forever. Switching rooms is a story that cancels the old
-    /// panel and spawns a new one. Returns true when a level died here.
-    pub fn cancel_flow(&mut self, platform: &mut dyn Platform, flow: &str) -> bool {
-        let (died, mut peers) = self.drop_flow(platform, flow);
-        // A tab may hold nothing parked for a flow whose live half is on
-        // the server (a server-started flow carrying her origin): her
-        // cancel still goes to the server, which checks she owns it.
-        if matches!(self.side, SideId::Browser(_)) && !peers.contains(&Value::str("server")) {
-            peers.push(Value::str("server"));
+    /// Kill every flow of `origin` holding `key`, except `except` (the
+    /// running spawner never kills herself — the new flow still starts).
+    /// Replacement releases far halves, exactly like a death: the other
+    /// side drops her half and hears nothing further. Returns how many
+    /// flows died.
+    pub fn kill_key(
+        &mut self,
+        platform: &mut dyn Platform,
+        origin: &Value,
+        key: &str,
+        except: &str,
+    ) -> usize {
+        let doomed: Vec<String> = self
+            .stacks
+            .iter()
+            .filter_map(|(flow, stack)| {
+                if flow == except {
+                    return None;
+                }
+                stack.last().and_then(|p| match (&p.ctx.origin, &p.ctx.key) {
+                    (o, Some(k)) if o == origin && k == key => Some(flow.clone()),
+                    _ => None,
+                })
+            })
+            .collect();
+        let n = doomed.len();
+        for flow in doomed {
+            if platform.tracing() {
+                platform.trace(format!("flow {flow} replaced (key {key})"));
+            }
+            let (_, peers) = self.drop_flow(platform, &flow);
+            for to in peers {
+                self.send_cancel(platform, &flow, to);
+            }
         }
-        for to in peers {
-            self.send_cancel(platform, flow, to);
-        }
-        died
+        n
     }
 
     /// Drop every parked level of `flow` on this VM and her store.wait
@@ -413,9 +456,10 @@ impl Vm {
     }
 
     /// Kill every flow whose origin session is `sid`. Server-side only.
-    /// Two callers: `cancel_origin()` (a tab switching views — `notify`, so
-    /// her parked halves are released) and a tab closing (no notify: her
-    /// VM is gone whole). Waiters die through the platform hook; parked
+    /// One caller: a tab closing (her VM is gone whole — no notify, the
+    /// far side hears nothing because there is nobody to hear it).
+    /// Re-births use [`Vm::kill_key`]; far-half deaths arrive as
+    /// `cancel` packets. Waiters die through the platform hook; parked
     /// stacks drop here. Returns how many flows died.
     pub fn kill_origin(&mut self, platform: &mut dyn Platform, sid: &str, notify: bool) -> usize {
         platform.cancel_waiters_of_origin(sid);
@@ -442,7 +486,7 @@ impl Vm {
     }
 
     /// Run a global function to completion, synchronously, returning its
-    /// value. It may cast and spawn but not hop (used by the harness for
+    /// value. It may cast and birth flows but not hop (used by the harness for
     /// server-side reads; a server-origin flow with no session).
     pub fn call_sync(
         &mut self,
@@ -458,6 +502,7 @@ impl Vm {
             origin: Value::Nil,
             user: Value::Nil,
             read_seq: 0,
+            key: None,
         };
         match self.run_exec(platform, exec, &mut ctx) {
             RunResult::Done(v) => Ok(v),
@@ -494,6 +539,7 @@ impl Vm {
                     flow: flow_s,
                     origin: pkt.get_field("origin"),
                     user: pkt.get_field("user"),
+                    key: pkt.get_field("key").as_str().map(|s| s.to_string()),
                     read_seq: pkt
                         .get_field("read_seq")
                         .as_str()
@@ -654,61 +700,91 @@ impl Vm {
 
     /// Drive an exec to its next boundary and dispose of the outcome —
     /// the port of the old runtime's step().
-    fn step(&mut self, platform: &mut dyn Platform, exec: Exec, mut ctx: FlowCtx, on_complete: Complete) {
-        match self.run_exec(platform, exec, &mut ctx) {
-            RunResult::Done(v) => {
-                if platform.tracing() {
-                    platform.trace(format!("flow {} done value={v}", ctx.flow));
-                }
-                match on_complete {
-                    Complete::Reply { to } => {
-                        platform.send(mk_map(vec![
-                            ("kind", Value::str("reply")),
-                            ("flow", Value::str(ctx.flow.as_str())),
-                            ("to", to),
-                            ("value", v),
-                            ("read_seq", Value::Int(ctx.read_seq as i64)),
-                        ]));
-                    }
-                    Complete::Done => {}
-                }
-            }
-            RunResult::Suspended(exec, target, hop, vars) => {
-                // A store.wait park never touches the wire: the flow
-                // sleeps on the Vm itself until the courier wakes her.
-                if target.as_str() == Some("@wait") {
+    ///
+    /// A hop targeting this VM's own address runs the segment inline,
+    /// no wire: a mark to the side you're already on is a no-op stay,
+    /// so birth site (tab or server) never changes what a panel does.
+    fn step(&mut self, platform: &mut dyn Platform, mut exec: Exec, mut ctx: FlowCtx, mut on_complete: Complete) {
+        loop {
+            match self.run_exec(platform, exec, &mut ctx) {
+                RunResult::Done(v) => {
                     if platform.tracing() {
-                        platform.trace(format!("flow {} parked in store.wait", ctx.flow));
+                        platform.trace(format!("flow {} done value={v}", ctx.flow));
                     }
+                    match on_complete {
+                        Complete::Reply { to } => {
+                            platform.send(mk_map(vec![
+                                ("kind", Value::str("reply")),
+                                ("flow", Value::str(ctx.flow.as_str())),
+                                ("to", to),
+                                ("value", v),
+                                ("read_seq", Value::Int(ctx.read_seq as i64)),
+                            ]));
+                        }
+                        Complete::Done => {}
+                    }
+                    return;
+                }
+                RunResult::Suspended(next_exec, target, hop, vars) => {
+                    if target == self.my_addr() {
+                        if platform.tracing() {
+                            platform.trace(format!(
+                                "flow {} self-hop {} vars={}",
+                                ctx.flow, hop, vars
+                            ));
+                        }
+                        let prog = self.prog.clone();
+                        let Some(&fn_idx) = prog.hops.get(&hop) else {
+                            self.dispose_error(platform, ctx, on_complete, format!("unknown hop: {hop}"));
+                            return;
+                        };
+                        exec = Exec::call(&prog, fn_idx, vec![vars]);
+                        continue;
+                    }
+                    // A store.wait park never touches the wire: the flow
+                    // sleeps on the Vm itself until the courier wakes her.
+                    if target.as_str() == Some("@wait") {
+                        if platform.tracing() {
+                            platform.trace(format!("flow {} parked in store.wait", ctx.flow));
+                        }
+                        self.stacks
+                            .entry(ctx.flow.clone())
+                            .or_default()
+                            .push(Parked { exec: next_exec, ctx, on_complete, awaiting: Value::str("@wait") });
+                        return;
+                    }
+                    if platform.tracing() {
+                        platform.trace(format!(
+                            "flow {} hop -> {} {} vars={}",
+                            ctx.flow, target, hop, vars
+                        ));
+                    }
+                    platform.send(mk_map(vec![
+                        ("kind", Value::str("call")),
+                        ("flow", Value::str(ctx.flow.as_str())),
+                        ("to", target.clone()),
+                        ("hop", Value::str(hop.as_str())),
+                        ("vars", vars),
+                        ("origin", ctx.origin.clone()),
+                        ("user", ctx.user.clone()),
+                        ("read_seq", Value::Int(ctx.read_seq as i64)),
+                        (
+                            "key",
+                            ctx.key.clone().map(Value::str).unwrap_or(Value::Nil),
+                        ),
+                        ("reply_to", self.my_addr()),
+                    ]));
                     self.stacks
                         .entry(ctx.flow.clone())
                         .or_default()
-                        .push(Parked { exec, ctx, on_complete, awaiting: Value::str("@wait") });
+                        .push(Parked { exec: next_exec, ctx, on_complete, awaiting: target });
                     return;
                 }
-                if platform.tracing() {
-                    platform.trace(format!(
-                        "flow {} hop -> {} {} vars={}",
-                        ctx.flow, target, hop, vars
-                    ));
+                RunResult::Failed(e) => {
+                    self.dispose_error(platform, ctx, on_complete, e);
+                    return;
                 }
-                platform.send(mk_map(vec![
-                    ("kind", Value::str("call")),
-                    ("flow", Value::str(ctx.flow.as_str())),
-                    ("to", target.clone()),
-                    ("hop", Value::str(hop.as_str())),
-                    ("vars", vars),
-                    ("origin", ctx.origin.clone()),
-                    ("user", ctx.user.clone()),
-                    ("read_seq", Value::Int(ctx.read_seq as i64)),
-                    ("reply_to", self.my_addr()),
-                ]));
-                self.stacks
-                    .entry(ctx.flow.clone())
-                    .or_default()
-                    .push(Parked { exec, ctx, on_complete, awaiting: target });
             }
-            RunResult::Failed(e) => self.dispose_error(platform, ctx, on_complete, e),
         }
     }
 
@@ -734,8 +810,8 @@ impl Vm {
         }
     }
 
-    /// Run one exec against this VM's globals, then run any flows it
-    /// spawned. Returns the exec's own outcome.
+    /// Run one exec against this VM's globals, then birth any flows it
+    /// named. Returns the exec's own outcome.
     fn run_exec(&mut self, platform: &mut dyn Platform, mut exec: Exec, ctx: &mut FlowCtx) -> RunResult {
         let prog = self.prog.clone();
         let mut flow_ops: Vec<FlowOp> = Vec::new();
@@ -748,7 +824,6 @@ impl Vm {
                 hui: &mut self.hui,
                 platform,
                 flow_ops: &mut flow_ops,
-                next_flow: &mut self.next_flow,
                 woken: &mut woken,
                 prog: &prog,
             };
@@ -764,20 +839,16 @@ impl Vm {
             Outcome::Suspend { target, hop, vars } => RunResult::Suspended(exec, target, hop, vars),
             Outcome::Error(e) => RunResult::Failed(e),
         };
-        // queued flow ops apply in program order when the spawning
+        // queued flow births apply in program order when the birthing
         // segment has reached its own boundary — after woken resumes, so
-        // a cancel later in the program kills what it names even if the
-        // courier woke her mid-step.
+        // a birth later in the program replaces what an earlier one
+        // started even if the courier woke her mid-step.
         for op in flow_ops {
             match op {
-                FlowOp::Spawn { flow, callee, args } => {
-                    self.start_flow_with_id(platform, flow, callee, args)
-                }
-                FlowOp::Cancel { flow } => {
-                    self.cancel_flow(platform, &flow);
-                }
-                FlowOp::CancelOrigin { sid } => {
-                    self.kill_origin(platform, &sid, true);
+                FlowOp::Flow { key, origin, user, callee, args } => {
+                    self.kill_key(platform, &origin, &key, "");
+                    let flow = self.mint_flow();
+                    self.start_flow_with_id(platform, flow, origin, user, Some(key), callee, args)
                 }
             }
         }
@@ -795,13 +866,12 @@ enum RunResult {
 // The per-step Host: bridges interpreter needs to VM state + platform
 // ---------------------------------------------------------------------------
 
-/// One queued flow operation: spawn a child, cancel by handle, or kill
-/// every flow of a session. Queued in program order during the step,
-/// applied at the segment boundary.
+/// One queued flow operation: birth the named flow. Queued in program
+/// order during the step, applied at the segment boundary with atomic
+/// replace — a `flow` later in the program replaces what an earlier one
+/// started, which is what room-switch wants.
 pub enum FlowOp {
-    Spawn { flow: String, callee: Value, args: Vec<Value> },
-    Cancel { flow: String },
-    CancelOrigin { sid: String },
+    Flow { key: String, origin: Value, user: Value, callee: Value, args: Vec<Value> },
 }
 
 struct StepHost<'a> {
@@ -811,14 +881,12 @@ struct StepHost<'a> {
     vm_user: &'a Value,
     hui: &'a mut HuiState,
     platform: &'a mut dyn Platform,
-    /// Flow operations queued this step, in program order: spawns (with
-    /// eagerly-minted ids so `spawn` answers synchronously), cancels by
-    /// handle, and origin-kills. Applied at the segment boundary after
-    /// woken resumes — a cancel later in the program kills a spawn
-    /// earlier in it, which is what room-switch wants.
+    /// Flow operations queued this step, in program order: named births
+    /// (with the spawner's origin/user, so a server-born child still
+    /// belongs to the tab that caused it). Applied at the segment
+    /// boundary after woken resumes — a flow later in the program
+    /// replaces what an earlier one birthed under the same key.
     flow_ops: &'a mut Vec<FlowOp>,
-    /// Fresh ids are minted here (the Vm's counter, borrowed for the step).
-    next_flow: &'a mut u64,
     /// Flows the courier woke during this step: resumed on the Vm once
     /// the platform borrow ends.
     woken: &'a mut Vec<String>,
@@ -852,37 +920,18 @@ impl Host for StepHost<'_> {
         Ok(())
     }
 
-    fn spawn(&mut self, callee: Value, args: Vec<Value>) -> Result<Value, String> {
-        *self.next_flow += 1;
-        let flow = format!("{}#{}", self.side.addr(), self.next_flow);
-        self.flow_ops.push(FlowOp::Spawn { flow: flow.clone(), callee, args });
-        Ok(Value::str(flow))
+    fn flow(&mut self, key: String, callee: Value, args: Vec<Value>) -> Result<(), String> {
+        // Ownership rides the spawner: the child belongs to whoever owns
+        // this flow, wherever this VM runs.
+        self.flow_ops.push(FlowOp::Flow {
+            key,
+            origin: self.ctx.origin.clone(),
+            user: self.ctx.user.clone(),
+            callee,
+            args,
+        });
+        Ok(())
     }
-
-    fn cancel(&mut self, flow: &str) -> Result<bool, String> {
-        self.flow_ops.push(FlowOp::Cancel { flow: flow.to_string() });
-        // applied at the boundary; report true when she is (still) parked
-        Ok(true)
-    }
-
-    fn cancel_origin(&mut self, sid: &str) -> Result<u64, String> {
-        // No sid = my own session: browser tabs pass nothing and kill
-        // their own panels; the server resolves origin from the packet.
-        let sid = if sid.is_empty() {
-            match self.side {
-                SideId::Browser(s) => s.clone(),
-                SideId::Server => match &self.ctx.origin {
-                    Value::Str(o) => o.to_string(),
-                    _ => return Ok(0),
-                },
-            }
-        } else {
-            sid.to_string()
-        };
-        self.flow_ops.push(FlowOp::CancelOrigin { sid });
-        Ok(0)
-    }
-
 
     fn session(&mut self) -> Result<Value, String> {
         match self.side {

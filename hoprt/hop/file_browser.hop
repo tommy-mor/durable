@@ -176,10 +176,11 @@ fn paint() {
   }
 }
 
-fn on_connect(sid) {
-  // on_connect runs server-side; it must NOT call a server!()-marked flow like
-  // `refresh` (that re-hops server→server and silently drops the work — the
-  // same wound the guardian's `load` carried). Talk to the plain helper.
+fn on_connect() {
+  // on_connect runs owned by the tab; plain helpers only (calling a
+  // server!()-marked flow from here re-hops server→server and silently
+  // drops the work — the same wound the guardian's `load` carried).
+  // Talk to the plain helper.
   let cwd = store(["cwd"]);
   if !cwd {
     cwd = "";

@@ -276,7 +276,7 @@ fn user_identity_casts_and_disconnect_hooks() {
           print("server sees " .. s .. "/" .. u .. " (session=" .. session() .. " user=" .. user() .. ")");
           cast user(u) { dom.set("#who", "hi " .. user() .. " in " .. session()); }
         }
-        fn on_connect(sid, uid) { print("+ " .. sid .. " " .. uid); }
+        fn on_connect() { print("+ " .. session() .. " " .. user()); }
         fn on_disconnect(sid, uid) { print("- " .. sid .. " " .. uid); }
     "##;
     let mut host = Cluster::new(&["A", "B", "C"], src, false).expect("cluster");

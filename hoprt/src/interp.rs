@@ -63,20 +63,13 @@ impl Globals {
 pub trait Host {
     fn print(&mut self, line: String);
     fn cast(&mut self, target: Value, hop: &str, vars: Value) -> Result<(), String>;
-    /// Schedule a new flow on this VM. Arguments were evaluated eagerly at
-    /// the spawn site. Returns the child flow id — `spawn` is an expression
-    /// whose value is a handle the spawner can later `cancel`.
-    fn spawn(&mut self, callee: Value, args: Vec<Value>) -> Result<Value, String>;
-    /// Cancel a flow by handle. Queued and applied at the segment boundary
-    /// (a flow cancels siblings, never itself mid-instruction).
-    fn cancel(&mut self, _flow: &str) -> Result<bool, String> {
-        Ok(false)
-    }
-    /// Kill every flow of a session (tab close, room switch). Queued like
-    /// cancel; the origin is captured eagerly from the packet stamp.
-    fn cancel_origin(&mut self, _sid: &str) -> Result<u64, String> {
-        Ok(0)
-    }
+    /// Birth the named flow under `key`, replacing any same-key flow of
+    /// mine. Key, callee, and args were evaluated eagerly at the flow
+    /// site; the callee body never runs in the spawner. Queued and
+    /// applied at the segment boundary (a flow replaces siblings, never
+    /// itself mid-instruction — self-birth is a no-op for the running
+    /// flow; the new flow still starts).
+    fn flow(&mut self, key: String, callee: Value, args: Vec<Value>) -> Result<(), String>;
     fn session(&mut self) -> Result<Value, String>;
     /// The durable identity behind the session (cookie-minted by hopd).
     /// Defaults to refusal — reducers and store hosts have no user.
@@ -495,18 +488,22 @@ pub fn run(
                     err!("{e}");
                 }
             }
-            Instr::Spawn => {
-                // stack: callee args-array; spawn is an expression —
-                // the child flow id (a handle) is pushed for the spawner.
+            Instr::Flow => {
+                // stack: key callee args-array; birth is a statement —
+                // nothing is pushed for the spawner.
                 let args_v = pop!();
                 let callee = pop!();
+                let key_v = pop!();
                 let args = match &args_v {
                     Value::Array(a) => a.borrow().clone(),
-                    _ => err!("spawn arguments corrupted"),
+                    _ => err!("flow arguments corrupted"),
                 };
-                match host.spawn(callee, args) {
-                    Ok(handle) => push!(handle),
-                    Err(e) => err!("{e}"),
+                let key = match &key_v {
+                    Value::Str(s) => s.to_string(),
+                    _ => err!("flow key must be a string"),
+                };
+                if let Err(e) = host.flow(key, callee, args) {
+                    err!("{e}");
                 }
             }
             Instr::Session => match host.session() {
@@ -714,19 +711,6 @@ fn call_native(id: NativeId, mut args: Vec<Value>, host: &mut dyn Host) -> Resul
         NativeId::TypeOf => Ok(Value::str(
             args.first().map(Value::kind).unwrap_or("nil"),
         )),
-        NativeId::Cancel => {
-            let flow = args
-                .first()
-                .and_then(Value::as_str)
-                .ok_or("cancel(flow-handle)")?;
-            host.cancel(flow).map(Value::Bool)
-        }
-        NativeId::CancelOrigin => {
-            // kill every flow of a session: defaults to MY session when
-            // no sid is passed (a tab ending its own panels).
-            let sid = args.first().and_then(Value::as_str).unwrap_or("");
-            host.cancel_origin(sid).map(|n| Value::Int(n as i64))
-        }
         // schema shape constructors are pure data builders
         NativeId::ShapeMap | NativeId::ShapeList | NativeId::ShapeDeque => {
             let of = args.first().cloned().unwrap_or(Value::Nil);
