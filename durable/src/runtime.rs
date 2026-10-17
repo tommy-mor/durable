@@ -204,6 +204,7 @@ pub fn scan(bytes: &[u8]) -> std::result::Result<Committed, Corruption> {
             None => (&bytes[start..], bytes.len() + 1),
         };
         let terminated = next <= bytes.len();
+        offset = start;
         if !terminated {
             // Trailing bytes with no newline: torn write, stop here.
             if !chunk.iter().all(|b| b.is_ascii_whitespace()) && !chunk.is_empty() {
@@ -211,7 +212,6 @@ pub fn scan(bytes: &[u8]) -> std::result::Result<Committed, Corruption> {
             }
             break;
         }
-        offset = start;
         // Blank lines are skipped, legacy compatibility.
         if chunk.iter().all(|b| b.is_ascii_whitespace()) {
             start = next;
@@ -449,6 +449,13 @@ pub struct JsonlLog<E> {
     path: PathBuf,
     file: File,
     len: u64,
+    /// Byte offset of the committed end. Everything past it on disk is
+    /// residue of a batch that never committed.
+    end: u64,
+    /// Set when an I/O failure left the tape in a state this process can't
+    /// vouch for. Every later append refuses until the tape is reopened,
+    /// which re-derives the truth from the bytes.
+    poisoned: bool,
     _event: PhantomData<E>,
 }
 
@@ -465,10 +472,13 @@ impl<E> JsonlLog<E> {
             .open(&path)
             .map_err(|e| Error::Log(e.to_string()))?;
         let len = count_jsonl_lines(&mut file)?;
+        let end = file.metadata().map_err(|e| Error::Log(e.to_string()))?.len();
         Ok(Self {
             path,
             file,
             len,
+            end,
+            poisoned: false,
             _event: PhantomData,
         })
     }
@@ -495,6 +505,7 @@ impl<E> JsonlLog<E> {
         Self::seal_to(&path, &found)?;
         let mut log = Self::open(&path)?;
         log.len = found.len;
+        log.end = found.end as u64;
         Ok((log, found))
     }
 
@@ -574,7 +585,12 @@ impl<E> JsonlLog<E> {
         {
             let mut out = String::new();
             for (seq, ts, event_bytes) in &records {
-                let event: serde_json::Value = serde_json::from_slice(event_bytes)
+                // Carry the event bytes verbatim: re-serializing through
+                // serde_json::Value would sort keys and turn integers past
+                // 64 bits into lossy floats.
+                let text = String::from_utf8(event_bytes.clone())
+                    .map_err(|e| Error::Deserialize(e.to_string()))?;
+                let event = serde_json::value::RawValue::from_string(text)
                     .map_err(|e| Error::Deserialize(e.to_string()))?;
                 out.push_str(&render_sealed(*seq, *ts, *seq, *seq, &event)?);
                 out.push('\n');
@@ -602,23 +618,25 @@ impl<E> JsonlLog<E> {
     /// idempotent across interrupted opens, and keeps the next O_APPEND
     /// batch from landing behind dead bytes.
     pub fn seal_to(path: &Path, found: &Committed) -> Result<()> {
-        let len = fs::metadata(path).map_err(|e| Error::Log(e.to_string()))?.len() as usize;
+        let f = OpenOptions::new()
+            .write(true)
+            .open(path)
+            .map_err(|e| Error::Log(e.to_string()))?;
+        let len = f.metadata().map_err(|e| Error::Log(e.to_string()))?.len() as usize;
         if found.end < len {
-            let dropped = len - found.end;
-            let f = OpenOptions::new()
-                .write(true)
-                .open(path)
-                .map_err(|e| Error::Log(e.to_string()))?;
             f.set_len(found.end as u64)
                 .map_err(|e| Error::Log(e.to_string()))?;
-            // A restarted process may read a complete batch left in the page
-            // cache by a crashed writer without ever confirming it durable.
-            f.sync_data().map_err(|e| Error::Log(e.to_string()))?;
             eprintln!(
-                "tape: dropped {dropped} uncommitted bytes past seq {}",
+                "tape: dropped {} uncommitted bytes past seq {}",
+                len - found.end,
                 found.len
             );
         }
+        // Unconditional: a restarted process may be reading a complete batch
+        // a crashed writer left in the page cache, never confirmed durable.
+        // Nothing past this point may treat the prefix as committed until
+        // this sync succeeds.
+        f.sync_data().map_err(|e| Error::Log(e.to_string()))?;
         Ok(())
     }
 
@@ -632,6 +650,40 @@ impl<E> JsonlLog<E> {
 
     pub fn is_empty(&self) -> Result<bool> {
         Ok(self.len == 0)
+    }
+}
+
+impl<E> JsonlLog<E> {
+    /// Cut the file back to the committed end and sync. If either step
+    /// fails the writer can no longer vouch for the file: poison it.
+    fn rollback(&mut self) -> Result<()> {
+        let res = self
+            .file
+            .set_len(self.end)
+            .and_then(|_| self.file.sync_data());
+        if let Err(e) = res {
+            self.poisoned = true;
+            return Err(Error::Log(format!(
+                "rollback to committed end failed (writer poisoned): {e}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// True when the first complete, non-blank line is an unsealed legacy
+    /// record. A torn or sealed first line is not legacy: a sealed tape
+    /// whose first batch tore is ordinary in-flight residue.
+    pub fn looks_legacy(path: &Path) -> Result<bool> {
+        let bytes = fs::read(path).map_err(|e| Error::Log(e.to_string()))?;
+        let mut rest = &bytes[..];
+        while let Some(i) = rest.iter().position(|b| *b == b'\n') {
+            let line = &rest[..i];
+            if !line.iter().all(|b| b.is_ascii_whitespace()) {
+                return Ok(Self::parse_legacy_line(line).is_ok());
+            }
+            rest = &rest[i + 1..];
+        }
+        Ok(false)
     }
 }
 
@@ -652,26 +704,50 @@ impl<E: Serialize + DeserializeOwned> JsonlLog<Record<E>> {
             batch.push_str(&line);
             batch.push('\n');
         }
-        // Roll back any residue past the committed end before writing, so
-        // the acknowledged batch always lands contiguous: a partial write
-        // (ENOSPC mid-line, outside drool) never buries the next commit
-        // behind dead bytes. Truncation only removes what the scan says
-        // was never committed.
-        let found = Self::scan_file(&self.path)?;
-        if found.len != self.len {
+        if self.poisoned {
+            return Err(Error::Log(
+                "tape writer poisoned by an earlier I/O failure; reopen the tape".into(),
+            ));
+        }
+        // O(1) guard, no rescan: this process owns the committed end. Bytes
+        // past it are residue of a batch that never committed; cut them so
+        // the next batch never lands behind dead bytes. A file shorter than
+        // the committed end means acknowledged bytes vanished under us.
+        let on_disk = self
+            .file
+            .metadata()
+            .map_err(|e| Error::Log(e.to_string()))?
+            .len();
+        if on_disk < self.end {
+            self.poisoned = true;
             return Err(Error::Corruption(format!(
-                "tape moved under writer (committed {} != held {})",
-                found.len, self.len
+                "tape shrank under writer ({on_disk} bytes < committed end {})",
+                self.end
             )));
         }
-        Self::seal_to(&self.path, &found)?;
-        self.file
-            .write_all(batch.as_bytes())
-            .map_err(|e| Error::Log(e.to_string()))?;
+        if on_disk > self.end {
+            self.rollback()?;
+        }
+        if let Err(e) = self.file.write_all(batch.as_bytes()) {
+            // The closing line's newline can't have landed, so the scan
+            // drops this batch regardless; rolling back keeps O_APPEND clean.
+            self.rollback()?;
+            return Err(Error::Log(format!("not committed: {e}")));
+        }
         // Content durability. Metadata (mtime) is not the tape.
-        self.file
-            .sync_data()
-            .map_err(|e| Error::Log(e.to_string()))?;
+        if let Err(e) = self.file.sync_data() {
+            // The bytes may still reach disk as a closed batch, and Linux
+            // may already have marked the dirty pages clean: never retry the
+            // fsync and trust it. Roll back, and stop writing either way.
+            let rolled = self.rollback().is_ok();
+            self.poisoned = true;
+            return Err(Error::Log(if rolled {
+                format!("not committed (writer poisoned): {e}")
+            } else {
+                format!("commit outcome unknown (writer poisoned): {e}")
+            }));
+        }
+        self.end += batch.len() as u64;
         self.len += events.len() as u64;
         Ok(start)
     }
@@ -790,7 +866,7 @@ impl<E: Serialize + DeserializeOwned + 'static> Runtime<E> {
         // damaged legacy refuses with `tape seal` — never truncated.
         if found.len == 0
             && log_path.exists()
-            && fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0) > 0
+            && JsonlLog::<Record<E>>::looks_legacy(&log_path)?
         {
             found = JsonlLog::<Record<E>>::seal_legacy::<E>(&log_path)?;
         }
@@ -807,6 +883,7 @@ impl<E: Serialize + DeserializeOwned + 'static> Runtime<E> {
         }
         let mut log = JsonlLog::open(&log_path)?;
         log.len = found.len;
+        log.end = found.end as u64;
         let last_ts_ms = found.last_ts;
         let rt = Self {
             inner: Mutex::new(Inner {
@@ -1018,7 +1095,11 @@ impl<E: Serialize + DeserializeOwned + 'static> Runtime<E> {
             .lock()
             .map_err(|_| Error::Log("runtime lock poisoned".into()))?;
         let log_path = inner.log.path().to_path_buf();
-        drop(inner);
+        // Hold the ingest lock for the whole replay. The replay opens the
+        // same tape, and its open may truncate residue past the committed
+        // end — which, during a live append, would be the batch being
+        // written. With the lock held no batch is in flight.
+        let _ingest = inner;
         let tmp = tempfile_dir()?;
         let db_path = tmp.join("proj");
         let reducer = self.reducer.clone();

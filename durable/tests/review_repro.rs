@@ -112,3 +112,64 @@ fn e_oversize_batch_survives_reopen() {
     let len_after = std::fs::metadata(dir.path().join("log.jsonl")).unwrap().len();
     assert_eq!(len_after, len_before, "acknowledged batch truncated (open: {:?})", res.err().map(|e| e.to_string()));
 }
+
+// ---- round 2 -------------------------------------------------------------
+
+/// A sealed tape whose very first append was torn (fresh deploy, disk
+/// full on event 0) has committed len 0 and non-empty bytes. That is
+/// in-flight residue, not a legacy tape: open must drop it and rise empty.
+#[test]
+fn f_torn_first_sealed_batch_is_residue_not_legacy() {
+    let dir = TempDir::new().unwrap();
+    {
+        let rt = open(dir.path()).unwrap();
+        rt.append(ev("a")).unwrap();
+    }
+    let log = dir.path().join("log.jsonl");
+    let bytes = std::fs::read(&log).unwrap();
+    std::fs::write(&log, &bytes[..bytes.len() / 2]).unwrap(); // torn, no newline
+    std::fs::remove_dir_all(dir.path().join("proj")).unwrap(); // projection never applied it
+    let rt = open(dir.path()).expect("torn first sealed batch must open as empty");
+    assert_eq!(rt.applied().unwrap(), 0);
+}
+
+/// Auto-seal must preserve each legacy event byte-for-byte: key order,
+/// integer width, float spelling. Re-serializing through serde_json::Value
+/// sorts keys and turns integers past u64 into lossy floats.
+#[test]
+fn g_legacy_seal_preserves_event_bytes() {
+    let dir = TempDir::new().unwrap();
+    let event = r#"{"note":"a","z":1,"big":18446744073709551616,"f":1.0}"#;
+    std::fs::write(
+        dir.path().join("log.jsonl"),
+        format!("{{\"seq\":0,\"ts_ms\":1,\"event\":{event}}}\n"),
+    )
+    .unwrap();
+    let _ = open(dir.path());
+    let sealed = std::fs::read_to_string(dir.path().join("log.jsonl")).unwrap();
+    assert!(sealed.contains(&format!("\"event\":{event},\"crc\"")), "event bytes changed:\n{sealed}");
+}
+
+/// Every append re-reads and re-scans the whole tape (scan_file inside
+/// append_all), so a single append's cost grows with tape size.
+#[test]
+fn h_append_cost_is_independent_of_tape_size() {
+    let dir = TempDir::new().unwrap();
+    let rt = open(dir.path()).unwrap();
+    let pad = "x".repeat(2000);
+    let time = |rt: &Runtime<Ev>, n: usize, tag: &str| {
+        let t = std::time::Instant::now();
+        for i in 0..n {
+            rt.append(ev(&format!("{tag}{i}{pad}"))).unwrap();
+        }
+        t.elapsed() / n as u32
+    };
+    let early = time(&rt, 200, "e");
+    for chunk in 0..20 {
+        let evs = (0..1000).map(|i| ev(&format!("m{chunk}-{i}{pad}"))).collect();
+        rt.append_batch(evs).unwrap();
+    }
+    let late = time(&rt, 200, "l");
+    eprintln!("per-append early={early:?} late={late:?} (tape ~{} MB)", 20_400 * 2 / 1000);
+    assert!(late < early * 4, "append slowed from {early:?} to {late:?} as the tape grew");
+}
