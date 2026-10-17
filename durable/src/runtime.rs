@@ -473,6 +473,46 @@ impl<E> JsonlLog<E> {
         })
     }
 
+    /// Seal-gated open for sealed tapes: scan read-only, truncate
+    /// in-flight residue, sync unconditionally, then count. Truncation here
+    /// is not a repair — it removes only bytes the format says were never
+    /// committed, is idempotent across interrupted opens, and is required
+    /// so the next O_APPEND batch never lands behind dead bytes.
+    /// Returns the log plus what the scan found.
+    pub fn open_sealed(path: impl AsRef<Path>) -> Result<(Self, Committed)> {
+        let path = path.as_ref().to_path_buf();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| Error::Log(e.to_string()))?;
+        }
+        if !path.exists() {
+            let log = Self::open(&path)?;
+            return Ok((log, Committed { end: 0, len: 0, last_ts: 0 }));
+        }
+        let bytes = fs::read(&path).map_err(|e| Error::Log(e.to_string()))?;
+        let found = scan(&bytes).map_err(|c| {
+            Error::Corruption(format!("tape corrupt at byte {}: {}", c.offset, c.reason))
+        })?;
+        if found.end < bytes.len() {
+            let dropped = bytes.len() - found.end;
+            let f = OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .map_err(|e| Error::Log(e.to_string()))?;
+            f.set_len(found.end as u64)
+                .map_err(|e| Error::Log(e.to_string()))?;
+            // A restarted process may read a complete batch left in the page
+            // cache by a crashed writer without ever confirming it durable.
+            f.sync_data().map_err(|e| Error::Log(e.to_string()))?;
+            eprintln!(
+                "tape: dropped {dropped} uncommitted bytes past seq {}",
+                found.len
+            );
+        }
+        let mut log = Self::open(&path)?;
+        log.len = found.len;
+        Ok((log, found))
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -612,8 +652,14 @@ impl<E: Serialize + DeserializeOwned + 'static> Runtime<E> {
         }
         let db = Db::open(&db_path)?;
         let applied = applied_leaf().get(&db)?.unwrap_or(0);
-        let log = JsonlLog::open(log_path)?;
-        let last_ts_ms = max_ts_on_tape(&log)?;
+        let (log, found) = JsonlLog::<Record<E>>::open_sealed(log_path)?;
+        if applied > found.len {
+            return Err(Error::Corruption(format!(
+                "projection and tape disagree (applied={applied}, tape has {})",
+                found.len
+            )));
+        }
+        let last_ts_ms = found.last_ts;
         let rt = Self {
             inner: Mutex::new(Inner {
                 log,
@@ -884,14 +930,6 @@ impl<E: Serialize + DeserializeOwned + 'static> Runtime<E> {
         }
         q
     }
-}
-
-fn max_ts_on_tape<E: Serialize + DeserializeOwned>(log: &JsonlLog<Record<E>>) -> Result<u64> {
-    let mut max = 0u64;
-    for (_, rec) in log.read_all()? {
-        max = max.max(rec.ts_ms);
-    }
-    Ok(max)
 }
 
 fn next_ts(last: u64) -> u64 {

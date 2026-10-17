@@ -130,3 +130,86 @@ fn inconsistent_to_inside_batch_never_commits() {
     let found = scan(&bytes).unwrap();
     assert_eq!(found.len, 1);
 }
+
+#[test]
+fn runtime_opens_through_torn_tail_and_keeps_prefix() {
+    use durable::{Durable, Leaf, Map, Runtime};
+    use serde::{Deserialize, Serialize};
+    use tempfile::TempDir;
+
+    #[derive(Durable)]
+    #[allow(dead_code)]
+    struct Store {
+        seen: Map<String, Leaf<String>>,
+    }
+    #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+    struct Ev {
+        note: String,
+    }
+    fn reduce(tx: &mut durable::Tx, event: &Ev) -> durable::Result<()> {
+        let root = Store::root();
+        tx.write(root.seen().key(&event.note).set(&event.note));
+        Ok(())
+    }
+    let dir = TempDir::new().unwrap();
+    let log = dir.path().join("log.jsonl");
+    let proj = dir.path().join("proj");
+    {
+        let rt = Runtime::open_described::<Store>(&proj, &log, None, reduce).unwrap();
+        rt.append(Ev { note: "a".into() }).unwrap();
+        rt.append(Ev { note: "b".into() }).unwrap();
+        assert_eq!(rt.applied().unwrap(), 2);
+    }
+    // Drool in-flight residue past the committed end, the way ENOSPC left
+    // identity 3463 snapped mid-line: half a sealed line, no newline.
+    let mut bytes = std::fs::read(&log).unwrap();
+    let stub = bytes[bytes.len() / 2..bytes.len() / 2 + 40].to_vec();
+    bytes.extend_from_slice(&stub);
+    std::fs::write(&log, &bytes).unwrap();
+    // She rises anyway, holding the committed prefix, and takes new seed.
+    let rt = Runtime::open_described::<Store>(&proj, &log, None, reduce).unwrap();
+    assert_eq!(rt.applied().unwrap(), 2);
+    rt.append(Ev { note: "c".into() }).unwrap();
+    assert_eq!(rt.applied().unwrap(), 3);
+    rt.verify().unwrap();
+}
+
+#[test]
+fn cutting_acknowledged_history_is_fatal_not_silent() {
+    use durable::{Durable, Leaf, Map, Runtime};
+    use serde::{Deserialize, Serialize};
+    use tempfile::TempDir;
+
+    #[derive(Durable)]
+    #[allow(dead_code)]
+    struct Store2 {
+        seen: Map<String, Leaf<String>>,
+    }
+    #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+    struct Ev2 {
+        note: String,
+    }
+    fn reduce2(tx: &mut durable::Tx, event: &Ev2) -> durable::Result<()> {
+        let root = Store2::root();
+        tx.write(root.seen().key(&event.note).set(&event.note));
+        Ok(())
+    }
+    let dir = TempDir::new().unwrap();
+    let log = dir.path().join("log.jsonl");
+    let proj = dir.path().join("proj");
+    {
+        let rt = Runtime::open_described::<Store2>(&proj, &log, None, reduce2).unwrap();
+        rt.append(Ev2 { note: "a".into() }).unwrap();
+        rt.append(Ev2 { note: "b".into() }).unwrap();
+    }
+    // Amputate acknowledged history: tape cut below applied. She must
+    // refuse with disagree, file untouched — never silently pretend.
+    let bytes = std::fs::read(&log).unwrap();
+    let cut = bytes.iter().position(|b| *b == b'\n').unwrap() + 1;
+    std::fs::write(&log, &bytes[..cut]).unwrap();
+    let err = match Runtime::open_described::<Store2>(&proj, &log, None, reduce2) {
+        Ok(_) => panic!("amputated tape opened without disagree"),
+        Err(e) => e.to_string(),
+    };
+    assert!(err.contains("disagree"), "{err}");
+}
