@@ -73,7 +73,7 @@ pub use query::{
     entries, explain, one, project, select, subtree, CostClass, Expr, Nav, Plan, Predicate, Query,
     Terminal,
 };
-pub use runtime::{JsonlLog, Meta, Record, Runtime, Tx};
+pub use runtime::{FailMode, FailingFile, JsonlLog, Meta, Record, Runtime, TapeFile, Tx};
 pub use schema::{Deque, Leaf, List, Map, Schema, Sum, Summable};
 pub use shape::{Describe, Shape};
 pub use watch::{prefix_overlap, watch_hit, watch_prefix, write_range, WatchRange};

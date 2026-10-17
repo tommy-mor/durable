@@ -473,7 +473,7 @@ impl Tx {
 /// and expect `len` to notice.
 pub struct JsonlLog<E> {
     path: PathBuf,
-    file: File,
+    file: Box<dyn TapeFile>,
     len: u64,
     /// Byte offset of the committed end. Everything past it on disk is
     /// residue of a batch that never committed.
@@ -483,6 +483,122 @@ pub struct JsonlLog<E> {
     /// which re-derives the truth from the bytes.
     poisoned: bool,
     _event: PhantomData<E>,
+}
+
+/// Handle indirection for the tape file. Production wraps a real [`File`];
+/// tests wrap a failing double. The writer only touches the tape through
+/// this trait, so every outcome-table row is reachable without real ENOSPC.
+pub trait TapeFile: Send {
+    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()>;
+    fn sync_data(&self) -> std::io::Result<()>;
+    fn file_len(&self) -> std::io::Result<u64>;
+    fn set_len(&self, len: u64) -> std::io::Result<()>;
+}
+
+impl TapeFile for File {
+    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        IoWrite::write_all(self, buf)
+    }
+    fn sync_data(&self) -> std::io::Result<()> {
+        File::sync_data(self)
+    }
+    fn file_len(&self) -> std::io::Result<u64> {
+        Ok(self.metadata()?.len())
+    }
+    fn set_len(&self, len: u64) -> std::io::Result<()> {
+        File::set_len(self, len)
+    }
+}
+
+/// A tape file that fails on command. Test double for the writer outcome
+/// table — the poison, rollback, and shrink-guard branches are otherwise
+/// unreachable without real ENOSPC or EIO.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailMode {
+    /// Every write returns ENOSPC; sync/len/truncate still work.
+    WriteEnospc,
+    /// Every sync returns EIO (Linux may mark pages clean).
+    SyncEio,
+    /// The next sync returns EIO, later syncs succeed: batch sync fails
+    /// but rollback's sync lands — the NotCommitted-poisoned row.
+    SyncEioOnce,
+    /// Truncate returns EPERM: rollback cannot be confirmed.
+    TruncateEperm,
+    /// Sync returns EIO AND truncate returns EPERM: rollback
+    /// unconfirmable after a failed commit — the Unknown row.
+    SyncEioAndTruncateEperm,
+    /// Length reports a shrunken file: acknowledged bytes vanished.
+    ShrunkTo(u64),
+}
+
+/// Failing test double. Records appended bytes in memory so trials can
+/// inspect what would have hit the disk.
+#[derive(Debug, Default)]
+pub struct FailingFile {
+    /// Bytes the writer pushed (including rolled-back ones).
+    pub written: Vec<u8>,
+    /// Length the real file had when the double took over.
+    pub base_len: u64,
+    /// How the double fails.
+    pub mode: Option<FailMode>,
+    /// Syncs failed so far (drives SyncEioOnce).
+    pub syncs_failed: std::cell::Cell<usize>,
+}
+
+impl FailingFile {
+    pub fn healthy(base_len: u64) -> Self {
+        Self {
+            written: Vec::new(),
+            base_len,
+            mode: None,
+            syncs_failed: std::cell::Cell::new(0),
+        }
+    }
+
+    pub fn failing(base_len: u64, mode: FailMode) -> Self {
+        Self {
+            written: Vec::new(),
+            base_len,
+            mode: Some(mode),
+            syncs_failed: std::cell::Cell::new(0),
+        }
+    }
+}
+
+impl TapeFile for FailingFile {
+    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        if self.mode == Some(FailMode::WriteEnospc) {
+            return Err(std::io::Error::from_raw_os_error(28));
+        }
+        self.written.extend_from_slice(buf);
+        Ok(())
+    }
+    fn sync_data(&self) -> std::io::Result<()> {
+        if self.mode == Some(FailMode::SyncEio)
+            || self.mode == Some(FailMode::SyncEioAndTruncateEperm)
+        {
+            return Err(std::io::Error::from_raw_os_error(5));
+        }
+        if self.mode == Some(FailMode::SyncEioOnce) && self.syncs_failed.get() == 0 {
+            self.syncs_failed.set(1);
+            return Err(std::io::Error::from_raw_os_error(5));
+        }
+        Ok(())
+    }
+    fn file_len(&self) -> std::io::Result<u64> {
+        if let Some(FailMode::ShrunkTo(n)) = self.mode {
+            return Ok(n);
+        }
+        Ok(self.base_len + self.written.len() as u64)
+    }
+    fn set_len(&self, _len: u64) -> std::io::Result<()> {
+        if self.mode == Some(FailMode::TruncateEperm)
+            || self.mode == Some(FailMode::SyncEioAndTruncateEperm)
+        {
+            return Err(std::io::Error::from_raw_os_error(1));
+        }
+        Ok(())
+    }
 }
 
 impl<E> JsonlLog<E> {
@@ -501,7 +617,7 @@ impl<E> JsonlLog<E> {
         let end = file.metadata().map_err(|e| Error::Log(e.to_string()))?.len();
         Ok(Self {
             path,
-            file,
+            file: Box::new(file),
             len,
             end,
             poisoned: false,
@@ -583,6 +699,23 @@ impl<E> JsonlLog<E> {
         Ok(self.len)
     }
 
+    /// Whether an I/O failure poisoned this writer. A poisoned writer
+    /// refuses every append until the tape is reopened, which re-derives
+    /// the truth from the bytes. Test hook for the outcome table.
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
+    /// Swap the live file handle for a failing test double, and forget the
+    /// held committed end (the double starts from the given base length).
+    /// Test seam for the outcome table: the next write/sync/truncate
+    /// through this writer fails with the configured error, exercising
+    /// poison, rollback, and the shrink guard without touching real disk.
+    pub fn inject_failing_file(&mut self, fail: FailingFile, base_end: u64) {
+        self.file = Box::new(fail);
+        self.end = base_end;
+    }
+
     pub fn is_empty(&self) -> Result<bool> {
         Ok(self.len == 0)
     }
@@ -634,9 +767,8 @@ impl<E: Serialize + DeserializeOwned> JsonlLog<Record<E>> {
         // the committed end means acknowledged bytes vanished under us.
         let on_disk = self
             .file
-            .metadata()
-            .map_err(|e| Error::Log(e.to_string()))?
-            .len();
+            .file_len()
+            .map_err(|e| Error::Log(e.to_string()))?;
         if on_disk < self.end {
             self.poisoned = true;
             return Err(Error::Corruption(format!(
