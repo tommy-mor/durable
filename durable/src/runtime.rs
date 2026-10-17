@@ -93,20 +93,19 @@ impl<'de, E: DeserializeOwned> Deserialize<'de> for Record<E> {
         struct Helper<E> {
             seq: u64,
             ts_ms: u64,
-            from: Option<u64>,
-            to: Option<u64>,
+            // No legacy fallback: an unsealed record has no from/to/crc and
+            // must not deserialize as if it were sealed.
+            from: u64,
+            to: u64,
             event: E,
-            #[serde(default)]
             crc: String,
         }
         let h = Helper::deserialize(d)?;
-        let from = h.from.unwrap_or(h.seq);
-        let to = h.to.unwrap_or(h.seq);
         Ok(Record {
             seq: h.seq,
             ts_ms: h.ts_ms,
-            from,
-            to,
+            from: h.from,
+            to: h.to,
             event: h.event,
             crc: h.crc,
         })
@@ -277,10 +276,27 @@ pub fn scan(bytes: &[u8]) -> std::result::Result<Committed, Corruption> {
                 None => break,
             };
             if !chunk.iter().all(|b| b.is_ascii_whitespace()) && !chunk.is_empty() {
-                if let Ok((env, _)) = parse_sealed(chunk) {
-                    if env.from != committed.len {
-                        return Err(Corruption { offset: off, reason });
+                match parse_sealed(chunk) {
+                    Ok((env, _)) => {
+                        if env.from != committed.len {
+                            return Err(Corruption { offset: off, reason });
+                        }
                     }
+                    Err(_) if is_unsealed_json(chunk) => {
+                        // A complete line that is valid JSON but carries no
+                        // crc suffix can't come from the sealed writer: a
+                        // torn write never ends in `}\n`, and zero-filled
+                        // pages are not valid JSON. It is someone else's
+                        // history (an unmigrated tape, a hand edit), never
+                        // residue. Refuse; never truncate it away.
+                        return Err(Corruption {
+                            offset: pos,
+                            reason: "unsealed line: not written by the sealed writer \
+                                     (migrate old tapes offline before opening)"
+                                .into(),
+                        });
+                    }
+                    Err(_) => {}
                 }
             }
             pos = next;
@@ -289,6 +305,17 @@ pub fn scan(bytes: &[u8]) -> std::result::Result<Committed, Corruption> {
         return Ok(committed);
     }
     Ok(committed)
+}
+
+/// Valid JSON without the sealed `,"crc":"xxxxxxxx"}` suffix shape. A sealed
+/// line whose CRC no longer matches still has the suffix shape and stays
+/// ordinary damage; only lines the sealed writer could never have produced
+/// match here.
+fn is_unsealed_json(line: &[u8]) -> bool {
+    let has_crc_suffix = line.len() >= CRC_SUFFIX_LEN
+        && line[line.len() - CRC_SUFFIX_LEN..].starts_with(b",\"crc\":\"")
+        && line.ends_with(b"\"}");
+    !has_crc_suffix && serde_json::from_slice::<serde::de::IgnoredAny>(line).is_ok()
 }
 
 pub fn parse_sealed(line: &[u8]) -> Result<(SealedEnvelope, Vec<u8>)> {
@@ -523,9 +550,9 @@ impl<E> JsonlLog<E> {
     /// it removes only bytes the format says were never committed, is
     /// idempotent across interrupted opens, and keeps the next O_APPEND
     /// batch from landing behind dead bytes.
-    /// There is no legacy path: unsealed lines are not candidates, full
-    /// stop. Old tapes migrate through an offline migration script, never
-    /// through the writer.
+    /// There is no legacy path: an unsealed line makes the scan refuse, so
+    /// it never reaches here. Old tapes migrate through an offline
+    /// migration script, never through the writer.
     pub fn seal_to(path: &Path, found: &Committed) -> Result<()> {
         let f = OpenOptions::new()
             .write(true)
@@ -754,9 +781,8 @@ impl<E: Serialize + DeserializeOwned + 'static> Runtime<E> {
         } else {
             Committed { end: 0, len: 0, last_ts: 0 }
         };
-        // No legacy path, ever: unsealed lines are not candidates. A
-        // pre-seal tape opens to whatever sealed prefix the scan finds
-        // (usually zero) and the residue drops at seal_to. Old tapes
+        // No legacy path, ever: an unsealed line is refused by the scan
+        // with the file untouched, never dropped as residue. Old tapes
         // migrate through the offline migration script, never the writer.
         let db = Db::open(&db_path)?;
         let applied = applied_leaf().get(&db)?.unwrap_or(0);

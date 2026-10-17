@@ -26,22 +26,18 @@ fn ev(s: &str) -> Ev {
     Ev { note: s.into() }
 }
 
-/// No legacy path, ever, by Master's law: unsealed lines are not
-/// candidates. A pre-seal tape opens to the sealed prefix (here zero),
-/// its residue drops at seal, and the runtime rises empty ready to take
-/// sealed seed. Old tapes migrate through the offline migration script.
+/// No legacy path, and no wiping either: unsealed lines can't come from
+/// the sealed writer, so an unmigrated tape is refused with the file
+/// byte-identical. Old tapes migrate through the offline script.
 #[test]
-fn a_unsealed_tape_is_residue_not_history() {
+fn a_unsealed_tape_is_refused_untouched() {
     let dir = TempDir::new().unwrap();
     let legacy = "{\"seq\":0,\"ts_ms\":1,\"event\":{\"note\":\"a\"}}\n\
                   {\"seq\":1,\"ts_ms\":2,\"event\":{\"note\":\"b\"}}\n";
     std::fs::write(dir.path().join("log.jsonl"), legacy).unwrap();
-    let rt = open(dir.path()).expect("unsealed residue must open as empty");
-    assert_eq!(rt.applied().unwrap(), 0);
-    assert_eq!(std::fs::read_to_string(dir.path().join("log.jsonl")).unwrap(), "");
-    rt.append(ev("fresh")).unwrap();
-    assert_eq!(rt.applied().unwrap(), 1);
-    rt.verify().unwrap();
+    let err = open(dir.path()).err().expect("unsealed tape must be refused").to_string();
+    assert!(err.contains("unsealed"), "{err}");
+    assert_eq!(std::fs::read_to_string(dir.path().join("log.jsonl")).unwrap(), legacy);
 }
 
 /// Spec, Opening step 4: cross-check BEFORE truncating. Damage the final
@@ -126,10 +122,10 @@ fn f_torn_first_sealed_batch_is_residue_not_legacy() {
     assert_eq!(rt.applied().unwrap(), 0);
 }
 
-/// A mixed tape (sealed prefix, unsealed tail) keeps its sealed history:
-/// the scan commits the sealed batches and drops the unsealed residue.
+/// A sealed prefix followed by an unsealed line: the unsealed line is
+/// foreign history, not residue. Refuse, file untouched.
 #[test]
-fn g_sealed_prefix_survives_unsealed_tail() {
+fn g_unsealed_tail_after_sealed_prefix_is_refused() {
     let dir = TempDir::new().unwrap();
     {
         let rt = open(dir.path()).unwrap();
@@ -140,11 +136,9 @@ fn g_sealed_prefix_survives_unsealed_tail() {
     let mut bytes = std::fs::read(&log).unwrap();
     bytes.extend_from_slice(b"{\"seq\":99,\"ts_ms\":1,\"event\":{\"note\":\"ghost\"}}\n");
     std::fs::write(&log, &bytes).unwrap();
-    let rt = open(dir.path()).expect("sealed prefix must survive");
-    assert_eq!(rt.applied().unwrap(), 2);
-    let recs = rt.records_from(0).unwrap();
-    assert_eq!(recs.len(), 2);
-    rt.verify().unwrap();
+    let err = open(dir.path()).err().expect("unsealed tail must be refused").to_string();
+    assert!(err.contains("unsealed"), "{err}");
+    assert_eq!(std::fs::read(&log).unwrap(), bytes);
 }
 
 /// Every append re-reads and re-scans the whole tape (scan_file inside
@@ -169,4 +163,23 @@ fn h_append_cost_is_independent_of_tape_size() {
     let late = time(&rt, 200, "l");
     eprintln!("per-append early={early:?} late={late:?} (tape ~{} MB)", 20_400 * 2 / 1000);
     assert!(late < early * 4, "append slowed from {early:?} to {late:?} as the tape grew");
+}
+
+/// The operator path that used to wipe history: an old hopd directory
+/// (unsealed tape + projection) is refused; deleting proj/ to "rebuild"
+/// must still be refused, never truncate the tape to zero.
+#[test]
+fn j_unsealed_tape_survives_projection_delete() {
+    let dir = TempDir::new().unwrap();
+    let log = dir.path().join("log.jsonl");
+    let mut old = String::new();
+    for i in 0..50 {
+        old += &format!("{{\"seq\":{i},\"ts_ms\":{i},\"event\":{{\"note\":\"n{i}\"}}}}\n");
+    }
+    std::fs::write(&log, &old).unwrap();
+    for _ in 0..2 {
+        assert!(open(dir.path()).is_err());
+        let _ = std::fs::remove_dir_all(dir.path().join("proj"));
+    }
+    assert_eq!(std::fs::read_to_string(&log).unwrap(), old);
 }
