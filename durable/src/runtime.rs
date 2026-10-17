@@ -163,6 +163,134 @@ pub const MAX_SEALED_BATCH: u64 = 1024;
 /// CRC suffix length: `,"crc":"xxxxxxxx"}` is always exactly 18 bytes.
 pub const CRC_SUFFIX_LEN: usize = 18;
 
+/// What the scan found: the committed prefix ends at byte `end`, holds
+/// `len` records, and the highest ingest timestamp among them is `last_ts`.
+/// Everything past `end` is in-flight residue, never committed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Committed {
+    pub end: usize,
+    pub len: u64,
+    pub last_ts: u64,
+}
+
+/// Where the scan stopped believing: byte `offset` and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Corruption {
+    pub offset: usize,
+    pub reason: String,
+}
+
+/// One pure function decides where the tape ends. Used by the writer at
+/// open, by in-process readers, by `verify` and by the CLI — nothing else
+/// may judge the bytes. A torn tail drops by rule (incomplete batch past
+/// the committed prefix); a valid line past it with a foreign `from`
+/// proves acknowledged bytes were damaged and is fatal.
+pub fn scan(bytes: &[u8]) -> std::result::Result<Committed, Corruption> {
+    let mut committed = Committed {
+        end: 0,
+        len: 0,
+        last_ts: 0,
+    };
+    // Outside: between batches. Inside: mid-batch, expecting `next`.
+    let mut inside: Option<(u64, u64, u64)> = None;
+    let mut bad: Option<(usize, String)> = None;
+    let mut offset = 0usize;
+    // Physical lines: split on \n, terminator included in length math.
+    let mut start = 0usize;
+    while start <= bytes.len() {
+        let rel = bytes[start..].iter().position(|b| *b == b'\n');
+        let (chunk, next) = match rel {
+            Some(i) => (&bytes[start..start + i], start + i + 1),
+            None => (&bytes[start..], bytes.len() + 1),
+        };
+        let terminated = next <= bytes.len();
+        if !terminated {
+            // Trailing bytes with no newline: torn write, stop here.
+            if !chunk.iter().all(|b| b.is_ascii_whitespace()) && !chunk.is_empty() {
+                bad = Some((offset, "torn tail without newline".into()));
+            }
+            break;
+        }
+        offset = start;
+        // Blank lines are skipped, legacy compatibility.
+        if chunk.iter().all(|b| b.is_ascii_whitespace()) {
+            start = next;
+            continue;
+        }
+        let (env, _event) = match parse_sealed(chunk) {
+            Ok(v) => v,
+            Err(e) => {
+                bad = Some((offset, format!("not a candidate line: {e}")));
+                break;
+            }
+        };
+        // Candidate-line envelope rules already checked part; require
+        // batch coherence against the scan state.
+        match inside {
+            None => {
+                if env.from != committed.len || env.seq != env.from {
+                    bad = Some((
+                        offset,
+                        format!(
+                            "batch opens at from={} seq={} but tape holds {}",
+                            env.from, env.seq, committed.len
+                        ),
+                    ));
+                    break;
+                }
+                inside = Some((env.from, env.to, env.seq + 1));
+            }
+            Some((from, to, next_seq)) => {
+                if env.from != from || env.to != to || env.seq != next_seq {
+                    bad = Some((
+                        offset,
+                        format!(
+                            "batch [{from}..{to}] expects seq {next_seq} but got seq {}",
+                            env.seq
+                        ),
+                    ));
+                    break;
+                }
+                inside = Some((from, to, next_seq + 1));
+            }
+        }
+        if env.seq == env.to {
+            committed = Committed {
+                end: next,
+                len: env.to + 1,
+                last_ts: committed.last_ts.max(env.ts_ms),
+            };
+            inside = None;
+        }
+        start = next;
+    }
+    if let Some((off, reason)) = bad {
+        // Tail check: every candidate line past committed.end with
+        // from == committed.len is in-flight residue, even a surviving
+        // closing line. Any other from proves a later batch was written,
+        // so the bad bytes are damage to acknowledged data: fatal.
+        let mut pos = committed.end;
+        while pos < bytes.len() {
+            let rel = bytes[pos..].iter().position(|b| *b == b'\n');
+            let (chunk, next) = match rel {
+                Some(i) => (&bytes[pos..pos + i], pos + i + 1),
+                None => break,
+            };
+            if !chunk.iter().all(|b| b.is_ascii_whitespace()) && !chunk.is_empty() {
+                if let Ok((env, _)) = parse_sealed(chunk) {
+                    if env.from != committed.len {
+                        return Err(Corruption { offset: off, reason });
+                    }
+                }
+            }
+            pos = next;
+        }
+        // Residue only: the committed prefix stands.
+        return Ok(committed);
+    }
+    Ok(committed)
+}
+
 pub fn parse_sealed(line: &[u8]) -> Result<(SealedEnvelope, Vec<u8>)> {
     if line.len() > MAX_SEALED_LINE {
         return Err(Error::Deserialize("sealed line over 16 MiB".into()));
