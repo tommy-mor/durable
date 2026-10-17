@@ -26,28 +26,21 @@ fn ev(s: &str) -> Ev {
     Ev { note: s.into() }
 }
 
-/// An unsealed tape written by the pre-slice-1 writer (every hopd
-/// `hop-data/log.jsonl` in existence) must not be destroyed on upgrade:
-/// clean legacy auto-seals per the spec (each record its own sealed
-/// batch, seq/ts/event preserved exactly), and the runtime rises with
-/// both records applied.
+/// No legacy path, ever, by Master's law: unsealed lines are not
+/// candidates. A pre-seal tape opens to the sealed prefix (here zero),
+/// its residue drops at seal, and the runtime rises empty ready to take
+/// sealed seed. Old tapes migrate through the offline migration script.
 #[test]
-fn a_legacy_tape_survives_upgrade() {
+fn a_unsealed_tape_is_residue_not_history() {
     let dir = TempDir::new().unwrap();
     let legacy = "{\"seq\":0,\"ts_ms\":1,\"event\":{\"note\":\"a\"}}\n\
                   {\"seq\":1,\"ts_ms\":2,\"event\":{\"note\":\"b\"}}\n";
     std::fs::write(dir.path().join("log.jsonl"), legacy).unwrap();
-    let rt = open(dir.path()).expect("clean legacy auto-seals");
-    assert_eq!(rt.applied().unwrap(), 2);
-    let after = std::fs::read_to_string(dir.path().join("log.jsonl")).unwrap();
-    assert_ne!(after, legacy, "legacy tape was not sealed");
-    // Every record survives with seq/ts/event intact, sealed shut.
-    let recs = rt.records_from(0).unwrap();
-    assert_eq!(recs.len(), 2);
-    assert_eq!((recs[0].seq, recs[0].from, recs[0].to), (0, 0, 0));
-    assert_eq!((recs[1].seq, recs[1].from, recs[1].to), (1, 1, 1));
-    assert_eq!(recs[0].ts_ms, 1);
-    assert_eq!(recs[1].ts_ms, 2);
+    let rt = open(dir.path()).expect("unsealed residue must open as empty");
+    assert_eq!(rt.applied().unwrap(), 0);
+    assert_eq!(std::fs::read_to_string(dir.path().join("log.jsonl")).unwrap(), "");
+    rt.append(ev("fresh")).unwrap();
+    assert_eq!(rt.applied().unwrap(), 1);
     rt.verify().unwrap();
 }
 
@@ -133,21 +126,25 @@ fn f_torn_first_sealed_batch_is_residue_not_legacy() {
     assert_eq!(rt.applied().unwrap(), 0);
 }
 
-/// Auto-seal must preserve each legacy event byte-for-byte: key order,
-/// integer width, float spelling. Re-serializing through serde_json::Value
-/// sorts keys and turns integers past u64 into lossy floats.
+/// A mixed tape (sealed prefix, unsealed tail) keeps its sealed history:
+/// the scan commits the sealed batches and drops the unsealed residue.
 #[test]
-fn g_legacy_seal_preserves_event_bytes() {
+fn g_sealed_prefix_survives_unsealed_tail() {
     let dir = TempDir::new().unwrap();
-    let event = r#"{"note":"a","z":1,"big":18446744073709551616,"f":1.0}"#;
-    std::fs::write(
-        dir.path().join("log.jsonl"),
-        format!("{{\"seq\":0,\"ts_ms\":1,\"event\":{event}}}\n"),
-    )
-    .unwrap();
-    let _ = open(dir.path());
-    let sealed = std::fs::read_to_string(dir.path().join("log.jsonl")).unwrap();
-    assert!(sealed.contains(&format!("\"event\":{event},\"crc\"")), "event bytes changed:\n{sealed}");
+    {
+        let rt = open(dir.path()).unwrap();
+        rt.append(ev("a")).unwrap();
+        rt.append(ev("b")).unwrap();
+    }
+    let log = dir.path().join("log.jsonl");
+    let mut bytes = std::fs::read(&log).unwrap();
+    bytes.extend_from_slice(b"{\"seq\":99,\"ts_ms\":1,\"event\":{\"note\":\"ghost\"}}\n");
+    std::fs::write(&log, &bytes).unwrap();
+    let rt = open(dir.path()).expect("sealed prefix must survive");
+    assert_eq!(rt.applied().unwrap(), 2);
+    let recs = rt.records_from(0).unwrap();
+    assert_eq!(recs.len(), 2);
+    rt.verify().unwrap();
 }
 
 /// Every append re-reads and re-scans the whole tape (scan_file inside

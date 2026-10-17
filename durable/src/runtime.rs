@@ -518,105 +518,14 @@ impl<E> JsonlLog<E> {
             Error::Corruption(format!("tape corrupt at byte {}: {}", c.offset, c.reason))
         })
     }
-
-    /// A legacy line: `{seq, ts_ms, event}` with no sealed envelope. The
-    /// old format cannot tell a torn tail from corruption, so only a
-    /// fully clean legacy tape auto-seals; anything else refuses.
-    fn parse_legacy_line(line: &[u8]) -> Result<(u64, u64, Vec<u8>)> {
-        #[derive(Deserialize)]
-        struct Legacy<'a> {
-            seq: u64,
-            ts_ms: u64,
-            #[serde(borrow)]
-            event: &'a serde_json::value::RawValue,
-        }
-        if line.iter().any(|b| *b == b'\n') {
-            return Err(Error::Deserialize("legacy line spans lines".into()));
-        }
-        let text = std::str::from_utf8(line)
-            .map_err(|e| Error::Deserialize(e.to_string()))?;
-        // Sealed lines are never legacy, even if their envelope also
-        // carries seq/ts_ms: the crc suffix marks them.
-        if text.contains("\"crc\"") || text.contains("\"from\"") {
-            return Err(Error::Deserialize("not a legacy line".into()));
-        }
-        let leg: Legacy =
-            serde_json::from_str(text).map_err(|e| Error::Deserialize(e.to_string()))?;
-        Ok((leg.seq, leg.ts_ms, leg.event.get().as_bytes().to_vec()))
-    }
-
-    /// Auto-seal a clean legacy tape under the tape lock: every legacy
-    /// record becomes its own sealed batch (`from = to = seq`), seq and
-    /// ts preserved exactly. Written to `<tape>.sealing`, fsynced,
-    /// renamed over the tape, directory fsynced. Returns the committed
-    /// truth of the sealed copy. A tape with ANY damaged line refuses
-    /// with `tape seal` — the one human decision per tape.
-    pub fn seal_legacy<F>(path: &Path) -> Result<Committed>
-    where
-        F: DeserializeOwned,
-    {
-        let bytes = fs::read(path).map_err(|e| Error::Log(e.to_string()))?;
-        let mut records: Vec<(u64, u64, Vec<u8>)> = Vec::new();
-        for chunk in bytes.split(|b| *b == b'\n') {
-            if chunk.is_empty() || chunk.iter().all(|b| b.is_ascii_whitespace()) {
-                continue;
-            }
-            let (seq, ts, event_bytes) = Self::parse_legacy_line(chunk).map_err(|_| {
-                Error::Corruption(
-                    "legacy tape damaged: run: durable tape seal <tape>".into(),
-                )
-            })?;
-            // The event must still decode under the new envelope.
-            let _: F = serde_json::from_slice(&event_bytes).map_err(|_| {
-                Error::Corruption(
-                    "legacy tape damaged: run: durable tape seal <tape>".into(),
-                )
-            })?;
-            records.push((seq, ts, event_bytes));
-        }
-        for (i, (seq, _, _)) in records.iter().enumerate() {
-            if *seq != i as u64 {
-                return Err(Error::Corruption(
-                    "legacy tape damaged: run: durable tape seal <tape>".into(),
-                ));
-            }
-        }
-        let sealing = path.with_extension("sealing");
-        {
-            let mut out = String::new();
-            for (seq, ts, event_bytes) in &records {
-                // Carry the event bytes verbatim: re-serializing through
-                // serde_json::Value would sort keys and turn integers past
-                // 64 bits into lossy floats.
-                let text = String::from_utf8(event_bytes.clone())
-                    .map_err(|e| Error::Deserialize(e.to_string()))?;
-                let event = serde_json::value::RawValue::from_string(text)
-                    .map_err(|e| Error::Deserialize(e.to_string()))?;
-                out.push_str(&render_sealed(*seq, *ts, *seq, *seq, &event)?);
-                out.push('\n');
-            }
-            fs::write(&sealing, out.as_bytes()).map_err(|e| Error::Log(e.to_string()))?;
-            let f = OpenOptions::new()
-                .read(true)
-                .open(&sealing)
-                .map_err(|e| Error::Log(e.to_string()))?;
-            f.sync_data().map_err(|e| Error::Log(e.to_string()))?;
-        }
-        fs::rename(&sealing, path).map_err(|e| Error::Log(e.to_string()))?;
-        if let Some(parent) = path.parent() {
-            let d = OpenOptions::new()
-                .read(true)
-                .open(parent)
-                .map_err(|e| Error::Log(e.to_string()))?;
-            d.sync_data().map_err(|e| Error::Log(e.to_string()))?;
-        }
-        Self::scan_file(path)
-    }
     /// Seal the tape to the scanned committed end: truncate in-flight
     /// residue, then sync unconditionally. Truncation is not a repair —
     /// it removes only bytes the format says were never committed, is
     /// idempotent across interrupted opens, and keeps the next O_APPEND
     /// batch from landing behind dead bytes.
+    /// There is no legacy path: unsealed lines are not candidates, full
+    /// stop. Old tapes migrate through an offline migration script, never
+    /// through the writer.
     pub fn seal_to(path: &Path, found: &Committed) -> Result<()> {
         let f = OpenOptions::new()
             .write(true)
@@ -668,22 +577,6 @@ impl<E> JsonlLog<E> {
             )));
         }
         Ok(())
-    }
-
-    /// True when the first complete, non-blank line is an unsealed legacy
-    /// record. A torn or sealed first line is not legacy: a sealed tape
-    /// whose first batch tore is ordinary in-flight residue.
-    pub fn looks_legacy(path: &Path) -> Result<bool> {
-        let bytes = fs::read(path).map_err(|e| Error::Log(e.to_string()))?;
-        let mut rest = &bytes[..];
-        while let Some(i) = rest.iter().position(|b| *b == b'\n') {
-            let line = &rest[..i];
-            if !line.iter().all(|b| b.is_ascii_whitespace()) {
-                return Ok(Self::parse_legacy_line(line).is_ok());
-            }
-            rest = &rest[i + 1..];
-        }
-        Ok(false)
     }
 }
 
@@ -856,20 +749,15 @@ impl<E: Serialize + DeserializeOwned + 'static> Runtime<E> {
         // cross-check BEFORE sealing. Sealing first would destroy the
         // evidence disagreement needs — the file must stay byte-identical
         // on every fatal path.
-        let mut found = if log_path.exists() {
+        let found = if log_path.exists() {
             JsonlLog::<Record<E>>::scan_file(&log_path)?
         } else {
             Committed { end: 0, len: 0, last_ts: 0 }
         };
-        // No sealed batch but bytes on disk: she may be a pre-slice
-        // legacy tape. Clean legacy auto-seals (seq/ts preserved);
-        // damaged legacy refuses with `tape seal` — never truncated.
-        if found.len == 0
-            && log_path.exists()
-            && JsonlLog::<Record<E>>::looks_legacy(&log_path)?
-        {
-            found = JsonlLog::<Record<E>>::seal_legacy::<E>(&log_path)?;
-        }
+        // No legacy path, ever: unsealed lines are not candidates. A
+        // pre-seal tape opens to whatever sealed prefix the scan finds
+        // (usually zero) and the residue drops at seal_to. Old tapes
+        // migrate through the offline migration script, never the writer.
         let db = Db::open(&db_path)?;
         let applied = applied_leaf().get(&db)?.unwrap_or(0);
         if applied > found.len {
