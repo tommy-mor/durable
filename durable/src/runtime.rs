@@ -55,14 +55,63 @@ pub struct Meta {
 /// One fsynced log line: ingest metadata plus the event body.
 ///
 /// The body is nested (not flattened) so an event field named `seq` or
-/// `ts_ms` cannot collide with the envelope.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// `ts_ms` cannot collide with the envelope. `from`/`to` name this record's
+/// batch (a lone append has `from == seq == to`); `crc` seals the line so a
+/// torn tail reads as uncommitted by rule, never by judgment.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Record<E> {
     pub seq: u64,
     pub ts_ms: u64,
+    pub from: u64,
+    pub to: u64,
     pub event: E,
+    pub crc: String,
 }
 
+impl<E: Serialize> Serialize for Record<E> {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        s: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut st = s.serialize_struct("Record", 6)?;
+        st.serialize_field("seq", &self.seq)?;
+        st.serialize_field("ts_ms", &self.ts_ms)?;
+        st.serialize_field("from", &self.from)?;
+        st.serialize_field("to", &self.to)?;
+        st.serialize_field("event", &self.event)?;
+        st.serialize_field("crc", &self.crc)?;
+        st.end()
+    }
+}
+
+impl<'de, E: DeserializeOwned> Deserialize<'de> for Record<E> {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        d: D,
+    ) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Helper<E> {
+            seq: u64,
+            ts_ms: u64,
+            from: Option<u64>,
+            to: Option<u64>,
+            event: E,
+            #[serde(default)]
+            crc: String,
+        }
+        let h = Helper::deserialize(d)?;
+        let from = h.from.unwrap_or(h.seq);
+        let to = h.to.unwrap_or(h.seq);
+        Ok(Record {
+            seq: h.seq,
+            ts_ms: h.ts_ms,
+            from,
+            to,
+            event: h.event,
+            crc: h.crc,
+        })
+    }
+}
 impl<E> Record<E> {
     pub fn meta(&self) -> Meta {
         Meta {
@@ -70,6 +119,98 @@ impl<E> Record<E> {
             ts_ms: self.ts_ms,
         }
     }
+}
+
+/// CRC32C over line bytes as written, rendered as 8 lowercase hex digits.
+/// `crc32c` is Castagnoli, not the `crc32fast` IEEE already in the tree.
+pub fn seal_crc(prefix_bytes: &[u8]) -> String {
+    format!("{:08x}", crc32c::crc32c(prefix_bytes))
+}
+
+/// Render one sealed tape line: compact JSON, `seq` first for
+/// `grep '^{"seq":…`, envelope then body, CRC suffix always exactly
+/// `,"crc":"xxxxxxxx"}` (18 bytes) so checking is slicing, never
+/// canonical-JSON. The only raw `\n` is added by the writer.
+pub fn render_sealed<E: Serialize>(seq: u64, ts_ms: u64, from: u64, to: u64, event: &E) -> Result<String> {
+    let body =
+        serde_json::to_string(event).map_err(|e| Error::Serialize(e.to_string()))?;
+    let mut prefix = format!(
+        "{{\"seq\":{seq},\"ts_ms\":{ts_ms},\"from\":{from},\"to\":{to},\"event\":{body}"
+    );
+    let crc = seal_crc(prefix.as_bytes());
+    prefix.push_str(",\"crc\":\"");
+    prefix.push_str(&crc);
+    prefix.push_str("\"}");
+    Ok(prefix)
+}
+
+/// A checked sealed line: envelope fields plus the raw event bytes, so the
+/// caller can decode `E` itself. Rejects overlong lines, bad CRC, and bad
+/// envelope shapes without ever hunting JSON fragments inside damage.
+#[derive(Debug, Clone, Copy)]
+pub struct SealedEnvelope {
+    pub seq: u64,
+    pub ts_ms: u64,
+    pub from: u64,
+    pub to: u64,
+}
+
+/// Maximum sealed line: 16 MiB per the spec; anything longer is not a
+/// candidate line, no matter how it parses.
+pub const MAX_SEALED_LINE: usize = 16 * 1024 * 1024;
+/// Largest batch the scan will call complete: bounds `to - from`.
+pub const MAX_SEALED_BATCH: u64 = 1024;
+/// CRC suffix length: `,"crc":"xxxxxxxx"}` is always exactly 18 bytes.
+pub const CRC_SUFFIX_LEN: usize = 18;
+
+pub fn parse_sealed(line: &[u8]) -> Result<(SealedEnvelope, Vec<u8>)> {
+    if line.len() > MAX_SEALED_LINE {
+        return Err(Error::Deserialize("sealed line over 16 MiB".into()));
+    }
+    if line.len() < CRC_SUFFIX_LEN + 2 {
+        return Err(Error::Deserialize("sealed line too short for a crc".into()));
+    }
+    let (prefix, suffix) = line.split_at(line.len() - CRC_SUFFIX_LEN);
+    if !suffix.starts_with(b",\"crc\":\"") || !suffix.ends_with(b"\"}") {
+        return Err(Error::Deserialize("sealed line missing crc suffix".into()));
+    }
+    let got = std::str::from_utf8(&suffix[8..16])
+        .map_err(|e| Error::Deserialize(e.to_string()))?;
+    if !got.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(Error::Deserialize("sealed crc not hex".into()));
+    }
+    let want = seal_crc(prefix);
+    if got != want {
+        return Err(Error::Deserialize("sealed crc mismatch".into()));
+    }
+    let env: SealedEnvelopeWire =
+        serde_json::from_slice(line).map_err(|e| Error::Deserialize(e.to_string()))?;
+    if env.from > env.to || env.seq < env.from || env.seq > env.to {
+        return Err(Error::Deserialize("sealed envelope seq outside batch".into()));
+    }
+    if env.to - env.from >= MAX_SEALED_BATCH {
+        return Err(Error::Deserialize("sealed batch too large".into()));
+    }
+    let event_bytes = env.event.get().as_bytes().to_vec();
+    Ok((
+        SealedEnvelope {
+            seq: env.seq,
+            ts_ms: env.ts_ms,
+            from: env.from,
+            to: env.to,
+        },
+        event_bytes,
+    ))
+}
+
+#[derive(Deserialize)]
+struct SealedEnvelopeWire<'a> {
+    seq: u64,
+    ts_ms: u64,
+    from: u64,
+    to: u64,
+    #[serde(borrow)]
+    event: &'a serde_json::value::RawValue,
 }
 
 /// A reducer transaction: reified writes plus committed-state reads.
@@ -217,26 +358,26 @@ impl<E> JsonlLog<E> {
     }
 }
 
-impl<E: Serialize + DeserializeOwned> JsonlLog<E> {
-    /// Append one event, fsync the file contents, return its 0-based index.
-    pub fn append(&mut self, event: &E) -> Result<u64> {
-        let idx = self.len;
-        self.append_all(std::slice::from_ref(event))?;
-        Ok(idx)
-    }
-
-    /// Append `events` as consecutive lines and fsync once. Returns the index
-    /// of the first event (equal to `len` before the call). Empty input is a
-    /// no-op and does not fsync.
-    pub fn append_all(&mut self, events: &[E]) -> Result<u64> {
+impl<E: Serialize + DeserializeOwned> JsonlLog<Record<E>> {
+    /// Append sealed records as consecutive lines and fsync once. Returns
+    /// the index of the first record (equal to `len` before the call).
+    /// Empty input is a no-op and does not fsync.
+    pub fn append_all(&mut self, events: &[Record<E>]) -> Result<u64> {
         let start = self.len;
         if events.is_empty() {
             return Ok(start);
         }
-        for event in events {
-            let line = serde_json::to_string(event).map_err(|e| Error::Serialize(e.to_string()))?;
-            writeln!(&self.file, "{line}").map_err(|e| Error::Log(e.to_string()))?;
+        // Render the whole batch first, sealing every line's CRC fresh, so a
+        // serialization failure never drools half a thrust onto the tape.
+        let mut batch = String::with_capacity(events.len() * 256);
+        for rec in events {
+            let line = render_sealed(rec.seq, rec.ts_ms, rec.from, rec.to, &rec.event)?;
+            batch.push_str(&line);
+            batch.push('\n');
         }
+        self.file
+            .write_all(batch.as_bytes())
+            .map_err(|e| Error::Log(e.to_string()))?;
         // Content durability. Metadata (mtime) is not the tape.
         self.file
             .sync_data()
@@ -245,30 +386,51 @@ impl<E: Serialize + DeserializeOwned> JsonlLog<E> {
         Ok(start)
     }
 
-    /// Events from `start` (inclusive) to the end, with their indices.
-    pub fn read_from(&self, start: u64) -> Result<Vec<(u64, E)>> {
+    /// Sealed records from `start` (inclusive) to the end, with their tape
+    /// indices. Every line is checked through `parse_sealed`; a torn tail
+    /// is the scan's business, never this reader's — here a bad line is a
+    /// hard error, because readers only walk the committed prefix.
+    pub fn read_from(&self, start: u64) -> Result<Vec<(u64, Record<E>)>> {
         if !self.path.exists() {
             return Ok(Vec::new());
         }
-        let file = File::open(&self.path).map_err(|e| Error::Log(e.to_string()))?;
+        let bytes = fs::read(&self.path).map_err(|e| Error::Log(e.to_string()))?;
         let mut out = Vec::new();
         let mut idx = 0u64;
-        for line in BufReader::new(file).lines() {
-            let line = line.map_err(|e| Error::Log(e.to_string()))?;
-            if line.trim().is_empty() {
+        for chunk in bytes.split(|b| *b == b'\n') {
+            if chunk.is_empty() {
                 continue;
             }
+            // Skip whitespace-only legacy padding without paying parse.
+            if chunk.iter().all(|b| b.is_ascii_whitespace()) {
+                continue;
+            }
+            let (env, event_bytes) = parse_sealed(chunk)?;
             if idx >= start {
-                let event: E =
-                    serde_json::from_str(&line).map_err(|e| Error::Deserialize(e.to_string()))?;
-                out.push((idx, event));
+                let event: E = serde_json::from_slice(&event_bytes)
+                    .map_err(|e| Error::Deserialize(e.to_string()))?;
+                let crc = String::from_utf8_lossy(
+                    &chunk[chunk.len() - CRC_SUFFIX_LEN + 8..chunk.len() - 2],
+                )
+                .into_owned();
+                out.push((
+                    idx,
+                    Record {
+                        seq: env.seq,
+                        ts_ms: env.ts_ms,
+                        from: env.from,
+                        to: env.to,
+                        event,
+                        crc,
+                    },
+                ));
             }
             idx += 1;
         }
         Ok(out)
     }
 
-    pub fn read_all(&self) -> Result<Vec<(u64, E)>> {
+    pub fn read_all(&self) -> Result<Vec<(u64, Record<E>)>> {
         self.read_from(0)
     }
 }
@@ -440,11 +602,20 @@ impl<E: Serialize + DeserializeOwned + 'static> Runtime<E> {
             .map_err(|_| Error::Log("runtime lock poisoned".into()))?;
         self.catch_up_locked(&mut inner)?;
         let mut records = Vec::with_capacity(events.len());
-        let mut seq = inner.log.len()?;
+        let from = inner.log.len()?;
+        let to = from + events.len() as u64 - 1;
+        let mut seq = from;
         let mut ts_ms = inner.last_ts_ms;
         for event in events {
             ts_ms = next_ts(ts_ms);
-            records.push(Record { seq, ts_ms, event });
+            records.push(Record {
+                seq,
+                ts_ms,
+                from,
+                to,
+                event,
+                crc: String::new(),
+            });
             seq += 1;
         }
         inner.log.append_all(&records)?;
