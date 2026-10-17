@@ -27,16 +27,28 @@ fn ev(s: &str) -> Ev {
 }
 
 /// An unsealed tape written by the pre-slice-1 writer (every hopd
-/// `hop-data/log.jsonl` in existence) must not be destroyed on upgrade.
+/// `hop-data/log.jsonl` in existence) must not be destroyed on upgrade:
+/// clean legacy auto-seals per the spec (each record its own sealed
+/// batch, seq/ts/event preserved exactly), and the runtime rises with
+/// both records applied.
 #[test]
 fn a_legacy_tape_survives_upgrade() {
     let dir = TempDir::new().unwrap();
     let legacy = "{\"seq\":0,\"ts_ms\":1,\"event\":{\"note\":\"a\"}}\n\
                   {\"seq\":1,\"ts_ms\":2,\"event\":{\"note\":\"b\"}}\n";
     std::fs::write(dir.path().join("log.jsonl"), legacy).unwrap();
-    let res = open(dir.path());
+    let rt = open(dir.path()).expect("clean legacy auto-seals");
+    assert_eq!(rt.applied().unwrap(), 2);
     let after = std::fs::read_to_string(dir.path().join("log.jsonl")).unwrap();
-    assert_eq!(after, legacy, "legacy tape bytes changed (open result: {:?})", res.as_ref().map(|r| r.applied().unwrap()).map_err(|e| e.to_string()));
+    assert_ne!(after, legacy, "legacy tape was not sealed");
+    // Every record survives with seq/ts/event intact, sealed shut.
+    let recs = rt.records_from(0).unwrap();
+    assert_eq!(recs.len(), 2);
+    assert_eq!((recs[0].seq, recs[0].from, recs[0].to), (0, 0, 0));
+    assert_eq!((recs[1].seq, recs[1].from, recs[1].to), (1, 1, 1));
+    assert_eq!(recs[0].ts_ms, 1);
+    assert_eq!(recs[1].ts_ms, 2);
+    rt.verify().unwrap();
 }
 
 /// Spec, Opening step 4: cross-check BEFORE truncating. Damage the final
