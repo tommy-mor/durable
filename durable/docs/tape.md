@@ -245,7 +245,20 @@ returns. So:
 ## Old (unsealed) tapes
 
 There is no legacy path in the writer or at open. Old tapes are migrated
-by an offline script before the new runtime ever opens them.
+offline, with no writer running, by `durable-tape-migrate [--drop-torn-tail] <tape>`:
+
+- It writes `<tape>.migrated`, fsynced, with each old record as its own
+  sealed batch (`from = to = seq`), seq and ts_ms preserved, event bytes
+  verbatim. The operator renames it over the tape and fsyncs the
+  directory. The existing projection stays valid: seqs don't change.
+- Any damaged line, a seq gap, or an already-sealed envelope refuses and
+  migrates nothing.
+- A torn tail (final bytes with no newline) refuses too, unless
+  `--drop-torn-tail` is passed. The old writer fsynced only after whole
+  lines, so that fragment was never acknowledged; the flag drops exactly
+  it and prints it. A damaged line that is newline-terminated is
+  acknowledged history and is never excused. This is the path for the
+  identity line-3463 and ladder line-558 tapes.
 
 Open never treats an unsealed line as residue. A complete line that is
 valid JSON but has no `,"crc":"xxxxxxxx"}` suffix can't have come from the

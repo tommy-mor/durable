@@ -193,7 +193,6 @@ pub fn scan(bytes: &[u8]) -> std::result::Result<Committed, Corruption> {
     // Outside: between batches. Inside: mid-batch, expecting `next`.
     let mut inside: Option<(u64, u64, u64)> = None;
     let mut bad: Option<(usize, String)> = None;
-    let mut offset = 0usize;
     // Physical lines: split on \n, terminator included in length math.
     let mut start = 0usize;
     while start <= bytes.len() {
@@ -203,7 +202,7 @@ pub fn scan(bytes: &[u8]) -> std::result::Result<Committed, Corruption> {
             None => (&bytes[start..], bytes.len() + 1),
         };
         let terminated = next <= bytes.len();
-        offset = start;
+        let offset = start;
         if !terminated {
             // Trailing bytes with no newline: torn write, stop here.
             if !chunk.iter().all(|b| b.is_ascii_whitespace()) && !chunk.is_empty() {

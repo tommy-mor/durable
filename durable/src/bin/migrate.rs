@@ -1,6 +1,6 @@
 //! durable-tape-migrate — offline migration of a pre-seal JSONL tape.
 //!
-//! Usage: durable-tape-migrate <tape.jsonl>
+//! Usage: durable-tape-migrate [--drop-torn-tail] <tape.jsonl>
 //!
 //! Reads old `{seq, ts_ms, event}` lines and writes sealed
 //! `{seq, ts_ms, from=seq, to=seq, event, crc}` lines to `<tape>.migrated`
@@ -10,16 +10,19 @@
 //!
 //! Rules, hard as stone:
 //! - every line must parse with u64 seq/ts_ms and a present event, seqs
-//!   contiguous from 0; ANY damaged line (torn tail included) refuses with
-//!   a non-zero exit and migrates NOTHING — the operator decides, the
-//!   blade never judges;
+//!   contiguous from 0; ANY damaged line refuses with a non-zero exit and
+//!   migrates NOTHING — the operator decides, the blade never judges;
+//! - a torn tail (final bytes with no newline) also refuses, unless the
+//!   operator passes `--drop-torn-tail`. The old writer fsynced only after
+//!   whole lines, so an unterminated final fragment was never acknowledged;
+//!   the flag drops exactly that fragment and prints it. A damaged line
+//!   that IS terminated is acknowledged history and is never excused;
 //! - each event's bytes travel VERBATIM (RawValue carry): re-serializing
 //!   through a JSON value would sort keys and turn integers past 64 bits
 //!   into lossy floats;
 //! - blank lines are skipped, matching the scan's tolerance.
 
 use std::fs::OpenOptions;
-use std::io::Write as IoWrite;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -30,7 +33,7 @@ fn fail(msg: &str) -> ExitCode {
     ExitCode::from(2)
 }
 
-fn migrate(path: &Path) -> Result<PathBuf, String> {
+fn migrate(path: &Path, drop_torn_tail: bool) -> Result<PathBuf, String> {
     let bytes =
         std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
     let mut out = String::new();
@@ -64,10 +67,18 @@ fn migrate(path: &Path) -> Result<PathBuf, String> {
             None => {
                 let tail = &bytes[start..];
                 if !tail.is_empty() && !tail.iter().all(|b| b.is_ascii_whitespace()) {
-                    return Err(format!(
-                        "torn tail past line {lineno}: {} unsealed bytes with no newline — migrate nothing",
-                        tail.len()
-                    ));
+                    if !drop_torn_tail {
+                        return Err(format!(
+                            "torn tail past line {lineno}: {} bytes with no newline — migrate nothing \
+                             (rerun with --drop-torn-tail to drop exactly this fragment)",
+                            tail.len()
+                        ));
+                    }
+                    eprintln!(
+                        "durable-tape-migrate: dropping torn tail past line {lineno} ({} bytes, never acknowledged): {}",
+                        tail.len(),
+                        String::from_utf8_lossy(tail).escape_debug()
+                    );
                 }
                 break;
             }
@@ -99,14 +110,19 @@ fn parse_old_line(
         ts_ms: u64,
         #[serde(borrow)]
         event: &'a serde_json::value::RawValue,
+        // Envelope fields only a sealed line has. Checked at the top level,
+        // so an event that carries its own "crc" field is still old.
+        crc: Option<serde::de::IgnoredAny>,
+        from: Option<serde::de::IgnoredAny>,
+        to: Option<serde::de::IgnoredAny>,
     }
     let text =
         std::str::from_utf8(line).map_err(|e| format!("not utf-8: {e}"))?;
-    if text.contains("\"crc\"") {
-        return Err("already sealed (has crc) — refusing to re-migrate".into());
-    }
     let old: Old =
         serde_json::from_str(text).map_err(|e| format!("not an old record: {e}"))?;
+    if old.crc.is_some() || old.from.is_some() || old.to.is_some() {
+        return Err("already sealed (envelope has crc/from/to) — refusing to re-migrate".into());
+    }
     // Re-own the verbatim bytes: RawValue borrows the input line, which
     // the caller drops. from_string validates without re-rendering.
     let owned = serde_json::value::RawValue::from_string(old.event.get().to_string())
@@ -115,13 +131,20 @@ fn parse_old_line(
 }
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let drop_torn_tail = if let Some(i) = args.iter().position(|a| a == "--drop-torn-tail") {
+        args.remove(i);
+        true
+    } else {
+        false
+    };
     if args.len() != 1 || args[0] == "-h" || args[0] == "--help" {
-        eprintln!("usage: durable-tape-migrate <tape.jsonl>");
-        eprintln!("writes <tape>.migrated (fsynced); you rename it over the tape with no writer running.");
+        eprintln!("usage: durable-tape-migrate [--drop-torn-tail] <tape.jsonl>");
+        eprintln!("writes <tape>.migrated (fsynced); with no writer running, rename it over the tape");
+        eprintln!("and fsync the directory (e.g. `mv` then `sync`). The existing projection stays valid.");
         return ExitCode::from(if args.len() != 1 { 2 } else { 0 });
     }
-    match migrate(Path::new(&args[0])) {
+    match migrate(Path::new(&args[0]), drop_torn_tail) {
         Ok(dest) => {
             println!("migrated -> {}", dest.display());
             ExitCode::SUCCESS

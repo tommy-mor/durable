@@ -205,3 +205,59 @@ fn i_migrate_binary_opens_legacy_clean() {
     assert_eq!((recs[1].seq, recs[1].ts_ms), (1, 9));
     rt.verify().unwrap();
 }
+
+// ---- round 4: migration blade -------------------------------------------
+
+fn migrate_bin() -> std::process::Command {
+    std::process::Command::new(env!("CARGO_BIN_EXE_durable-tape-migrate"))
+}
+
+/// An old event may legitimately carry its own "crc" field (a checksum in
+/// the domain data). Only a top-level envelope crc marks a sealed tape.
+#[test]
+fn k_migrate_accepts_event_field_named_crc() {
+    let dir = TempDir::new().unwrap();
+    let tape = dir.path().join("log.jsonl");
+    std::fs::write(&tape, "{\"seq\":0,\"ts_ms\":1,\"event\":{\"note\":\"a\",\"crc\":\"beef\"}}\n").unwrap();
+    let out = migrate_bin().arg(&tape).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// Event bytes travel verbatim: unsorted keys and an integer past 64 bits
+/// survive migration byte for byte.
+#[test]
+fn l_migrate_carries_event_bytes_verbatim() {
+    let dir = TempDir::new().unwrap();
+    let tape = dir.path().join("log.jsonl");
+    let event = r#"{"z":1,"note":"a","big":18446744073709551616,"f":1.0}"#;
+    std::fs::write(&tape, format!("{{\"seq\":0,\"ts_ms\":1,\"event\":{event}}}\n")).unwrap();
+    assert!(migrate_bin().arg(&tape).status().unwrap().success());
+    let sealed = std::fs::read_to_string(dir.path().join("log.migrated")).unwrap();
+    assert!(sealed.contains(&format!("\"event\":{event},\"crc\"")), "{sealed}");
+}
+
+/// The production case: an old tape whose final line tore mid-write (no
+/// newline). The old writer fsynced only after the whole line, so that
+/// fragment was never acknowledged. With --drop-torn-tail the blade drops
+/// exactly that fragment, says so, and migrates the rest; without the flag
+/// it still refuses.
+#[test]
+fn m_migrate_drops_torn_tail_only_when_asked() {
+    let dir = TempDir::new().unwrap();
+    let tape = dir.path().join("log.jsonl");
+    let body = "{\"seq\":0,\"ts_ms\":1,\"event\":{\"note\":\"a\"}}\n\
+                {\"seq\":1,\"ts_ms\":2,\"event\":{\"note\":\"b\"}}\n\
+                {\"seq\":2,\"ts_ms\":3,\"event\":{\"no";
+    std::fs::write(&tape, body).unwrap();
+    assert!(!migrate_bin().arg(&tape).status().unwrap().success(), "must refuse without the flag");
+    let out = migrate_bin().arg("--drop-torn-tail").arg(&tape).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("dropping"), "must report the dropped bytes");
+    std::fs::rename(dir.path().join("log.migrated"), &tape).unwrap();
+    let rt = open(dir.path()).unwrap();
+    assert_eq!(rt.applied().unwrap(), 2);
+    // A damaged *terminated* line is acknowledged history: the flag never
+    // excuses it.
+    std::fs::write(&tape, "{\"seq\":0,\"ts_ms\":1,\"event\":{\"note\":\"a\"}}\n{\"seq\":1,\"ts\n").unwrap();
+    assert!(!migrate_bin().arg("--drop-torn-tail").arg(&tape).status().unwrap().success());
+}
