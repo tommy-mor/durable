@@ -15,6 +15,9 @@ serde_json = { version = "1.0", features = ["raw_value"] }
 durable-derive = { path = "../durable-derive", version = "0.3.0" }
 crc32c = "0.6.8"
 
+[[bin]]
+name = "durable-tape-migrate"
+path = "src/bin/migrate.rs"
 [dev-dependencies]
 tempfile = "3.8"
 proptest = "1.4"

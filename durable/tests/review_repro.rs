@@ -183,3 +183,25 @@ fn j_unsealed_tape_survives_projection_delete() {
     }
     assert_eq!(std::fs::read_to_string(&log).unwrap(), old);
 }
+
+/// The offline blade migrates a clean legacy tape end to end: the binary
+/// runs, its renamed output opens with both records applied, seq/ts
+/// intact, event bytes verbatim.
+#[test]
+fn i_migrate_binary_opens_legacy_clean() {
+    use std::process::Command;
+    let dir = TempDir::new().unwrap();
+    let legacy = "{\"seq\":0,\"ts_ms\":5,\"event\":{\"note\":\"a\",\"z\":1}}\n\
+                  {\"seq\":1,\"ts_ms\":9,\"event\":{\"note\":\"b\"}}\n";
+    let tape = dir.path().join("log.jsonl");
+    std::fs::write(&tape, legacy).unwrap();
+    let bin = env!("CARGO_BIN_EXE_durable-tape-migrate");
+    assert!(Command::new(bin).arg(&tape).status().unwrap().success());
+    std::fs::rename(dir.path().join("log.migrated"), &tape).unwrap();
+    let rt = open(dir.path()).expect("migrated tape opens");
+    assert_eq!(rt.applied().unwrap(), 2);
+    let recs = rt.records_from(0).unwrap();
+    assert_eq!((recs[0].seq, recs[0].ts_ms), (0, 5));
+    assert_eq!((recs[1].seq, recs[1].ts_ms), (1, 9));
+    rt.verify().unwrap();
+}
