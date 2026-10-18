@@ -511,12 +511,20 @@ impl TapeFile for File {
 }
 
 /// A tape file that fails on command. Test double for the writer outcome
-/// table — the poison, rollback, and shrink-guard branches are otherwise
-/// unreachable without real ENOSPC or EIO.
+/// table: the poison, rollback, and shrink-guard branches are otherwise
+/// unreachable without real ENOSPC or EIO. Only built with the
+/// `fault-injection` feature, which the crate's own tests turn on.
+#[cfg(feature = "fault-injection")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailMode {
-    /// Every write returns ENOSPC; sync/len/truncate still work.
+    /// Every write returns ENOSPC having landed nothing.
     WriteEnospc,
+    /// Every write lands its first `n` bytes, then returns ENOSPC: what a
+    /// full disk does mid-batch.
+    WritePartialEnospc(usize),
+    /// Partial write as above AND truncate returns EPERM: the partial
+    /// bytes can't be rolled back.
+    WritePartialEnospcAndTruncateEperm(usize),
     /// Every sync returns EIO (Linux may mark pages clean).
     SyncEio,
     /// The next sync returns EIO, later syncs succeed: batch sync fails
@@ -531,72 +539,87 @@ pub enum FailMode {
     ShrunkTo(u64),
 }
 
-/// Failing test double. Records appended bytes in memory so trials can
-/// inspect what would have hit the disk.
-#[derive(Debug, Default)]
+/// Failing test double over an in-memory disk. Writes append to the disk,
+/// `set_len` really truncates it, and the test keeps a handle to the disk
+/// so it can scan exactly what a rollback left behind.
+#[cfg(feature = "fault-injection")]
+#[derive(Debug)]
 pub struct FailingFile {
-    /// Bytes the writer pushed (including rolled-back ones).
-    pub written: Vec<u8>,
-    /// Length the real file had when the double took over.
-    pub base_len: u64,
-    /// How the double fails.
-    pub mode: Option<FailMode>,
-    /// Syncs failed so far (drives SyncEioOnce).
-    pub syncs_failed: std::cell::Cell<usize>,
+    disk: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    mode: Option<FailMode>,
+    syncs_failed: std::cell::Cell<usize>,
 }
 
+/// Shared view of a [`FailingFile`]'s disk bytes.
+#[cfg(feature = "fault-injection")]
+pub type FakeDisk = std::sync::Arc<std::sync::Mutex<Vec<u8>>>;
+
+#[cfg(feature = "fault-injection")]
 impl FailingFile {
-    pub fn healthy(base_len: u64) -> Self {
-        Self {
-            written: Vec::new(),
-            base_len,
-            mode: None,
-            syncs_failed: std::cell::Cell::new(0),
-        }
+    /// A double whose disk starts as `bytes`. Returns the double and a
+    /// handle to its disk.
+    pub fn over(bytes: Vec<u8>, mode: Option<FailMode>) -> (Self, FakeDisk) {
+        let disk = std::sync::Arc::new(std::sync::Mutex::new(bytes));
+        (
+            Self {
+                disk: disk.clone(),
+                mode,
+                syncs_failed: std::cell::Cell::new(0),
+            },
+            disk,
+        )
     }
 
-    pub fn failing(base_len: u64, mode: FailMode) -> Self {
-        Self {
-            written: Vec::new(),
-            base_len,
-            mode: Some(mode),
-            syncs_failed: std::cell::Cell::new(0),
-        }
+    fn truncate_fails(&self) -> bool {
+        matches!(
+            self.mode,
+            Some(FailMode::TruncateEperm)
+                | Some(FailMode::SyncEioAndTruncateEperm)
+                | Some(FailMode::WritePartialEnospcAndTruncateEperm(_))
+        )
     }
 }
 
+#[cfg(feature = "fault-injection")]
 impl TapeFile for FailingFile {
     fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
-        if self.mode == Some(FailMode::WriteEnospc) {
-            return Err(std::io::Error::from_raw_os_error(28));
+        let mut disk = self.disk.lock().unwrap();
+        match self.mode {
+            Some(FailMode::WriteEnospc) => Err(std::io::Error::from_raw_os_error(28)),
+            Some(FailMode::WritePartialEnospc(n))
+            | Some(FailMode::WritePartialEnospcAndTruncateEperm(n)) => {
+                disk.extend_from_slice(&buf[..n.min(buf.len())]);
+                Err(std::io::Error::from_raw_os_error(28))
+            }
+            _ => {
+                disk.extend_from_slice(buf);
+                Ok(())
+            }
         }
-        self.written.extend_from_slice(buf);
-        Ok(())
     }
     fn sync_data(&self) -> std::io::Result<()> {
-        if self.mode == Some(FailMode::SyncEio)
-            || self.mode == Some(FailMode::SyncEioAndTruncateEperm)
-        {
-            return Err(std::io::Error::from_raw_os_error(5));
+        match self.mode {
+            Some(FailMode::SyncEio) | Some(FailMode::SyncEioAndTruncateEperm) => {
+                Err(std::io::Error::from_raw_os_error(5))
+            }
+            Some(FailMode::SyncEioOnce) if self.syncs_failed.get() == 0 => {
+                self.syncs_failed.set(1);
+                Err(std::io::Error::from_raw_os_error(5))
+            }
+            _ => Ok(()),
         }
-        if self.mode == Some(FailMode::SyncEioOnce) && self.syncs_failed.get() == 0 {
-            self.syncs_failed.set(1);
-            return Err(std::io::Error::from_raw_os_error(5));
-        }
-        Ok(())
     }
     fn file_len(&self) -> std::io::Result<u64> {
         if let Some(FailMode::ShrunkTo(n)) = self.mode {
             return Ok(n);
         }
-        Ok(self.base_len + self.written.len() as u64)
+        Ok(self.disk.lock().unwrap().len() as u64)
     }
-    fn set_len(&self, _len: u64) -> std::io::Result<()> {
-        if self.mode == Some(FailMode::TruncateEperm)
-            || self.mode == Some(FailMode::SyncEioAndTruncateEperm)
-        {
+    fn set_len(&self, len: u64) -> std::io::Result<()> {
+        if self.truncate_fails() {
             return Err(std::io::Error::from_raw_os_error(1));
         }
+        self.disk.lock().unwrap().resize(len as usize, 0);
         Ok(())
     }
 }
@@ -706,14 +729,12 @@ impl<E> JsonlLog<E> {
         self.poisoned
     }
 
-    /// Swap the live file handle for a failing test double, and forget the
-    /// held committed end (the double starts from the given base length).
-    /// Test seam for the outcome table: the next write/sync/truncate
-    /// through this writer fails with the configured error, exercising
-    /// poison, rollback, and the shrink guard without touching real disk.
-    pub fn inject_failing_file(&mut self, fail: FailingFile, base_end: u64) {
+    /// Swap the live file handle for a failing test double. The writer
+    /// keeps its committed end, so the double's disk should start as the
+    /// real tape's bytes. Test seam only (`fault-injection` feature).
+    #[cfg(feature = "fault-injection")]
+    pub fn inject_failing_file(&mut self, fail: FailingFile) {
         self.file = Box::new(fail);
-        self.end = base_end;
     }
 
     pub fn is_empty(&self) -> Result<bool> {

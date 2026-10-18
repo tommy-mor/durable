@@ -15,10 +15,16 @@ serde_json = { version = "1.0", features = ["raw_value"] }
 durable-derive = { path = "../durable-derive", version = "0.3.0" }
 crc32c = "0.6.8"
 
+[features]
+# Test doubles for the tape writer's failure paths. Off in normal builds;
+# the crate's own tests enable it through the self dev-dependency below.
+fault-injection = []
+
 [[bin]]
 name = "durable-tape-migrate"
 path = "src/bin/migrate.rs"
 [dev-dependencies]
+durable = { path = ".", features = ["fault-injection"] }
 tempfile = "3.8"
 proptest = "1.4"
 serde = { version = "1.0", features = ["derive"] }
