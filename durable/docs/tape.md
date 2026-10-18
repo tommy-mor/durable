@@ -242,25 +242,40 @@ returns. So:
   two histories diverge.
 - `tail`, `grep` and `jq` on the raw file are for looking, not for backups.
 
-## Legacy tapes
+## Old (unsealed) tapes
 
-Old lines have no `from`, `to` or `crc`, and the old format genuinely
-cannot tell a torn tail from a corrupt last line.
+There is no legacy path in the writer or at open. Old tapes are migrated
+offline, with no writer running, by `durable-tape-migrate [--drop-torn-tail] <tape>`:
 
-- **Clean legacy tape** (every line parses, seqs contiguous): auto-seal at
-  open, under the tape lock. Write the sealed copy to `<tape>.sealing`
-  with each legacy record as its own batch (`from = to = seq`), seq and
-  ts_ms preserved exactly; fsync it; `rename` over the tape; fsync the
-  directory; reopen (the inode check in step 1 picks up the new file).
-- **Damaged legacy tape:** refuse to boot with
-  `run: durable tape seal <tape>`. That offline command shows exactly which
-  bytes it would drop and requires confirmation. This is the only place a
-  human decides, once per tape.
-- A sealed tape containing an unsealed line is corruption.
+- It writes `<tape>.migrated`, fsynced, with each old record as its own
+  sealed batch (`from = to = seq`), seq and ts_ms preserved, event bytes
+  verbatim. The operator renames it over the tape and fsyncs the
+  directory. The existing projection stays valid: seqs don't change.
+- Any damaged line, a seq gap, or an already-sealed envelope refuses and
+  migrates nothing.
+- A torn tail (final bytes with no newline) refuses too, unless
+  `--drop-torn-tail` is passed. The old writer fsynced only after whole
+  lines, so that fragment was never acknowledged; the flag drops exactly
+  it and prints it. A damaged line that is newline-terminated is
+  acknowledged history and is never excused. This is the path for the
+  identity line-3463 and ladder line-558 tapes.
+
+Open never treats an unsealed line as residue. A complete line that is
+valid JSON but has no `,"crc":"xxxxxxxx"}` suffix can't have come from the
+sealed writer (a torn write never ends in `}\n`, and zero-filled pages are
+not valid JSON), so the scan refuses with `Corruption` and the file stays
+byte-identical. This matters because the natural response to "projection
+and tape disagree" is to delete the projection and rebuild; without this
+rule that deleted the whole unmigrated tape.
+
+A sealed line whose CRC no longer matches still has the suffix shape and
+is ordinary damage, handled by the scan rule above.
 
 Tapes from other writers (webmge's identity, ladder and inventory
 journals) migrate only if their envelopes map onto `{seq, ts_ms, event}`
-without reassigning seq or ts. Check per tape before sealing.
+without reassigning seq or ts. Check per tape before migrating, and carry
+each event's bytes verbatim (re-serializing through a JSON value sorts
+keys and turns integers past 64 bits into floats).
 
 ## Operator commands
 
@@ -268,7 +283,6 @@ without reassigning seq or ts. Check per tape before sealing.
   ts, uncommitted tail bytes, sealed or legacy.
 - `durable tape verify <tape>` — full scan.
 - `durable tape cat <tape> [--from SEQ]` — committed records only, for `jq`.
-- `durable tape seal <tape>` — one-time legacy conversion.
 
 ## Deferred
 
@@ -333,6 +347,5 @@ Semantics:
 19. Second opener of a tape fails on the lock; `verify` and the CLI read
     alongside a live writer. Rename race during sealing: the second opener
     ends up locked on the new inode.
-20. Legacy: clean fixtures auto-seal with identical seq and ts; torn
-    fixtures (the identity line-3463 and ladder line-558 tails) refuse to
-    boot and point to `tape seal`.
+20. Unsealed tapes: refused with the file byte-identical, with or without
+    a projection, including after the projection is deleted.

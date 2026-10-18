@@ -93,20 +93,19 @@ impl<'de, E: DeserializeOwned> Deserialize<'de> for Record<E> {
         struct Helper<E> {
             seq: u64,
             ts_ms: u64,
-            from: Option<u64>,
-            to: Option<u64>,
+            // No legacy fallback: an unsealed record has no from/to/crc and
+            // must not deserialize as if it were sealed.
+            from: u64,
+            to: u64,
             event: E,
-            #[serde(default)]
             crc: String,
         }
         let h = Helper::deserialize(d)?;
-        let from = h.from.unwrap_or(h.seq);
-        let to = h.to.unwrap_or(h.seq);
         Ok(Record {
             seq: h.seq,
             ts_ms: h.ts_ms,
-            from,
-            to,
+            from: h.from,
+            to: h.to,
             event: h.event,
             crc: h.crc,
         })
@@ -194,7 +193,6 @@ pub fn scan(bytes: &[u8]) -> std::result::Result<Committed, Corruption> {
     // Outside: between batches. Inside: mid-batch, expecting `next`.
     let mut inside: Option<(u64, u64, u64)> = None;
     let mut bad: Option<(usize, String)> = None;
-    let mut offset = 0usize;
     // Physical lines: split on \n, terminator included in length math.
     let mut start = 0usize;
     while start <= bytes.len() {
@@ -204,6 +202,7 @@ pub fn scan(bytes: &[u8]) -> std::result::Result<Committed, Corruption> {
             None => (&bytes[start..], bytes.len() + 1),
         };
         let terminated = next <= bytes.len();
+        let offset = start;
         if !terminated {
             // Trailing bytes with no newline: torn write, stop here.
             if !chunk.iter().all(|b| b.is_ascii_whitespace()) && !chunk.is_empty() {
@@ -211,7 +210,6 @@ pub fn scan(bytes: &[u8]) -> std::result::Result<Committed, Corruption> {
             }
             break;
         }
-        offset = start;
         // Blank lines are skipped, legacy compatibility.
         if chunk.iter().all(|b| b.is_ascii_whitespace()) {
             start = next;
@@ -277,10 +275,27 @@ pub fn scan(bytes: &[u8]) -> std::result::Result<Committed, Corruption> {
                 None => break,
             };
             if !chunk.iter().all(|b| b.is_ascii_whitespace()) && !chunk.is_empty() {
-                if let Ok((env, _)) = parse_sealed(chunk) {
-                    if env.from != committed.len {
-                        return Err(Corruption { offset: off, reason });
+                match parse_sealed(chunk) {
+                    Ok((env, _)) => {
+                        if env.from != committed.len {
+                            return Err(Corruption { offset: off, reason });
+                        }
                     }
+                    Err(_) if is_unsealed_json(chunk) => {
+                        // A complete line that is valid JSON but carries no
+                        // crc suffix can't come from the sealed writer: a
+                        // torn write never ends in `}\n`, and zero-filled
+                        // pages are not valid JSON. It is someone else's
+                        // history (an unmigrated tape, a hand edit), never
+                        // residue. Refuse; never truncate it away.
+                        return Err(Corruption {
+                            offset: pos,
+                            reason: "unsealed line: not written by the sealed writer \
+                                     (migrate old tapes offline before opening)"
+                                .into(),
+                        });
+                    }
+                    Err(_) => {}
                 }
             }
             pos = next;
@@ -289,6 +304,17 @@ pub fn scan(bytes: &[u8]) -> std::result::Result<Committed, Corruption> {
         return Ok(committed);
     }
     Ok(committed)
+}
+
+/// Valid JSON without the sealed `,"crc":"xxxxxxxx"}` suffix shape. A sealed
+/// line whose CRC no longer matches still has the suffix shape and stays
+/// ordinary damage; only lines the sealed writer could never have produced
+/// match here.
+fn is_unsealed_json(line: &[u8]) -> bool {
+    let has_crc_suffix = line.len() >= CRC_SUFFIX_LEN
+        && line[line.len() - CRC_SUFFIX_LEN..].starts_with(b",\"crc\":\"")
+        && line.ends_with(b"\"}");
+    !has_crc_suffix && serde_json::from_slice::<serde::de::IgnoredAny>(line).is_ok()
 }
 
 pub fn parse_sealed(line: &[u8]) -> Result<(SealedEnvelope, Vec<u8>)> {
@@ -447,9 +473,155 @@ impl Tx {
 /// and expect `len` to notice.
 pub struct JsonlLog<E> {
     path: PathBuf,
-    file: File,
+    file: Box<dyn TapeFile>,
     len: u64,
+    /// Byte offset of the committed end. Everything past it on disk is
+    /// residue of a batch that never committed.
+    end: u64,
+    /// Set when an I/O failure left the tape in a state this process can't
+    /// vouch for. Every later append refuses until the tape is reopened,
+    /// which re-derives the truth from the bytes.
+    poisoned: bool,
     _event: PhantomData<E>,
+}
+
+/// Handle indirection for the tape file. Production wraps a real [`File`];
+/// tests wrap a failing double. The writer only touches the tape through
+/// this trait, so every outcome-table row is reachable without real ENOSPC.
+pub trait TapeFile: Send {
+    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()>;
+    fn sync_data(&self) -> std::io::Result<()>;
+    fn file_len(&self) -> std::io::Result<u64>;
+    fn set_len(&self, len: u64) -> std::io::Result<()>;
+}
+
+impl TapeFile for File {
+    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        IoWrite::write_all(self, buf)
+    }
+    fn sync_data(&self) -> std::io::Result<()> {
+        File::sync_data(self)
+    }
+    fn file_len(&self) -> std::io::Result<u64> {
+        Ok(self.metadata()?.len())
+    }
+    fn set_len(&self, len: u64) -> std::io::Result<()> {
+        File::set_len(self, len)
+    }
+}
+
+/// A tape file that fails on command. Test double for the writer outcome
+/// table: the poison, rollback, and shrink-guard branches are otherwise
+/// unreachable without real ENOSPC or EIO. Only built with the
+/// `fault-injection` feature, which the crate's own tests turn on.
+#[cfg(feature = "fault-injection")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailMode {
+    /// Every write returns ENOSPC having landed nothing.
+    WriteEnospc,
+    /// Every write lands its first `n` bytes, then returns ENOSPC: what a
+    /// full disk does mid-batch.
+    WritePartialEnospc(usize),
+    /// Partial write as above AND truncate returns EPERM: the partial
+    /// bytes can't be rolled back.
+    WritePartialEnospcAndTruncateEperm(usize),
+    /// Every sync returns EIO (Linux may mark pages clean).
+    SyncEio,
+    /// The next sync returns EIO, later syncs succeed: batch sync fails
+    /// but rollback's sync lands — the NotCommitted-poisoned row.
+    SyncEioOnce,
+    /// Truncate returns EPERM: rollback cannot be confirmed.
+    TruncateEperm,
+    /// Sync returns EIO AND truncate returns EPERM: rollback
+    /// unconfirmable after a failed commit — the Unknown row.
+    SyncEioAndTruncateEperm,
+    /// Length reports a shrunken file: acknowledged bytes vanished.
+    ShrunkTo(u64),
+}
+
+/// Failing test double over an in-memory disk. Writes append to the disk,
+/// `set_len` really truncates it, and the test keeps a handle to the disk
+/// so it can scan exactly what a rollback left behind.
+#[cfg(feature = "fault-injection")]
+#[derive(Debug)]
+pub struct FailingFile {
+    disk: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    mode: Option<FailMode>,
+    syncs_failed: std::cell::Cell<usize>,
+}
+
+/// Shared view of a [`FailingFile`]'s disk bytes.
+#[cfg(feature = "fault-injection")]
+pub type FakeDisk = std::sync::Arc<std::sync::Mutex<Vec<u8>>>;
+
+#[cfg(feature = "fault-injection")]
+impl FailingFile {
+    /// A double whose disk starts as `bytes`. Returns the double and a
+    /// handle to its disk.
+    pub fn over(bytes: Vec<u8>, mode: Option<FailMode>) -> (Self, FakeDisk) {
+        let disk = std::sync::Arc::new(std::sync::Mutex::new(bytes));
+        (
+            Self {
+                disk: disk.clone(),
+                mode,
+                syncs_failed: std::cell::Cell::new(0),
+            },
+            disk,
+        )
+    }
+
+    fn truncate_fails(&self) -> bool {
+        matches!(
+            self.mode,
+            Some(FailMode::TruncateEperm)
+                | Some(FailMode::SyncEioAndTruncateEperm)
+                | Some(FailMode::WritePartialEnospcAndTruncateEperm(_))
+        )
+    }
+}
+
+#[cfg(feature = "fault-injection")]
+impl TapeFile for FailingFile {
+    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        let mut disk = self.disk.lock().unwrap();
+        match self.mode {
+            Some(FailMode::WriteEnospc) => Err(std::io::Error::from_raw_os_error(28)),
+            Some(FailMode::WritePartialEnospc(n))
+            | Some(FailMode::WritePartialEnospcAndTruncateEperm(n)) => {
+                disk.extend_from_slice(&buf[..n.min(buf.len())]);
+                Err(std::io::Error::from_raw_os_error(28))
+            }
+            _ => {
+                disk.extend_from_slice(buf);
+                Ok(())
+            }
+        }
+    }
+    fn sync_data(&self) -> std::io::Result<()> {
+        match self.mode {
+            Some(FailMode::SyncEio) | Some(FailMode::SyncEioAndTruncateEperm) => {
+                Err(std::io::Error::from_raw_os_error(5))
+            }
+            Some(FailMode::SyncEioOnce) if self.syncs_failed.get() == 0 => {
+                self.syncs_failed.set(1);
+                Err(std::io::Error::from_raw_os_error(5))
+            }
+            _ => Ok(()),
+        }
+    }
+    fn file_len(&self) -> std::io::Result<u64> {
+        if let Some(FailMode::ShrunkTo(n)) = self.mode {
+            return Ok(n);
+        }
+        Ok(self.disk.lock().unwrap().len() as u64)
+    }
+    fn set_len(&self, len: u64) -> std::io::Result<()> {
+        if self.truncate_fails() {
+            return Err(std::io::Error::from_raw_os_error(1));
+        }
+        self.disk.lock().unwrap().resize(len as usize, 0);
+        Ok(())
+    }
 }
 
 impl<E> JsonlLog<E> {
@@ -465,10 +637,13 @@ impl<E> JsonlLog<E> {
             .open(&path)
             .map_err(|e| Error::Log(e.to_string()))?;
         let len = count_jsonl_lines(&mut file)?;
+        let end = file.metadata().map_err(|e| Error::Log(e.to_string()))?.len();
         Ok(Self {
             path,
-            file,
+            file: Box::new(file),
             len,
+            end,
+            poisoned: false,
             _event: PhantomData,
         })
     }
@@ -488,29 +663,55 @@ impl<E> JsonlLog<E> {
             let log = Self::open(&path)?;
             return Ok((log, Committed { end: 0, len: 0, last_ts: 0 }));
         }
-        let bytes = fs::read(&path).map_err(|e| Error::Log(e.to_string()))?;
-        let found = scan(&bytes).map_err(|c| {
+        // Spec order: scan read-only FIRST, cross-check (by the caller)
+        // against the projection, and only then seal. Truncating before
+        // the check would destroy the evidence disagreement needs.
+        let found = Self::scan_file(&path)?;
+        Self::seal_to(&path, &found)?;
+        let mut log = Self::open(&path)?;
+        log.len = found.len;
+        log.end = found.end as u64;
+        Ok((log, found))
+    }
+
+    /// Read-only scan of the tape file: no mutation, file untouched on
+    /// both committed and corrupt outcomes. The cross-check reads this
+    /// before anything is sealed.
+    pub fn scan_file(path: &Path) -> Result<Committed> {
+        let bytes = fs::read(path).map_err(|e| Error::Log(e.to_string()))?;
+        scan(&bytes).map_err(|c| {
             Error::Corruption(format!("tape corrupt at byte {}: {}", c.offset, c.reason))
-        })?;
-        if found.end < bytes.len() {
-            let dropped = bytes.len() - found.end;
-            let f = OpenOptions::new()
-                .write(true)
-                .open(&path)
-                .map_err(|e| Error::Log(e.to_string()))?;
+        })
+    }
+    /// Seal the tape to the scanned committed end: truncate in-flight
+    /// residue, then sync unconditionally. Truncation is not a repair —
+    /// it removes only bytes the format says were never committed, is
+    /// idempotent across interrupted opens, and keeps the next O_APPEND
+    /// batch from landing behind dead bytes.
+    /// There is no legacy path: an unsealed line makes the scan refuse, so
+    /// it never reaches here. Old tapes migrate through an offline
+    /// migration script, never through the writer.
+    pub fn seal_to(path: &Path, found: &Committed) -> Result<()> {
+        let f = OpenOptions::new()
+            .write(true)
+            .open(path)
+            .map_err(|e| Error::Log(e.to_string()))?;
+        let len = f.metadata().map_err(|e| Error::Log(e.to_string()))?.len() as usize;
+        if found.end < len {
             f.set_len(found.end as u64)
                 .map_err(|e| Error::Log(e.to_string()))?;
-            // A restarted process may read a complete batch left in the page
-            // cache by a crashed writer without ever confirming it durable.
-            f.sync_data().map_err(|e| Error::Log(e.to_string()))?;
             eprintln!(
-                "tape: dropped {dropped} uncommitted bytes past seq {}",
+                "tape: dropped {} uncommitted bytes past seq {}",
+                len - found.end,
                 found.len
             );
         }
-        let mut log = Self::open(&path)?;
-        log.len = found.len;
-        Ok((log, found))
+        // Unconditional: a restarted process may be reading a complete batch
+        // a crashed writer left in the page cache, never confirmed durable.
+        // Nothing past this point may treat the prefix as committed until
+        // this sync succeeds.
+        f.sync_data().map_err(|e| Error::Log(e.to_string()))?;
+        Ok(())
     }
 
     pub fn path(&self) -> &Path {
@@ -521,8 +722,41 @@ impl<E> JsonlLog<E> {
         Ok(self.len)
     }
 
+    /// Whether an I/O failure poisoned this writer. A poisoned writer
+    /// refuses every append until the tape is reopened, which re-derives
+    /// the truth from the bytes. Test hook for the outcome table.
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
+    /// Swap the live file handle for a failing test double. The writer
+    /// keeps its committed end, so the double's disk should start as the
+    /// real tape's bytes. Test seam only (`fault-injection` feature).
+    #[cfg(feature = "fault-injection")]
+    pub fn inject_failing_file(&mut self, fail: FailingFile) {
+        self.file = Box::new(fail);
+    }
+
     pub fn is_empty(&self) -> Result<bool> {
         Ok(self.len == 0)
+    }
+}
+
+impl<E> JsonlLog<E> {
+    /// Cut the file back to the committed end and sync. If either step
+    /// fails the writer can no longer vouch for the file: poison it.
+    fn rollback(&mut self) -> Result<()> {
+        let res = self
+            .file
+            .set_len(self.end)
+            .and_then(|_| self.file.sync_data());
+        if let Err(e) = res {
+            self.poisoned = true;
+            return Err(Error::Log(format!(
+                "rollback to committed end failed (writer poisoned): {e}"
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -543,13 +777,49 @@ impl<E: Serialize + DeserializeOwned> JsonlLog<Record<E>> {
             batch.push_str(&line);
             batch.push('\n');
         }
-        self.file
-            .write_all(batch.as_bytes())
+        if self.poisoned {
+            return Err(Error::Log(
+                "tape writer poisoned by an earlier I/O failure; reopen the tape".into(),
+            ));
+        }
+        // O(1) guard, no rescan: this process owns the committed end. Bytes
+        // past it are residue of a batch that never committed; cut them so
+        // the next batch never lands behind dead bytes. A file shorter than
+        // the committed end means acknowledged bytes vanished under us.
+        let on_disk = self
+            .file
+            .file_len()
             .map_err(|e| Error::Log(e.to_string()))?;
+        if on_disk < self.end {
+            self.poisoned = true;
+            return Err(Error::Corruption(format!(
+                "tape shrank under writer ({on_disk} bytes < committed end {})",
+                self.end
+            )));
+        }
+        if on_disk > self.end {
+            self.rollback()?;
+        }
+        if let Err(e) = self.file.write_all(batch.as_bytes()) {
+            // The closing line's newline can't have landed, so the scan
+            // drops this batch regardless; rolling back keeps O_APPEND clean.
+            self.rollback()?;
+            return Err(Error::Log(format!("not committed: {e}")));
+        }
         // Content durability. Metadata (mtime) is not the tape.
-        self.file
-            .sync_data()
-            .map_err(|e| Error::Log(e.to_string()))?;
+        if let Err(e) = self.file.sync_data() {
+            // The bytes may still reach disk as a closed batch, and Linux
+            // may already have marked the dirty pages clean: never retry the
+            // fsync and trust it. Roll back, and stop writing either way.
+            let rolled = self.rollback().is_ok();
+            self.poisoned = true;
+            return Err(Error::Log(if rolled {
+                format!("not committed (writer poisoned): {e}")
+            } else {
+                format!("commit outcome unknown (writer poisoned): {e}")
+            }));
+        }
+        self.end += batch.len() as u64;
         self.len += events.len() as u64;
         Ok(start)
     }
@@ -650,15 +920,36 @@ impl<E: Serialize + DeserializeOwned + 'static> Runtime<E> {
         if let Some(parent) = db_path.parent() {
             fs::create_dir_all(parent).map_err(|e| Error::Log(e.to_string()))?;
         }
+        let log_path = log_path.as_ref().to_path_buf();
+        if let Some(parent) = log_path.parent() {
+            fs::create_dir_all(parent).map_err(|e| Error::Log(e.to_string()))?;
+        }
+        // Spec Opening order: scan read-only, open the projection, then
+        // cross-check BEFORE sealing. Sealing first would destroy the
+        // evidence disagreement needs — the file must stay byte-identical
+        // on every fatal path.
+        let found = if log_path.exists() {
+            JsonlLog::<Record<E>>::scan_file(&log_path)?
+        } else {
+            Committed { end: 0, len: 0, last_ts: 0 }
+        };
+        // No legacy path, ever: an unsealed line is refused by the scan
+        // with the file untouched, never dropped as residue. Old tapes
+        // migrate through the offline migration script, never the writer.
         let db = Db::open(&db_path)?;
         let applied = applied_leaf().get(&db)?.unwrap_or(0);
-        let (log, found) = JsonlLog::<Record<E>>::open_sealed(log_path)?;
         if applied > found.len {
             return Err(Error::Corruption(format!(
                 "projection and tape disagree (applied={applied}, tape has {})",
                 found.len
             )));
         }
+        if log_path.exists() {
+            JsonlLog::<Record<E>>::seal_to(&log_path, &found)?;
+        }
+        let mut log = JsonlLog::open(&log_path)?;
+        log.len = found.len;
+        log.end = found.end as u64;
         let last_ts_ms = found.last_ts;
         let rt = Self {
             inner: Mutex::new(Inner {
@@ -770,6 +1061,12 @@ impl<E: Serialize + DeserializeOwned + 'static> Runtime<E> {
         if events.is_empty() {
             return Ok(Vec::new());
         }
+        if events.len() as u64 > MAX_SEALED_BATCH {
+            return Err(Error::Log(format!(
+                "batch of {} exceeds sealed maximum {MAX_SEALED_BATCH}",
+                events.len()
+            )));
+        }
         let mut inner = self
             .inner
             .lock()
@@ -864,7 +1161,11 @@ impl<E: Serialize + DeserializeOwned + 'static> Runtime<E> {
             .lock()
             .map_err(|_| Error::Log("runtime lock poisoned".into()))?;
         let log_path = inner.log.path().to_path_buf();
-        drop(inner);
+        // Hold the ingest lock for the whole replay. The replay opens the
+        // same tape, and its open may truncate residue past the committed
+        // end — which, during a live append, would be the batch being
+        // written. With the lock held no batch is in flight.
+        let _ingest = inner;
         let tmp = tempfile_dir()?;
         let db_path = tmp.join("proj");
         let reducer = self.reducer.clone();

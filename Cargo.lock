@@ -388,6 +388,7 @@ version = "0.3.0"
 dependencies = [
  "ciborium",
  "crc32c",
+ "durable",
  "durable-derive",
  "proptest",
  "rocksdb",
