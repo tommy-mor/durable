@@ -7,7 +7,7 @@ description = "Event-sourced application-state runtime with typed reducers and a
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-rocksdb = { version = "0.21", optional = true }
+rocksdb = { version = "0.25", optional = true }
 redb = { version = "4", optional = true }
 sled = { version = "0.34", optional = true }
 serde = { version = "1.0", features = ["derive"] }

@@ -5,16 +5,13 @@
 //!
 //! ```bash
 //! OUT=target/bench-backends
-//! CXXFLAGS="-include cstdint" cargo run -q -p durable --example bench_backends --no-default-features --features backend-rocksdb -- --work $OUT
+//! cargo run -q -p durable --example bench_backends --no-default-features --features backend-rocksdb -- --work $OUT
 //! cargo run -q -p durable --example bench_backends --no-default-features --features backend-redb -- --work $OUT
 //! cargo run -q -p durable --example bench_backends --no-default-features --features backend-sled -- --work $OUT
 //! # --render builds the harness with any backend (redb is fastest to compile):
 //! cargo run -q -p durable --example bench_backends --no-default-features --features backend-redb -- --render $OUT
 //! # open $OUT/report.html
 //! ```
-//!
-//! CXXFLAGS is needed only for the rocksdb run (old vendored RocksDB vs new
-//! GCC); redb/sled are pure Rust.
 //!
 //! `--quick` runs a small-N smoke pass. Methodology follows
 //! `docs/bench-bigO.txt`: separate phases with stated durability, cold
@@ -42,6 +39,14 @@ const BATCH_ROWS: usize = 10_000;
 const SINGLE_REPS: usize = 100;
 const GET_SAMPLES: usize = 2_000;
 const READ_REPS: usize = 200;
+
+/// Keep in sync with Cargo.toml/Cargo.lock on every backend bump.
+#[cfg(feature = "backend-rocksdb")]
+const BACKEND_VERSION: &str = "rocksdb 0.25.0 (RocksDB 11.8.1)";
+#[cfg(feature = "backend-redb")]
+const BACKEND_VERSION: &str = "redb 4.4.0";
+#[cfg(feature = "backend-sled")]
+const BACKEND_VERSION: &str = "sled 0.34.7";
 
 #[derive(Durable)]
 #[allow(dead_code)]
@@ -316,6 +321,7 @@ fn work(out_dir: &Path, quick: bool) -> durable::Result<()> {
     std::fs::create_dir_all(out_dir).map_err(|e| durable::Error::Log(e.to_string()))?;
     let doc = serde_json::json!({
         "backend": BACKEND,
+        "backend_version": BACKEND_VERSION,
         "samples": samples.iter().map(|s| serde_json::json!({
             "op": s.op, "n": s.n, "p50_ns": s.p50_ns, "p99_ns": s.p99_ns, "unit": s.unit,
         })).collect::<Vec<_>>(),
@@ -569,6 +575,7 @@ fn chart_svg(
 fn render(out_dir: &Path) -> durable::Result<()> {
     let err = |e: std::io::Error| durable::Error::Log(e.to_string());
     let mut backends: HashMap<String, Vec<Sample>> = HashMap::new();
+    let mut versions: HashMap<String, String> = HashMap::new();
     let mut order: Vec<String> = vec![];
     let mut entries: Vec<PathBuf> = std::fs::read_dir(out_dir)
         .map_err(err)?
@@ -597,7 +604,11 @@ fn render(out_dir: &Path) -> durable::Result<()> {
             });
         }
         order.push(backend.clone());
-        backends.insert(backend, ss);
+        backends.insert(backend.clone(), ss);
+        versions.insert(
+            backend,
+            doc["backend_version"].as_str().unwrap_or("?").to_string(),
+        );
     }
     if backends.is_empty() {
         return Err(durable::Error::Log(format!(
@@ -737,9 +748,13 @@ fn render(out_dir: &Path) -> durable::Result<()> {
          <li>rocksdb: blind Sum merges fold at compaction; reads slow under merge pressure.</li>\
          <li>redb: merges fold read-modify-write in the commit txn; reads stay flat.</li>\
          <li>sled: merges lower to put/delete against a commit overlay; reads stay flat.</li>\
-         <li>SyncWal fsyncs per commit on rocksdb/redb; sled flush()es.</li>\
-         </ul></body></html>",
+         <li>SyncWal fsyncs per commit on rocksdb/redb; sled flush()es.</li>",
     );
+    for b in &order {
+        let ver = versions.get(b).map(String::as_str).unwrap_or("?");
+        html.push_str(&format!("<li>{b}: {ver}.</li>"));
+    }
+    html.push_str("</ul></body></html>");
     std::fs::write(out_dir.join("report.html"), html).map_err(err)?;
     println!("wrote {}", out_dir.join("report.html").display());
     Ok(())
