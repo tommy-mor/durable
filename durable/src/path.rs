@@ -92,7 +92,7 @@ impl<S> Path<S> {
 impl<T: Serialize + DeserializeOwned> Path<Leaf<T>> {
     /// Read the value at this leaf, if present.
     pub fn get(&self, db: &Db) -> Result<Option<T>> {
-        match db.raw().get(&self.prefix)? {
+        match db.get(&self.prefix)? {
             Some(bytes) => Ok(Some(decode_value(&bytes)?)),
             None => Ok(None),
         }
@@ -122,7 +122,7 @@ impl<T: Serialize + DeserializeOwned> Path<Leaf<T>> {
 impl<N: Summable> Path<Sum<N>> {
     /// Read the accumulated value (defaults to zero when absent).
     pub fn get(&self, db: &Db) -> Result<N> {
-        match db.raw().get(&self.prefix)? {
+        match db.get(&self.prefix)? {
             Some(bytes) => decode_sum::<N>(&bytes)
                 .ok_or_else(|| Error::Corruption("malformed Sum accumulator".into())),
             None => Ok(N::zero()),
@@ -179,9 +179,7 @@ impl<K: Serialize + DeserializeOwned, V: Schema> Path<Map<K, V>> {
     /// All keys present in the map, in stored (encoded-byte) order.
     pub fn keys(&self, db: &Db) -> Result<Vec<K>> {
         let scan = codec::child_scan_prefix(&self.prefix);
-        let iter = db
-            .raw()
-            .iterator(rocksdb::IteratorMode::From(&scan, rocksdb::Direction::Forward));
+        let iter = db.iter_from(&scan)?;
         let mut keys = Vec::new();
         let mut last: Option<Vec<u8>> = None;
         for item in iter {
@@ -209,9 +207,7 @@ impl<K: Serialize + DeserializeOwned, V: Schema> Path<Map<K, V>> {
     /// Whether the map has no entries.
     pub fn is_empty(&self, db: &Db) -> Result<bool> {
         let scan = codec::child_scan_prefix(&self.prefix);
-        let mut iter = db
-            .raw()
-            .iterator(rocksdb::IteratorMode::From(&scan, rocksdb::Direction::Forward));
+        let mut iter = db.iter_from(&scan)?;
         match iter.next() {
             Some(item) => {
                 let (db_key, _) = item?;
@@ -225,10 +221,7 @@ impl<K: Serialize + DeserializeOwned, V: Schema> Path<Map<K, V>> {
     pub fn contains(&self, db: &Db, key: &K) -> Result<bool> {
         let child = self.key(key);
         // A present entry has at least one key at-or-under the child prefix.
-        let mut iter = db.raw().iterator(rocksdb::IteratorMode::From(
-            child.prefix(),
-            rocksdb::Direction::Forward,
-        ));
+        let mut iter = db.iter_from(child.prefix())?;
         match iter.next() {
             Some(item) => {
                 let (db_key, _) = item?;
@@ -261,9 +254,7 @@ impl<K: Serialize + DeserializeOwned, T: Serialize + DeserializeOwned> Path<Map<
     /// All `(key, value)` pairs in stored order.
     pub fn iter(&self, db: &Db) -> Result<Vec<(K, T)>> {
         let scan = codec::child_scan_prefix(&self.prefix);
-        let iter = db
-            .raw()
-            .iterator(rocksdb::IteratorMode::From(&scan, rocksdb::Direction::Forward));
+        let iter = db.iter_from(&scan)?;
         let mut out = Vec::new();
         for item in iter {
             let (db_key, value) = item?;
@@ -314,9 +305,7 @@ impl<K: Serialize + DeserializeOwned, N: Summable> Path<Map<K, Sum<N>>> {
     /// All `(key, value)` accumulator pairs in stored order.
     pub fn iter(&self, db: &Db) -> Result<Vec<(K, N)>> {
         let scan = codec::child_scan_prefix(&self.prefix);
-        let iter = db
-            .raw()
-            .iterator(rocksdb::IteratorMode::From(&scan, rocksdb::Direction::Forward));
+        let iter = db.iter_from(&scan)?;
         let mut out = Vec::new();
         for item in iter {
             let (db_key, value) = item?;

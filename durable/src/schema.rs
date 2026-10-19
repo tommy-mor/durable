@@ -165,13 +165,14 @@ fn fold_tagged(acc: &mut Option<[u8; 9]>, operand: &[u8]) {
     }
 }
 
-/// Associative merge operator registered on every durable database so that
-/// [`Sum`] accumulators can be incremented with blind `merge` writes.
-pub(crate) fn sum_merge(
-    _key: &[u8],
-    existing: Option<&[u8]>,
-    operands: &rocksdb::MergeOperands,
-) -> Option<Vec<u8>> {
+/// Fold merge operands over an optional existing accumulator.
+///
+/// Pure byte-level fold shared by every storage backend: [`sum_merge`] (the
+/// RocksDB merge operator) calls this at compaction time, and backends
+/// without native merge support call it read-modify-write at commit time.
+/// Operands of mismatched tags are skipped rather than panicking, keeping
+/// compaction resilient to stray bytes.
+pub(crate) fn fold_merge(existing: Option<&[u8]>, operands: &[&[u8]]) -> Option<Vec<u8>> {
     let mut acc: Option<[u8; 9]> = None;
     if let Some(existing) = existing {
         if existing.len() == 9 {
@@ -180,10 +181,23 @@ pub(crate) fn sum_merge(
             acc = Some(start);
         }
     }
-    for operand in operands.iter() {
+    for operand in operands {
         fold_tagged(&mut acc, operand);
     }
     acc.map(|bytes| bytes.to_vec())
+}
+
+/// Associative merge operator registered on every RocksDB-backed durable
+/// database so that [`Sum`] accumulators can be incremented with blind
+/// `merge` writes.
+#[cfg(feature = "backend-rocksdb")]
+pub(crate) fn sum_merge(
+    _key: &[u8],
+    existing: Option<&[u8]>,
+    operands: &rocksdb::MergeOperands,
+) -> Option<Vec<u8>> {
+    let ops: Vec<&[u8]> = operands.iter().collect();
+    fold_merge(existing, &ops)
 }
 
 #[cfg(test)]

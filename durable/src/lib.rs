@@ -57,13 +57,21 @@ pub mod query;
 pub mod runtime;
 mod schema;
 mod shape;
+pub mod store;
 pub mod watch;
+
+#[cfg(not(any(feature = "backend-rocksdb", feature = "backend-redb")))]
+compile_error!(
+    "durable: enable exactly one storage backend feature (`backend-rocksdb` or `backend-redb`)"
+);
+#[cfg(all(feature = "backend-rocksdb", feature = "backend-redb"))]
+compile_error!("durable: only one storage backend feature may be enabled at a time");
 
 use std::path::Path as FsPath;
 use std::sync::Arc;
 
-use rocksdb::{Options, WriteBatch, WriteOptions, DB as RocksDb};
 use serde::{de::DeserializeOwned, Serialize};
+use store::{FinalOp, Store};
 use thiserror::Error;
 
 pub use durable_derive::Durable;
@@ -83,8 +91,12 @@ pub use watch::{prefix_overlap, watch_hit, watch_prefix, write_range, WatchRange
 /// Errors returned by durable operations.
 #[derive(Error, Debug)]
 pub enum Error {
+    #[cfg(feature = "backend-rocksdb")]
     #[error("rocksdb error: {0}")]
     RocksDb(#[from] rocksdb::Error),
+    /// Storage backend failure (redb today; sled/surrealkv when they land).
+    #[error("store error: {0}")]
+    Store(String),
     #[error("serialization error: {0}")]
     Serialize(String),
     #[error("deserialization error: {0}")]
@@ -182,27 +194,38 @@ impl Write {
 
 /// A handle to an open durable database.
 ///
-/// Cheap to clone (an `Arc` around the RocksDB handle). Durable assumes a single
+/// Cheap to clone (an `Arc` around the storage handle). Durable assumes a single
 /// writer process; serialize writes at the application layer.
 #[derive(Clone)]
 pub struct Db {
-    inner: Arc<RocksDb>,
+    inner: Arc<Store>,
 }
 
 impl Db {
     /// Open (or create) a durable database at `path`.
+    ///
+    /// The on-disk format is backend-specific (see [`store`]); switching
+    /// backends means replaying the event tape into a fresh directory.
     pub fn open<P: AsRef<FsPath>>(path: P) -> Result<Self> {
-        let mut opts = Options::default();
-        opts.create_if_missing(true);
-        opts.set_merge_operator_associative("durable.sum", schema::sum_merge);
-        let db = RocksDb::open(&opts, path)?;
+        let store = Store::open(path.as_ref())?;
         Ok(Self {
-            inner: Arc::new(db),
+            inner: Arc::new(store),
         })
     }
 
-    pub(crate) fn raw(&self) -> &RocksDb {
-        &self.inner
+    /// Point read against committed state.
+    pub(crate) fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.inner.get(key)
+    }
+
+    /// Forward scan starting at the first key `>= from`.
+    pub(crate) fn iter_from(&self, from: &[u8]) -> Result<store::StoreIter<'_>> {
+        self.inner.iter_from(from)
+    }
+
+    /// Forward scan of the whole keyspace.
+    pub(crate) fn iter_start(&self) -> Result<store::StoreIter<'_>> {
+        self.inner.iter_start()
     }
 
     /// Start an atomic batch of writes.
@@ -227,15 +250,23 @@ impl Db {
 
 /// An atomic batch of writes plus deferred collection appends.
 ///
-/// Blind writes are recorded immediately. Stateful appends ([`Batch::push_back`]
-/// / [`Batch::push`]) are resolved at commit time against the current collection
-/// length, so several appends in one batch land at contiguous indices and the
-/// whole batch commits as one RocksDB write (one WAL flush).
+/// Blind writes are recorded immediately, in order. Stateful appends
+/// ([`Batch::push_back`] / [`Batch::push`]) and prefix deletes are resolved
+/// at commit time against committed state, then the whole op stream commits
+/// as one atomic backend write (one WAL flush on RocksDB, one transaction
+/// on redb).
 pub struct Batch {
     db: Db,
-    inner: WriteBatch,
+    point: Vec<PointOp>,
     prefix_deletes: Vec<Vec<u8>>,
     appends: Vec<PendingAppend>,
+}
+
+/// One blind point op, in arrival order.
+pub(crate) enum PointOp {
+    Put { key: Vec<u8>, value: Vec<u8> },
+    Delete { key: Vec<u8> },
+    Merge { key: Vec<u8>, value: Vec<u8> },
 }
 
 pub(crate) enum AppendEnd {
@@ -257,7 +288,7 @@ impl Batch {
     fn new(db: Db) -> Self {
         Self {
             db,
-            inner: WriteBatch::default(),
+            point: Vec::new(),
             prefix_deletes: Vec::new(),
             appends: Vec::new(),
         }
@@ -266,9 +297,9 @@ impl Batch {
     /// Record a reified write in this batch.
     pub fn write(&mut self, write: Write) {
         match write.into_op() {
-            Op::Put { key, value } => self.inner.put(key, value),
-            Op::Delete { key } => self.inner.delete(key),
-            Op::Merge { key, value } => self.inner.merge(key, value),
+            Op::Put { key, value } => self.point.push(PointOp::Put { key, value }),
+            Op::Delete { key } => self.point.push(PointOp::Delete { key }),
+            Op::Merge { key, value } => self.point.push(PointOp::Merge { key, value }),
             Op::DeletePrefix { prefix } => self.prefix_deletes.push(prefix),
             Op::ListPush { prefix, value } => self.appends.push(PendingAppend {
                 coll_prefix: prefix,
@@ -302,7 +333,7 @@ impl Batch {
     }
 
     pub(crate) fn raw_put(&mut self, key: Vec<u8>, value: Vec<u8>) {
-        self.inner.put(key, value);
+        self.point.push(PointOp::Put { key, value });
     }
 
     /// Append `value` to the back of a leaf list (resolved at commit).
@@ -351,50 +382,38 @@ impl Batch {
 
     /// Commit the batch with an explicit durability policy.
     pub fn commit_with(mut self, durability: Durability) -> Result<()> {
-        self.resolve_prefix_deletes()?;
-        self.resolve_appends()?;
-
-        match durability {
-            Durability::SyncWal => {
-                self.db.raw().write(self.inner)?;
-                self.db.raw().flush_wal(true)?;
-            }
-            Durability::WalOnly => {
-                self.db.raw().write(self.inner)?;
-            }
-            Durability::DisableWal => {
-                let mut opts = WriteOptions::default();
-                opts.disable_wal(true);
-                self.db.raw().write_opt(self.inner, &opts)?;
-            }
-        }
-        Ok(())
+        // Resolution order matches the old single-WriteBatch layout: point
+        // ops first (arrival order), then prefix-delete expansion, then
+        // resolved appends.
+        let mut ops: Vec<FinalOp> = self
+            .point
+            .drain(..)
+            .map(|op| match op {
+                PointOp::Put { key, value } => FinalOp::Put(key, value),
+                PointOp::Delete { key } => FinalOp::Delete(key),
+                PointOp::Merge { key, value } => FinalOp::Merge(key, value),
+            })
+            .collect();
+        ops.extend(self.resolve_prefix_deletes());
+        ops.extend(
+            self.resolve_appends()?
+                .into_iter()
+                .map(|(key, value)| FinalOp::Put(key, value)),
+        );
+        self.db.inner.write(ops, durability)
     }
 
-    fn resolve_prefix_deletes(&mut self) -> Result<()> {
-        for prefix in std::mem::take(&mut self.prefix_deletes) {
-            match codec::prefix_upper_bound(&prefix) {
-                Some(end) => self.inner.delete_range(&prefix, &end),
-                None => {
-                    // Range extends to the end of the keyspace: scan and delete.
-                    let iter = self.db.raw().iterator(rocksdb::IteratorMode::From(
-                        &prefix,
-                        rocksdb::Direction::Forward,
-                    ));
-                    for item in iter {
-                        let (key, _) = item?;
-                        if !key.starts_with(&prefix) {
-                            break;
-                        }
-                        self.inner.delete(&key);
-                    }
-                }
-            }
-        }
-        Ok(())
+    fn resolve_prefix_deletes(&mut self) -> Vec<FinalOp> {
+        std::mem::take(&mut self.prefix_deletes)
+            .into_iter()
+            .map(|prefix| {
+                let end = codec::prefix_upper_bound(&prefix);
+                FinalOp::DeleteRange { start: prefix, end }
+            })
+            .collect()
     }
 
-    fn resolve_appends(&mut self) -> Result<()> {
+    fn resolve_appends(&mut self) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         use std::collections::HashMap;
         // Group appends by (collection, end) so contiguous appends get contiguous
         // indices and each counter is read exactly once.
@@ -414,27 +433,33 @@ impl Batch {
             entry.push(append.value);
         }
 
+        let mut out = Vec::new();
         for (coll_prefix, tag) in order {
             let values = grouped.remove(&(coll_prefix.clone(), tag)).unwrap();
             match tag {
-                0 => self.resolve_list_back(&coll_prefix, values)?,
-                1 => self.resolve_deque_end(&coll_prefix, values, true)?,
-                2 => self.resolve_deque_end(&coll_prefix, values, false)?,
+                0 => self.resolve_list_back(&coll_prefix, values, &mut out)?,
+                1 => self.resolve_deque_end(&coll_prefix, values, true, &mut out)?,
+                2 => self.resolve_deque_end(&coll_prefix, values, false, &mut out)?,
                 _ => unreachable!(),
             }
         }
-        Ok(())
+        Ok(out)
     }
 
-    fn resolve_list_back(&mut self, coll_prefix: &[u8], values: Vec<Vec<u8>>) -> Result<()> {
+    fn resolve_list_back(
+        &mut self,
+        coll_prefix: &[u8],
+        values: Vec<Vec<u8>>,
+        out: &mut Vec<(Vec<u8>, Vec<u8>)>,
+    ) -> Result<()> {
         let len_key = codec::meta_key(coll_prefix, b"len");
         let mut len = read_u64(&self.db, &len_key)?.unwrap_or(0);
         for value in values {
             let elem = codec::child_key(coll_prefix, &codec::order_u64(len));
-            self.inner.put(&elem, &value);
+            out.push((elem, value));
             len += 1;
         }
-        self.inner.put(&len_key, len.to_le_bytes());
+        out.push((len_key, len.to_le_bytes().to_vec()));
         Ok(())
     }
 
@@ -443,6 +468,7 @@ impl Batch {
         coll_prefix: &[u8],
         values: Vec<Vec<u8>>,
         back: bool,
+        out: &mut Vec<(Vec<u8>, Vec<u8>)>,
     ) -> Result<()> {
         let head_key = codec::meta_key(coll_prefix, b"head");
         let tail_key = codec::meta_key(coll_prefix, b"tail");
@@ -451,22 +477,22 @@ impl Batch {
         for value in values {
             if back {
                 let elem = codec::child_key(coll_prefix, &codec::order_i64(tail));
-                self.inner.put(&elem, &value);
+                out.push((elem, value));
                 tail += 1;
             } else {
                 head -= 1;
                 let elem = codec::child_key(coll_prefix, &codec::order_i64(head));
-                self.inner.put(&elem, &value);
+                out.push((elem, value));
             }
         }
-        self.inner.put(&head_key, head.to_le_bytes());
-        self.inner.put(&tail_key, tail.to_le_bytes());
+        out.push((head_key, head.to_le_bytes().to_vec()));
+        out.push((tail_key, tail.to_le_bytes().to_vec()));
         Ok(())
     }
 }
 
 pub(crate) fn read_u64(db: &Db, key: &[u8]) -> Result<Option<u64>> {
-    match db.raw().get(key)? {
+    match db.get(key)? {
         Some(bytes) => {
             if bytes.len() != 8 {
                 return Err(Error::Corruption("expected 8-byte u64 meta".into()));
@@ -480,7 +506,7 @@ pub(crate) fn read_u64(db: &Db, key: &[u8]) -> Result<Option<u64>> {
 }
 
 pub(crate) fn read_i64(db: &Db, key: &[u8]) -> Result<Option<i64>> {
-    match db.raw().get(key)? {
+    match db.get(key)? {
         Some(bytes) => {
             if bytes.len() != 8 {
                 return Err(Error::Corruption("expected 8-byte i64 meta".into()));

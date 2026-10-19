@@ -1242,11 +1242,10 @@ fn next_ts(last: u64) -> u64 {
 }
 
 fn dump(db: &Db) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-    let iter = db.raw().iterator(rocksdb::IteratorMode::Start);
+    let iter = db.iter_start()?;
     let mut out = Vec::new();
     for item in iter {
-        let (k, v) = item?;
-        out.push((k.to_vec(), v.to_vec()));
+        out.push(item?);
     }
     out.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(out)
