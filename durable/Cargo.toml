@@ -9,6 +9,7 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 rocksdb = { version = "0.21", optional = true }
 redb = { version = "4", optional = true }
+sled = { version = "0.34", optional = true }
 serde = { version = "1.0", features = ["derive"] }
 thiserror = "1.0"
 ciborium = "0.2.2"
@@ -19,10 +20,11 @@ crc32c = "0.6.8"
 [features]
 # Storage backend selection: exactly one must be enabled. The backend is
 # picked in the depending crate's `durable` dependency, e.g.
-# `durable = { version = "0.3", default-features = false, features = ["backend-redb"] }`.
+# `durable = { version = "0.3", default-features = false, features = ["backend-sled"] }`.
 default = ["backend-rocksdb"]
 backend-rocksdb = ["dep:rocksdb"]
 backend-redb = ["dep:redb"]
+backend-sled = ["dep:sled"]
 # Test doubles for the tape writer's failure paths. Off in normal builds;
 # the crate's own tests enable it through the self dev-dependency below.
 fault-injection = []

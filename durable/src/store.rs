@@ -11,11 +11,11 @@
 //! * Commits are atomic: every [`FinalOp`] in one [`Store::write`] call lands
 //!   together or not at all.
 //! * [`Durability`] maps onto each engine's fsync story; see the commit arms.
-//! * Merge ops have no native equivalent outside RocksDB, so non-RocksDB
-//!   backends fold them read-modify-write inside the commit transaction via
-//!   [`crate::schema::fold_merge`]. This preserves single-writer semantics
-//!   exactly; only cross-process blind-merge concurrency would differ (and
-//!   durable already assumes a single writer process).
+//! * Merge ops fold through the shared [`crate::schema::fold_merge`]:
+//!   natively at compaction time on RocksDB, read-modify-write inside the
+//!   commit transaction on redb, and against a commit-time overlay on sled
+//!   (whose batches have no merge op). All three preserve single-writer
+//!   semantics exactly (and durable already assumes a single writer).
 //! * On-disk formats differ per backend. Switching backends for an existing
 //!   deployment means replaying the event tape into a fresh store directory —
 //!   which is the supported migration path everywhere durable is used.
@@ -40,11 +40,21 @@ pub(crate) enum FinalOp {
 }
 
 /// Forward key-order scan yielding owned pairs.
+///
+/// RocksDB iterates a live snapshot handle; redb materializes under one
+/// read transaction (also snapshot-consistent). sled has no read
+/// transactions, so scans materialize immediately — still exact under the
+/// single-writer contract.
 pub(crate) enum StoreIter<'a> {
     #[cfg(feature = "backend-rocksdb")]
     Rocksdb(rocksdb::DBIterator<'a>),
     #[cfg(feature = "backend-redb")]
     Redb(
+        std::vec::IntoIter<(Vec<u8>, Vec<u8>)>,
+        std::marker::PhantomData<&'a ()>,
+    ),
+    #[cfg(feature = "backend-sled")]
+    Sled(
         std::vec::IntoIter<(Vec<u8>, Vec<u8>)>,
         std::marker::PhantomData<&'a ()>,
     ),
@@ -62,6 +72,8 @@ impl Iterator for StoreIter<'_> {
             }),
             #[cfg(feature = "backend-redb")]
             StoreIter::Redb(iter, _) => iter.next().map(Ok),
+            #[cfg(feature = "backend-sled")]
+            StoreIter::Sled(iter, _) => iter.next().map(Ok),
         }
     }
 }
@@ -71,6 +83,8 @@ pub(crate) enum Store {
     Rocksdb(rocksdb::DB),
     #[cfg(feature = "backend-redb")]
     Redb(redb::Database),
+    #[cfg(feature = "backend-sled")]
+    Sled(sled::Db),
 }
 
 impl Store {
@@ -95,6 +109,11 @@ impl Store {
             txn.commit().map_err(store_err)?;
             return Ok(Store::Redb(db));
         }
+        #[cfg(feature = "backend-sled")]
+        {
+            let db = sled::open(path).map_err(store_err)?;
+            return Ok(Store::Sled(db));
+        }
         #[allow(unreachable_code)]
         Err(Error::Log("no durable storage backend enabled".into()))
     }
@@ -106,6 +125,8 @@ impl Store {
             Store::Rocksdb(db) => db.get(key).map_err(Error::RocksDb),
             #[cfg(feature = "backend-redb")]
             Store::Redb(db) => redb_be::get(db, key),
+            #[cfg(feature = "backend-sled")]
+            Store::Sled(db) => sled_be::get(db, key),
         }
     }
 
@@ -121,6 +142,11 @@ impl Store {
                 redb_be::scan(db, Some(from))?.into_iter(),
                 std::marker::PhantomData,
             )),
+            #[cfg(feature = "backend-sled")]
+            Store::Sled(db) => Ok(StoreIter::Sled(
+                sled_be::scan(db, Some(from))?.into_iter(),
+                std::marker::PhantomData,
+            )),
         }
     }
 
@@ -134,6 +160,11 @@ impl Store {
             #[cfg(feature = "backend-redb")]
             Store::Redb(db) => Ok(StoreIter::Redb(
                 redb_be::scan(db, None)?.into_iter(),
+                std::marker::PhantomData,
+            )),
+            #[cfg(feature = "backend-sled")]
+            Store::Sled(db) => Ok(StoreIter::Sled(
+                sled_be::scan(db, None)?.into_iter(),
                 std::marker::PhantomData,
             )),
         }
@@ -188,6 +219,8 @@ impl Store {
             }
             #[cfg(feature = "backend-redb")]
             Store::Redb(db) => redb_be::commit(db, ops, durability),
+            #[cfg(feature = "backend-sled")]
+            Store::Sled(db) => sled_be::commit(db, ops, durability),
         }
     }
 }
@@ -322,6 +355,129 @@ mod redb_be {
             }
         }
         txn.commit().map_err(store_err)?;
+        Ok(())
+    }
+}
+
+/// Pure-Rust backend: sled (ordered B-tree, no C++).
+///
+/// sled's [`sled::Batch`] has no merge op, so [`FinalOp::Merge`] lowers to a
+/// put/delete here against a commit-time overlay that replicates WriteBatch
+/// order semantics exactly (prior puts/deletes/ranges in the same batch are
+/// visible to later merges, and ranges cover earlier puts). The fold itself
+/// is the shared [`schema::fold_merge`], so accumulator bytes are identical
+/// on every backend.
+#[cfg(feature = "backend-sled")]
+mod sled_be {
+    use std::collections::HashMap;
+
+    use super::*;
+
+    pub(super) fn get(db: &sled::Db, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        Ok(db.get(key).map_err(store_err)?.map(|v| v.to_vec()))
+    }
+
+    /// Eagerly materialized scan. `from == None` scans the whole keyspace.
+    pub(super) fn scan(db: &sled::Db, from: Option<&[u8]>) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let mut out = Vec::new();
+        match from {
+            Some(start) => {
+                for item in db.range(start..) {
+                    let (k, v) = item.map_err(store_err)?;
+                    out.push((k.to_vec(), v.to_vec()));
+                }
+            }
+            None => {
+                for item in db.iter() {
+                    let (k, v) = item.map_err(store_err)?;
+                    out.push((k.to_vec(), v.to_vec()));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    pub(super) fn commit(db: &sled::Db, ops: Vec<FinalOp>, durability: Durability) -> Result<()> {
+        let mut batch = sled::Batch::default();
+        // Committed-state overlay: Some(value) = put this batch,
+        // None = deleted this batch. Lets later ops in the same commit
+        // observe earlier ones, exactly like a RocksDB WriteBatch.
+        let mut overlay: HashMap<Vec<u8>, Option<Vec<u8>>> = HashMap::new();
+        for op in ops {
+            match op {
+                FinalOp::Put(k, v) => {
+                    batch.insert(k.clone(), v.clone());
+                    overlay.insert(k, Some(v));
+                }
+                FinalOp::Delete(k) => {
+                    batch.remove(k.clone());
+                    overlay.insert(k, None);
+                }
+                FinalOp::Merge(k, operand) => {
+                    let base = match overlay.get(&k) {
+                        Some(staged) => staged.clone(),
+                        None => get(db, &k)?,
+                    };
+                    match schema::fold_merge(base.as_deref(), &[operand.as_slice()]) {
+                        Some(next) => {
+                            batch.insert(k.clone(), next.clone());
+                            overlay.insert(k, Some(next));
+                        }
+                        None => {
+                            batch.remove(k.clone());
+                            overlay.insert(k, None);
+                        }
+                    }
+                }
+                FinalOp::DeleteRange { start, end } => {
+                    let in_range = |k: &[u8]| {
+                        k >= start.as_slice() && end.as_ref().is_none_or(|e| k < e.as_slice())
+                    };
+                    // Staged keys in range, plus the committed scan minus
+                    // anything the overlay already covers.
+                    let mut condemned: Vec<Vec<u8>> =
+                        overlay.keys().filter(|k| in_range(k)).cloned().collect();
+                    match &end {
+                        Some(end) => {
+                            for item in db.range(start.as_slice()..end.as_slice()) {
+                                let (k, _) = item.map_err(store_err)?;
+                                let key = k.to_vec();
+                                if !overlay.contains_key(&key) {
+                                    condemned.push(key);
+                                }
+                            }
+                        }
+                        None => {
+                            for item in db.range(start.as_slice()..) {
+                                let (k, _) = item.map_err(store_err)?;
+                                let key = k.to_vec();
+                                if !key.starts_with(&start) {
+                                    break;
+                                }
+                                if !overlay.contains_key(&key) {
+                                    condemned.push(key);
+                                }
+                            }
+                        }
+                    }
+                    for key in condemned {
+                        batch.remove(key.clone());
+                        overlay.insert(key, None);
+                    }
+                }
+            }
+        }
+        db.apply_batch(batch).map_err(store_err)?;
+        match durability {
+            // Force the WAL to stable storage before returning.
+            Durability::SyncWal => {
+                db.flush().map_err(store_err)?;
+            }
+            // sled has no WAL-without-fsync level and no WAL-disable knob:
+            // batches still go through the WAL, background flush decides
+            // when bytes hit disk. Documented, same as upstream behavior.
+            Durability::WalOnly | Durability::DisableWal => {}
+        }
         Ok(())
     }
 }

@@ -60,11 +60,20 @@ mod shape;
 pub mod store;
 pub mod watch;
 
-#[cfg(not(any(feature = "backend-rocksdb", feature = "backend-redb")))]
+#[cfg(not(any(
+    feature = "backend-rocksdb",
+    feature = "backend-redb",
+    feature = "backend-sled"
+)))]
 compile_error!(
-    "durable: enable exactly one storage backend feature (`backend-rocksdb` or `backend-redb`)"
+    "durable: enable exactly one storage backend feature \
+     (`backend-rocksdb`, `backend-redb`, or `backend-sled`)"
 );
-#[cfg(all(feature = "backend-rocksdb", feature = "backend-redb"))]
+#[cfg(any(
+    all(feature = "backend-rocksdb", feature = "backend-redb"),
+    all(feature = "backend-rocksdb", feature = "backend-sled"),
+    all(feature = "backend-redb", feature = "backend-sled"),
+))]
 compile_error!("durable: only one storage backend feature may be enabled at a time");
 
 use std::path::Path as FsPath;
@@ -94,7 +103,7 @@ pub enum Error {
     #[cfg(feature = "backend-rocksdb")]
     #[error("rocksdb error: {0}")]
     RocksDb(#[from] rocksdb::Error),
-    /// Storage backend failure (redb today; sled/surrealkv when they land).
+    /// Storage backend failure (redb/sled; surrealkv when it lands).
     #[error("store error: {0}")]
     Store(String),
     #[error("serialization error: {0}")]
