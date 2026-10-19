@@ -278,6 +278,7 @@ pub(crate) enum PointOp {
     Merge { key: Vec<u8>, value: Vec<u8> },
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AppendEnd {
     /// Append to the tail of a [`List`]; counter is `len`, index is `len`.
     ListBack,
@@ -424,32 +425,39 @@ impl Batch {
 
     fn resolve_appends(&mut self) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         use std::collections::HashMap;
-        // Group appends by (collection, end) so contiguous appends get contiguous
-        // indices and each counter is read exactly once.
-        let mut order: Vec<(Vec<u8>, u8)> = Vec::new();
-        let mut grouped: HashMap<(Vec<u8>, u8), Vec<Vec<u8>>> = HashMap::new();
+        // Group appends by collection so contiguous appends get contiguous
+        // indices and each counter is read exactly once. Deque appends keep
+        // their end marker: back and front pushes to the SAME deque must
+        // resolve against one shared head/tail read, otherwise the second
+        // group would clobber the first's counter update with a stale value.
+        enum Group {
+            List(Vec<Vec<u8>>),
+            Deque(Vec<(AppendEnd, Vec<u8>)>),
+        }
+        let mut order: Vec<Vec<u8>> = Vec::new();
+        let mut grouped: HashMap<Vec<u8>, Group> = HashMap::new();
         for append in std::mem::take(&mut self.appends) {
-            let tag = match append.end {
-                AppendEnd::ListBack => 0u8,
-                AppendEnd::DequeBack => 1u8,
-                AppendEnd::DequeFront => 2u8,
-            };
-            let group_key = (append.coll_prefix, tag);
-            let entry = grouped.entry(group_key.clone()).or_insert_with(|| {
-                order.push(group_key);
-                Vec::new()
+            let entry = grouped.entry(append.coll_prefix.clone()).or_insert_with(|| {
+                order.push(append.coll_prefix.clone());
+                match append.end {
+                    AppendEnd::ListBack => Group::List(Vec::new()),
+                    AppendEnd::DequeBack | AppendEnd::DequeFront => {
+                        Group::Deque(Vec::new())
+                    }
+                }
             });
-            entry.push(append.value);
+            match (entry, append.end) {
+                (Group::List(values), AppendEnd::ListBack) => values.push(append.value),
+                (Group::Deque(items), end) => items.push((end, append.value)),
+                _ => unreachable!("list and deque appends never share a prefix"),
+            }
         }
 
         let mut out = Vec::new();
-        for (coll_prefix, tag) in order {
-            let values = grouped.remove(&(coll_prefix.clone(), tag)).unwrap();
-            match tag {
-                0 => self.resolve_list_back(&coll_prefix, values, &mut out)?,
-                1 => self.resolve_deque_end(&coll_prefix, values, true, &mut out)?,
-                2 => self.resolve_deque_end(&coll_prefix, values, false, &mut out)?,
-                _ => unreachable!(),
+        for coll_prefix in order {
+            match grouped.remove(&coll_prefix).unwrap() {
+                Group::List(values) => self.resolve_list_back(&coll_prefix, values, &mut out)?,
+                Group::Deque(items) => self.resolve_deque(&coll_prefix, items, &mut out)?,
             }
         }
         Ok(out)
@@ -472,26 +480,31 @@ impl Batch {
         Ok(())
     }
 
-    fn resolve_deque_end(
+    /// Resolve mixed back/front appends to one deque against a single
+    /// head/tail read, preserving arrival order.
+    fn resolve_deque(
         &mut self,
         coll_prefix: &[u8],
-        values: Vec<Vec<u8>>,
-        back: bool,
+        items: Vec<(AppendEnd, Vec<u8>)>,
         out: &mut Vec<(Vec<u8>, Vec<u8>)>,
     ) -> Result<()> {
         let head_key = codec::meta_key(coll_prefix, b"head");
         let tail_key = codec::meta_key(coll_prefix, b"tail");
         let mut head = read_i64(&self.db, &head_key)?.unwrap_or(0);
         let mut tail = read_i64(&self.db, &tail_key)?.unwrap_or(0);
-        for value in values {
-            if back {
-                let elem = codec::child_key(coll_prefix, &codec::order_i64(tail));
-                out.push((elem, value));
-                tail += 1;
-            } else {
-                head -= 1;
-                let elem = codec::child_key(coll_prefix, &codec::order_i64(head));
-                out.push((elem, value));
+        for (end, value) in items {
+            match end {
+                AppendEnd::ListBack => unreachable!("list appends never join a deque group"),
+                AppendEnd::DequeBack => {
+                    let elem = codec::child_key(coll_prefix, &codec::order_i64(tail));
+                    out.push((elem, value));
+                    tail += 1;
+                }
+                AppendEnd::DequeFront => {
+                    head -= 1;
+                    let elem = codec::child_key(coll_prefix, &codec::order_i64(head));
+                    out.push((elem, value));
+                }
             }
         }
         out.push((head_key, head.to_le_bytes().to_vec()));

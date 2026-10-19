@@ -308,6 +308,30 @@ fn deque_behaves_like_a_double_ended_queue() {
 }
 
 #[test]
+fn deque_mixed_back_and_front_appends_share_one_batch() {
+    // Regression: back and front pushes to the same deque in ONE batch used
+    // to resolve against separate head/tail reads, so the second group
+    // clobbered the first's counter update with a stale value (len 3 here
+    // came back as 2 or 1 depending on order).
+    let (_dir, db) = open();
+    let dq = Store::root().scopes().key(&"s".to_string()).recent_votes();
+    let v = |n: i32| Vote { a: format!("a{n}"), b: format!("b{n}"), ratio: n };
+
+    let mut batch = db.batch();
+    batch.write(dq.push_back_op(&v(1)));
+    batch.write(dq.push_front_op(&v(0)));
+    batch.write(dq.push_back_op(&v(2)));
+    batch.write(dq.push_front_op(&v(-1)));
+    batch.commit().unwrap();
+
+    assert_eq!(dq.len(&db).unwrap(), 4);
+    assert_eq!(
+        dq.iter(&db).unwrap(),
+        vec![v(-1), v(0), v(1), v(2)]
+    );
+}
+
+#[test]
 fn deque_supports_capped_recent_window() {
     // The motivating use case: keep only the most recent N votes, O(1) per insert.
     let (_dir, db) = open();
