@@ -19,6 +19,11 @@
 //! * On-disk formats differ per backend. Switching backends for an existing
 //!   deployment means replaying the event tape into a fresh store directory —
 //!   which is the supported migration path everywhere durable is used.
+//!
+//! Deliberately not a backend (yet): SurrealKV. Its commit path is `async`
+//! on top of tokio while this crate's API is fully synchronous — and the
+//! main consumer commits from tokio workers, where a `block_on` bridge
+//! would panic. Revisit if it ever gains a synchronous commit path.
 
 use std::path::Path as FsPath;
 
