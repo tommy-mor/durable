@@ -1,4 +1,8 @@
-//! Cross-backend benchmark with BigO charts.
+//! Cross-backend benchmark: on-disk structures vs their in-memory BigO.
+//!
+//! The question this answers: does putting a Vec/VecDeque/BTreeMap on disk
+//! change its complexity? Every chart plots rocksdb / redb / sled against
+//! the std baseline (`memory`) on log–log axes with O(1)/O(N) slope guides.
 //!
 //! Run once per backend (sequentially — never in parallel, they contend),
 //! then render the combined report:
@@ -20,11 +24,12 @@
 //! >>RAM), so hot-cache effects flatter scan curves — the slope guides
 //! still show the shape, constants are machine-specific.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use durable::{Db, Durability, Durable, Leaf, List, Map, Sum};
+use durable::{Db, Durability, Durable, Deque, Leaf, List, Map};
+use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "backend-rocksdb")]
 const BACKEND: &str = "rocksdb";
@@ -38,7 +43,8 @@ const QUICK_NS: [usize; 2] = [1_000, 10_000];
 const BATCH_ROWS: usize = 10_000;
 const SINGLE_REPS: usize = 100;
 const GET_SAMPLES: usize = 2_000;
-const READ_REPS: usize = 200;
+const POP_REPS: usize = 1_000;
+const DEQUE_POP_REPS: usize = 500;
 
 /// Keep in sync with Cargo.toml/Cargo.lock on every backend bump.
 #[cfg(feature = "backend-rocksdb")]
@@ -48,12 +54,21 @@ const BACKEND_VERSION: &str = "redb 4.4.0";
 #[cfg(feature = "backend-sled")]
 const BACKEND_VERSION: &str = "sled 0.34.7";
 
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+struct Rec {
+    id: u64,
+    name: String,
+    active: bool,
+}
+
 #[derive(Durable)]
 #[allow(dead_code)]
 struct Bench {
-    items: List<Leaf<u64>>,
-    sums: Map<String, Sum<i64>>,
+    list: List<Leaf<u64>>,
+    deque: Deque<Leaf<u64>>,
     maps: Map<String, Leaf<u64>>,
+    nested: Map<String, Map<String, Map<String, Leaf<u64>>>>,
+    records: List<Leaf<Rec>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -81,6 +96,26 @@ fn stats(op: &str, n: usize, unit: &str, mut xs: Vec<u128>) -> Sample {
     }
 }
 
+fn total(op: &str, n: usize, unit: &str, ns: u128) -> Sample {
+    Sample {
+        op: op.to_string(),
+        n,
+        p50_ns: ns as f64,
+        p99_ns: 0.0,
+        unit: unit.to_string(),
+    }
+}
+
+fn per_row(op: &str, n: usize, ns: u128, rows: usize) -> Sample {
+    Sample {
+        op: op.to_string(),
+        n,
+        p50_ns: ns as f64 / rows as f64,
+        p99_ns: 0.0,
+        unit: "ns/op".into(),
+    }
+}
+
 /// Deterministic xorshift64* — std-only "random" keys.
 struct Rng(u64);
 impl Rng {
@@ -98,131 +133,24 @@ fn key(i: usize) -> String {
     format!("k{i:08}")
 }
 
-// ---------------------------------------------------------------------------
-// workloads (each takes a fresh &Db)
-// ---------------------------------------------------------------------------
-
-fn load_maps(db: &Db, n: usize) -> durable::Result<()> {
-    let root = Bench::root();
-    let mut writes = Vec::with_capacity(BATCH_ROWS);
-    for i in 0..n {
-        writes.push(root.maps().key(&key(i)).set(&(i as u64)));
-        if writes.len() == BATCH_ROWS {
-            db.apply(&writes, Durability::DisableWal)?;
-            writes.clear();
-        }
+fn rec(i: usize) -> Rec {
+    Rec {
+        id: i as u64,
+        name: format!("name-{i:08}"),
+        active: i % 2 == 0,
     }
-    if !writes.is_empty() {
-        db.apply(&writes, Durability::DisableWal)?;
-    }
-    Ok(())
-}
-
-fn load_list(db: &Db, n: usize) -> durable::Result<()> {
-    let items = Bench::root().items();
-    let mut batch = db.batch();
-    for i in 0..n {
-        batch.push(&items, &(i as u64))?;
-        if i % BATCH_ROWS == BATCH_ROWS - 1 {
-            let fresh = db.batch();
-            let pending = std::mem::replace(&mut batch, fresh);
-            pending.commit_with(Durability::DisableWal)?;
-        }
-    }
-    batch.commit_with(Durability::DisableWal)?;
-    Ok(())
-}
-
-///latency of single-row SyncWal commits (the fsync floor).
-fn bench_single_appends(db: &Db, reps: usize) -> durable::Result<Vec<u128>> {
-    let items = Bench::root().items();
-    let mut out = Vec::with_capacity(reps);
-    for i in 0..reps {
-        let mut batch = db.batch();
-        batch.push(&items, &(1_000_000_000 + i as u64))?;
-        let t = Instant::now();
-        batch.commit_with(Durability::SyncWal)?;
-        out.push(t.elapsed().as_nanos());
-    }
-    Ok(out)
-}
-
-/// Per-row cost of a 10k-row SyncWal group commit.
-fn bench_batch_commit(db: &Db, rows: usize) -> durable::Result<u128> {
-    let root = Bench::root();
-    let writes: Vec<_> = (0..rows)
-        .map(|i| root.maps().key(&format!("b{i:08}")).set(&(i as u64)))
-        .collect();
-    let t = Instant::now();
-    db.apply(&writes, Durability::SyncWal)?;
-    Ok(t.elapsed().as_nanos() / rows as u128)
-}
-
-fn bench_point_gets(db: &Db, n: usize, samples: usize) -> durable::Result<Vec<u128>> {
-    let root = Bench::root();
-    let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
-    let mut out = Vec::with_capacity(samples);
-    for _ in 0..samples {
-        let k = key((rng.next() % n as u64) as usize);
-        let t = Instant::now();
-        let v = root.maps().get(db, &k)?;
-        std::hint::black_box(v);
-        out.push(t.elapsed().as_nanos());
-    }
-    Ok(out)
-}
-
-fn bench_scan(db: &Db) -> durable::Result<(u128, usize)> {
-    let t = Instant::now();
-    let pairs = Bench::root().maps().iter(db)?;
-    let dt = t.elapsed().as_nanos();
-    Ok((dt, pairs.len()))
-}
-
-/// M merges into ONE accumulator, then read it. Returns (total add ns, read samples).
-fn bench_sum_pressure(
-    db: &Db,
-    m: usize,
-) -> durable::Result<(u128, Vec<u128>)> {
-    let acc = Bench::root().sums().key(&"pressure".to_string());
-    let mut writes = Vec::with_capacity(BATCH_ROWS);
-    let t = Instant::now();
-    for _ in 0..m {
-        writes.push(acc.add(1));
-        if writes.len() == BATCH_ROWS {
-            db.apply(&writes, Durability::SyncWal)?;
-            writes.clear();
-        }
-    }
-    if !writes.is_empty() {
-        db.apply(&writes, Durability::SyncWal)?;
-    }
-    let add_total = t.elapsed().as_nanos();
-    let mut reads = Vec::with_capacity(READ_REPS);
-    for _ in 0..READ_REPS {
-        let t = Instant::now();
-        let v: i64 = acc.get(db)?;
-        std::hint::black_box(v);
-        reads.push(t.elapsed().as_nanos());
-    }
-    Ok((add_total, reads))
-}
-
-fn cold_reopen(path: &Path) -> durable::Result<Db> {
-    Db::open(path)
-}
-
-fn wipe(path: &Path) -> durable::Result<()> {
-    if path.exists() {
-        std::fs::remove_dir_all(path).map_err(|e| durable::Error::Log(e.to_string()))?;
-    }
-    std::fs::create_dir_all(path).map_err(|e| durable::Error::Log(e.to_string()))?;
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
 // --work driver
 // ---------------------------------------------------------------------------
+
+fn apply_all(db: &Db, writes: Vec<durable::Write>, durability: Durability) -> durable::Result<()> {
+    for chunk in writes.chunks(BATCH_ROWS) {
+        db.apply(chunk, durability)?;
+    }
+    Ok(())
+}
 
 fn work(out_dir: &Path, quick: bool) -> durable::Result<()> {
     let ns: &[usize] = if quick { &QUICK_NS } else { &NS };
@@ -234,102 +162,484 @@ fn work(out_dir: &Path, quick: bool) -> durable::Result<()> {
         let path = base.path().join(format!("db-{n}"));
         wipe(&path)?;
         let db = Db::open(&path)?;
+        let root = Bench::root();
 
-        // bulk load (DisableWal batches) — throughput floor
+        // ---- bulk loads (DisableWal, batched): the per-op floors ----
         let t = Instant::now();
-        load_maps(&db, n)?;
-        load_list(&db, n)?;
-        let load_ns = t.elapsed().as_nanos();
-        samples.push(Sample {
-            op: "load_bulk".into(),
+        let mut batch = db.batch();
+        for i in 0..n {
+            batch.push(&root.list(), &(i as u64))?;
+            if i % BATCH_ROWS == BATCH_ROWS - 1 {
+                let fresh = db.batch();
+                std::mem::replace(&mut batch, fresh)
+                    .commit_with(Durability::DisableWal)?;
+            }
+        }
+        batch.commit_with(Durability::DisableWal)?;
+        samples.push(per_row("list_push_batch", n, t.elapsed().as_nanos(), n));
+
+        let t = Instant::now();
+        let mut batch = db.batch();
+        for i in 0..n {
+            batch.write(root.deque().push_back_op(&(i as u64)));
+            batch.write(root.deque().push_front_op(&(i as u64)));
+            if i % (BATCH_ROWS / 2) == (BATCH_ROWS / 2) - 1 {
+                let fresh = db.batch();
+                std::mem::replace(&mut batch, fresh)
+                    .commit_with(Durability::DisableWal)?;
+            }
+        }
+        batch.commit_with(Durability::DisableWal)?;
+        samples.push(per_row("deque_push_batch", n, t.elapsed().as_nanos(), 2 * n));
+
+        let t = Instant::now();
+        let writes: Vec<_> = (0..n)
+            .map(|i| root.maps().key(&key(i)).set(&(i as u64)))
+            .collect();
+        apply_all(&db, writes, Durability::DisableWal)?;
+        samples.push(per_row(
+            "map_put_batch",
             n,
-            p50_ns: load_ns as f64 / (2 * n) as f64,
-            p99_ns: 0.0,
-            unit: "ns/row".into(),
-        });
-
-        // single-append fsync floor
-        let single = bench_single_appends(&db, SINGLE_REPS.min(n.max(10)))?;
-        samples.push(stats("append_single_syncwal", n, "ns/commit", single));
-
-        // group commit
-        let rows = BATCH_ROWS.min(n);
-        let per_row = bench_batch_commit(&db, rows)?;
-        samples.push(Sample {
-            op: "batch_commit_syncwal".into(),
+            t.elapsed().as_nanos(),
             n,
-            p50_ns: per_row as f64,
-            p99_ns: 0.0,
-            unit: "ns/row".into(),
-        });
+        ));
 
-        // cold point reads
+        let t = Instant::now();
+        let mut batch = db.batch();
+        for i in 0..n {
+            batch.push(&root.records(), &rec(i))?;
+            if i % BATCH_ROWS == BATCH_ROWS - 1 {
+                let fresh = db.batch();
+                std::mem::replace(&mut batch, fresh)
+                    .commit_with(Durability::DisableWal)?;
+            }
+        }
+        batch.commit_with(Durability::DisableWal)?;
+        samples.push(per_row("record_put_batch", n, t.elapsed().as_nanos(), n));
+
+        // nested maps: fanout f with f^3 leaves ~= n
+        let f = (n as f64).cbrt().ceil() as usize;
+        let leaves = f * f * f;
+        let t = Instant::now();
+        let mut writes = Vec::with_capacity(BATCH_ROWS);
+        for a in 0..f {
+            for b in 0..f {
+                for c in 0..f {
+                    writes.push(
+                        root.nested()
+                            .key(&format!("a{a:04}"))
+                            .key(&format!("b{b:04}"))
+                            .key(&format!("c{c:04}"))
+                            .set(&((a * f * f + b * f + c) as u64)),
+                    );
+                    if writes.len() == BATCH_ROWS {
+                        db.apply(
+                            &std::mem::replace(&mut writes, Vec::with_capacity(BATCH_ROWS)),
+                            Durability::DisableWal,
+                        )?;
+                    }
+                }
+            }
+        }
+        if !writes.is_empty() {
+            db.apply(&writes, Durability::DisableWal)?;
+        }
+        samples.push(per_row(
+            "nested_put_batch",
+            leaves,
+            t.elapsed().as_nanos(),
+            leaves,
+        ));
+
+        // ---- single-commit fsync floor (SyncWal List::push) ----
+        let mut lat = Vec::with_capacity(SINGLE_REPS);
+        for i in 0..SINGLE_REPS {
+            let t = Instant::now();
+            root.list().push(&db, &(1_000_000_000 + i as u64))?;
+            lat.push(t.elapsed().as_nanos());
+        }
+        // (pop the probes back off so later phases see exactly n list rows)
+        for _ in 0..SINGLE_REPS {
+            root.list().pop(&db)?;
+        }
+        samples.push(stats("list_push_single", n, "ns/commit", lat));
+
+        // ---- cold reopen, then all read phases ----
         drop(db);
-        let db = cold_reopen(&path)?;
-        let gets = bench_point_gets(&db, n, GET_SAMPLES.min(n * 2))?;
-        samples.push(stats("point_get_cold", n, "ns", gets));
+        let db = Db::open(&path)?;
 
-        // full scan
-        let (scan_ns, count) = bench_scan(&db)?;
-        assert_eq!(count, n + BATCH_ROWS.min(n));
-        samples.push(Sample {
-            op: "scan_full".into(),
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        let mut lat = Vec::with_capacity(GET_SAMPLES);
+        for _ in 0..GET_SAMPLES {
+            let i = (rng.next() % n as u64) as u64;
+            let t = Instant::now();
+            let v = root.list().get(&db, i)?;
+            std::hint::black_box(v);
+            lat.push(t.elapsed().as_nanos());
+        }
+        samples.push(stats("list_get", n, "ns", lat));
+
+        let mut lat = Vec::with_capacity(GET_SAMPLES);
+        for _ in 0..GET_SAMPLES {
+            let k = key((rng.next() % n as u64) as usize);
+            let t = Instant::now();
+            let v = root.maps().get(&db, &k)?;
+            std::hint::black_box(v);
+            lat.push(t.elapsed().as_nanos());
+        }
+        samples.push(stats("map_get", n, "ns", lat));
+
+        let mut lat = Vec::with_capacity(1000);
+        for _ in 0..1000 {
+            let (a, b, c) = (
+                (rng.next() % f as u64) as usize,
+                (rng.next() % f as u64) as usize,
+                (rng.next() % f as u64) as usize,
+            );
+            let t = Instant::now();
+            let v = root
+                .nested()
+                .key(&format!("a{a:04}"))
+                .key(&format!("b{b:04}"))
+                .key(&format!("c{c:04}"))
+                .get(&db)?;
+            std::hint::black_box(v);
+            lat.push(t.elapsed().as_nanos());
+        }
+        samples.push(stats("nested_get_deep", leaves, "ns", lat));
+
+        let t = Instant::now();
+        let items = root.list().iter(&db)?;
+        assert_eq!(items.len(), n);
+        samples.push(total("list_iter", n, "ns total", t.elapsed().as_nanos()));
+
+        let t = Instant::now();
+        let dq = root.deque().iter(&db)?;
+        assert_eq!(dq.len(), 2 * n);
+        samples.push(total("deque_iter", n, "ns total", t.elapsed().as_nanos()));
+
+        let t = Instant::now();
+        let pairs = root.maps().iter(&db)?;
+        assert_eq!(pairs.len(), n);
+        samples.push(total("map_iter", n, "ns total", t.elapsed().as_nanos()));
+
+        let t = Instant::now();
+        let keys = root.maps().keys(&db)?;
+        assert_eq!(keys.len(), n);
+        samples.push(total("map_keys", n, "ns total", t.elapsed().as_nanos()));
+
+        let t = Instant::now();
+        let l1 = root.nested().keys(&db)?;
+        assert_eq!(l1.len(), f);
+        samples.push(total("nested_keys_l1", leaves, "ns total", t.elapsed().as_nanos()));
+
+        let t = Instant::now();
+        let mut deep = 0usize;
+        for (_, pa) in root.nested().entries(&db)? {
+            for (_, pb) in pa.entries(&db)? {
+                deep += pb.iter(&db)?.len();
+            }
+        }
+        assert_eq!(deep, leaves);
+        samples.push(total(
+            "nested_scan_deep",
+            leaves,
+            "ns total",
+            t.elapsed().as_nanos(),
+        ));
+
+        let t = Instant::now();
+        let recs = root.records().iter(&db)?;
+        assert_eq!(recs.len(), n);
+        samples.push(total(
+            "record_scan",
             n,
-            p50_ns: scan_ns as f64,
-            p99_ns: 0.0,
-            unit: "ns total".into(),
-        });
+            "ns total",
+            t.elapsed().as_nanos(),
+        ));
 
-        // sum pressure on a fresh key space (separate dir: merges only)
+        // ---- destructive tail: pops + clear (nothing after but rebuild) ----
+        let mut lat = Vec::with_capacity(POP_REPS);
+        for _ in 0..POP_REPS {
+            let t = Instant::now();
+            let v = root.list().pop(&db)?;
+            std::hint::black_box(v);
+            lat.push(t.elapsed().as_nanos());
+        }
+        samples.push(stats("list_pop", n, "ns", lat));
+
+        let mut lat = Vec::with_capacity(DEQUE_POP_REPS);
+        for _ in 0..DEQUE_POP_REPS {
+            let t = Instant::now();
+            let v = root.deque().pop_front(&db)?;
+            std::hint::black_box(v);
+            lat.push(t.elapsed().as_nanos());
+        }
+        samples.push(stats("deque_pop_front", n, "ns", lat));
+        let mut lat = Vec::with_capacity(DEQUE_POP_REPS);
+        for _ in 0..DEQUE_POP_REPS {
+            let t = Instant::now();
+            let v = root.deque().pop_back(&db)?;
+            std::hint::black_box(v);
+            lat.push(t.elapsed().as_nanos());
+        }
+        samples.push(stats("deque_pop_back", n, "ns", lat));
+
+        let t = Instant::now();
+        db.apply(&[root.maps().clear()], Durability::SyncWal)?;
+        samples.push(total("map_clear", n, "ns total", t.elapsed().as_nanos()));
+
+        // ---- rebuild: wipe + replay everything from scratch ----
         drop(db);
-        let spath = base.path().join(format!("sum-{n}"));
-        wipe(&spath)?;
-        let sdb = Db::open(&spath)?;
-        let (add_ns, reads) = bench_sum_pressure(&sdb, n)?;
-        samples.push(Sample {
-            op: "sum_add".into(),
-            n,
-            p50_ns: add_ns as f64 / n as f64,
-            p99_ns: 0.0,
-            unit: "ns/op".into(),
-        });
-        drop(sdb);
-        let sdb = cold_reopen(&spath)?;
-        let acc = Bench::root().sums().key(&"pressure".to_string());
-        let v: i64 = acc.get(&sdb)?;
-        assert_eq!(v, n as i64, "pressure accumulator mismatch");
-        samples.push(stats("sum_read_pressure", n, "ns", reads));
-
-        // rebuild: wipe + replay the same writes from scratch
-        drop(sdb);
         let rpath = base.path().join(format!("rebuild-{n}"));
         wipe(&rpath)?;
         let rdb = Db::open(&rpath)?;
+        let rroot = Bench::root();
         let t = Instant::now();
-        load_maps(&rdb, n)?;
-        load_list(&rdb, n)?;
-        let rebuild_ns = t.elapsed().as_nanos();
-        samples.push(Sample {
-            op: "rebuild".into(),
-            n,
-            p50_ns: rebuild_ns as f64,
-            p99_ns: 0.0,
-            unit: "ns total".into(),
-        });
+        let mut batch = rdb.batch();
+        for i in 0..n {
+            batch.push(&rroot.list(), &(i as u64))?;
+            if i % BATCH_ROWS == BATCH_ROWS - 1 {
+                let fresh = rdb.batch();
+                std::mem::replace(&mut batch, fresh)
+                    .commit_with(Durability::DisableWal)?;
+            }
+        }
+        batch.commit_with(Durability::DisableWal)?;
+        let writes: Vec<_> = (0..n)
+            .map(|i| rroot.maps().key(&key(i)).set(&(i as u64)))
+            .collect();
+        apply_all(&rdb, writes, Durability::DisableWal)?;
+        samples.push(total("rebuild", n, "ns total", t.elapsed().as_nanos()));
+
+        // ---- in-memory baselines (same op names, backend "memory") ----
+        memory_baseline(n, leaves, f, &mut samples);
     }
 
     std::fs::create_dir_all(out_dir).map_err(|e| durable::Error::Log(e.to_string()))?;
+    // tag memory samples distinctly (emitted by memory_baseline with backend field)
     let doc = serde_json::json!({
         "backend": BACKEND,
         "backend_version": BACKEND_VERSION,
-        "samples": samples.iter().map(|s| serde_json::json!({
+        "samples": samples.iter().filter(|s| !s.op.starts_with("mem:")).map(|s| serde_json::json!({
             "op": s.op, "n": s.n, "p50_ns": s.p50_ns, "p99_ns": s.p99_ns, "unit": s.unit,
         })).collect::<Vec<_>>(),
     });
     let text = serde_json::to_string_pretty(&doc).map_err(|e| durable::Error::Log(e.to_string()))?;
     std::fs::write(out_dir.join(format!("results-{BACKEND}.json")), text)
         .map_err(|e| durable::Error::Log(e.to_string()))?;
-    println!("[{BACKEND}] wrote results-{BACKEND}.json ({} samples)", samples.len());
+    // memory baselines merge into their own file (identical across backends)
+    let mem = serde_json::json!({
+        "backend": "memory",
+        "backend_version": "std Vec/VecDeque/BTreeMap",
+        "samples": samples.iter().filter(|s| s.op.starts_with("mem:")).map(|s| serde_json::json!({
+            "op": s.op.trim_start_matches("mem:"), "n": s.n, "p50_ns": s.p50_ns, "p99_ns": s.p99_ns, "unit": s.unit,
+        })).collect::<Vec<_>>(),
+    });
+    let text = serde_json::to_string_pretty(&mem).map_err(|e| durable::Error::Log(e.to_string()))?;
+    std::fs::write(out_dir.join("results-memory.json"), text)
+        .map_err(|e| durable::Error::Log(e.to_string()))?;
+    println!(
+        "[{BACKEND}] wrote results-{BACKEND}.json + results-memory.json"
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+fn memory_baseline(n: usize, leaves: usize, f: usize, out: &mut Vec<Sample>) {
+    let mk = |op: &str, n: usize, unit: &str, xs: Vec<u128>| {
+        let mut s = stats(op, n, unit, xs);
+        s.op = format!("mem:{op}");
+        s
+    };
+    let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+
+    // Vec (List baseline)
+    let t = Instant::now();
+    let mut v = Vec::with_capacity(n);
+    for i in 0..n as u64 {
+        v.push(i);
+    }
+    out.push({
+        let mut s = total("mem:list_push_batch", n, "ns/op", t.elapsed().as_nanos());
+        s.p50_ns /= n as f64;
+        s
+    });
+    let mut lat = Vec::with_capacity(GET_SAMPLES);
+    for _ in 0..GET_SAMPLES {
+        let i = (rng.next() % n as u64) as usize;
+        let t = Instant::now();
+        std::hint::black_box(v[i]);
+        lat.push(t.elapsed().as_nanos());
+    }
+    out.push(mk("list_get", n, "ns", lat));
+    let t = Instant::now();
+    let mut acc = 0u64;
+    for x in &v {
+        acc = acc.wrapping_add(*x);
+    }
+    std::hint::black_box(acc);
+    out.push(total("mem:list_iter", n, "ns total", t.elapsed().as_nanos()));
+    let mut lat = Vec::with_capacity(POP_REPS);
+    for _ in 0..POP_REPS {
+        let t = Instant::now();
+        std::hint::black_box(v.pop());
+        lat.push(t.elapsed().as_nanos());
+    }
+    out.push(mk("list_pop", n, "ns", lat));
+
+    // VecDeque (Deque baseline)
+    let t = Instant::now();
+    let mut vd: VecDeque<u64> = VecDeque::with_capacity(2 * n);
+    for i in 0..n as u64 {
+        vd.push_back(i);
+        vd.push_front(i);
+    }
+    out.push({
+        let mut s = total("mem:deque_push_batch", n, "ns/op", t.elapsed().as_nanos());
+        s.p50_ns /= (2 * n) as f64;
+        s
+    });
+    let t = Instant::now();
+    let mut acc = 0u64;
+    for x in &vd {
+        acc = acc.wrapping_add(*x);
+    }
+    std::hint::black_box(acc);
+    out.push(total("mem:deque_iter", n, "ns total", t.elapsed().as_nanos()));
+    let mut lat = Vec::with_capacity(DEQUE_POP_REPS);
+    for _ in 0..DEQUE_POP_REPS {
+        let t = Instant::now();
+        std::hint::black_box(vd.pop_front());
+        lat.push(t.elapsed().as_nanos());
+    }
+    out.push(mk("deque_pop_front", n, "ns", lat));
+    let mut lat = Vec::with_capacity(DEQUE_POP_REPS);
+    for _ in 0..DEQUE_POP_REPS {
+        let t = Instant::now();
+        std::hint::black_box(vd.pop_back());
+        lat.push(t.elapsed().as_nanos());
+    }
+    out.push(mk("deque_pop_back", n, "ns", lat));
+
+    // BTreeMap (Map baseline)
+    let t = Instant::now();
+    let mut m: BTreeMap<String, u64> = BTreeMap::new();
+    for i in 0..n {
+        m.insert(key(i), i as u64);
+    }
+    out.push({
+        let mut s = total("mem:map_put_batch", n, "ns/op", t.elapsed().as_nanos());
+        s.p50_ns /= n as f64;
+        s
+    });
+    let mut lat = Vec::with_capacity(GET_SAMPLES);
+    for _ in 0..GET_SAMPLES {
+        let k = key((rng.next() % n as u64) as usize);
+        let t = Instant::now();
+        std::hint::black_box(m.get(&k));
+        lat.push(t.elapsed().as_nanos());
+    }
+    out.push(mk("map_get", n, "ns", lat));
+    let t = Instant::now();
+    let mut acc = 0u64;
+    for (_, val) in &m {
+        acc = acc.wrapping_add(*val);
+    }
+    std::hint::black_box(acc);
+    out.push(total("mem:map_iter", n, "ns total", t.elapsed().as_nanos()));
+    let t = Instant::now();
+    let ks: Vec<String> = m.keys().cloned().collect();
+    std::hint::black_box(&ks);
+    out.push(total("mem:map_keys", n, "ns total", t.elapsed().as_nanos()));
+    let t = Instant::now();
+    m.clear();
+    out.push(total("mem:map_clear", n, "ns total", t.elapsed().as_nanos()));
+
+    // nested BTreeMaps (3-deep baseline)
+    let t = Instant::now();
+    let mut nm: BTreeMap<String, BTreeMap<String, BTreeMap<String, u64>>> = BTreeMap::new();
+    for a in 0..f {
+        for b in 0..f {
+            for c in 0..f {
+                nm.entry(format!("a{a:04}"))
+                    .or_default()
+                    .entry(format!("b{b:04}"))
+                    .or_default()
+                    .insert(format!("c{c:04}"), (a * f * f + b * f + c) as u64);
+            }
+        }
+    }
+    out.push({
+        let mut s = total("mem:nested_put_batch", leaves, "ns/op", t.elapsed().as_nanos());
+        s.p50_ns /= leaves as f64;
+        s
+    });
+    let mut lat = Vec::with_capacity(1000);
+    for _ in 0..1000 {
+        let (a, b, c) = (
+            (rng.next() % f as u64) as usize,
+            (rng.next() % f as u64) as usize,
+            (rng.next() % f as u64) as usize,
+        );
+        let t = Instant::now();
+        std::hint::black_box(
+            nm.get(&format!("a{a:04}"))
+                .and_then(|x| x.get(&format!("b{b:04}")))
+                .and_then(|x| x.get(&format!("c{c:04}"))),
+        );
+        lat.push(t.elapsed().as_nanos());
+    }
+    out.push(mk("nested_get_deep", leaves, "ns", lat));
+    let t = Instant::now();
+    let l1: Vec<String> = nm.keys().cloned().collect();
+    std::hint::black_box(&l1);
+    out.push(total(
+        "mem:nested_keys_l1",
+        leaves,
+        "ns total",
+        t.elapsed().as_nanos(),
+    ));
+    let t = Instant::now();
+    let mut deep = 0u64;
+    for (_, l2) in &nm {
+        for (_, l3) in l2 {
+            // Visit every leaf like the durable walk decodes every value.
+            for v in l3.values() {
+                deep = deep.wrapping_add(*v);
+            }
+        }
+    }
+    std::hint::black_box(deep);
+    out.push(total(
+        "mem:nested_scan_deep",
+        leaves,
+        "ns total",
+        t.elapsed().as_nanos(),
+    ));
+
+    // Vec<Rec> (record list baseline)
+    let t = Instant::now();
+    let vr: Vec<Rec> = (0..n).map(rec).collect();
+    out.push({
+        let mut s = total("mem:record_put_batch", n, "ns/op", t.elapsed().as_nanos());
+        s.p50_ns /= n as f64;
+        s
+    });
+    let t = Instant::now();
+    let mut acc = 0u64;
+    for r in &vr {
+        acc = acc.wrapping_add(r.id + r.name.len() as u64 + r.active as u64);
+    }
+    std::hint::black_box(acc);
+    out.push(total("mem:record_scan", n, "ns total", t.elapsed().as_nanos()));
+}
+
+fn wipe(path: &Path) -> durable::Result<()> {
+    if path.exists() {
+        std::fs::remove_dir_all(path).map_err(|e| durable::Error::Log(e.to_string()))?;
+    }
+    std::fs::create_dir_all(path).map_err(|e| durable::Error::Log(e.to_string()))?;
     Ok(())
 }
 
@@ -359,11 +669,14 @@ fn fmt_n(n: f64) -> String {
     }
 }
 
-const COLORS: [(&str, &str); 3] = [
+const COLORS: [(&str, &str); 4] = [
     ("rocksdb", "#f0883e"),
     ("redb", "#58a6ff"),
     ("sled", "#3fb950"),
+    ("memory", "#d29922"),
 ];
+
+const ORDER: [&str; 4] = ["rocksdb", "redb", "sled", "memory"];
 
 fn color_of(backend: &str) -> &str {
     COLORS
@@ -572,11 +885,20 @@ fn chart_svg(
     s
 }
 
+fn chart(op: &str, title: &str, y: &str, metric: &str, guide: Option<&str>) -> ChartDef {
+    ChartDef {
+        op: op.into(),
+        title: title.into(),
+        y_label: y.into(),
+        metric: metric.into(),
+        guide: guide.map(str::to_string),
+    }
+}
+
 fn render(out_dir: &Path) -> durable::Result<()> {
     let err = |e: std::io::Error| durable::Error::Log(e.to_string());
     let mut backends: HashMap<String, Vec<Sample>> = HashMap::new();
     let mut versions: HashMap<String, String> = HashMap::new();
-    let mut order: Vec<String> = vec![];
     let mut entries: Vec<PathBuf> = std::fs::read_dir(out_dir)
         .map_err(err)?
         .filter_map(|e| e.ok().map(|e| e.path()))
@@ -603,7 +925,6 @@ fn render(out_dir: &Path) -> durable::Result<()> {
                 unit: v["unit"].as_str().unwrap_or("").into(),
             });
         }
-        order.push(backend.clone());
         backends.insert(backend.clone(), ss);
         versions.insert(
             backend,
@@ -616,64 +937,160 @@ fn render(out_dir: &Path) -> durable::Result<()> {
             out_dir.display()
         )));
     }
+    let order: Vec<String> = ORDER
+        .iter()
+        .map(|s| s.to_string())
+        .filter(|b| backends.contains_key(b))
+        .collect();
 
+    // (op, title, y-label, metric, guide)
     let charts = [
-        ChartDef {
-            op: "append_single_syncwal".into(),
-            title: "Single SyncWal append latency vs N".into(),
-            y_label: "commit latency".into(),
-            metric: "p50_ns".into(),
-            guide: Some("flat".into()),
-        },
-        ChartDef {
-            op: "batch_commit_syncwal".into(),
-            title: "10k-row SyncWal group commit: cost per row vs N".into(),
-            y_label: "ns / row".into(),
-            metric: "p50_ns".into(),
-            guide: Some("flat".into()),
-        },
-        ChartDef {
-            op: "point_get_cold".into(),
-            title: "Cold point-get latency vs N".into(),
-            y_label: "get latency".into(),
-            metric: "p50_ns".into(),
-            guide: Some("flat".into()),
-        },
-        ChartDef {
-            op: "point_get_cold".into(),
-            title: "Cold point-get p99 vs N".into(),
-            y_label: "get latency".into(),
-            metric: "p99_ns".into(),
-            guide: Some("flat".into()),
-        },
-        ChartDef {
-            op: "scan_full".into(),
-            title: "Full prefix scan time vs N".into(),
-            y_label: "total scan time".into(),
-            metric: "p50_ns".into(),
-            guide: Some("linear".into()),
-        },
-        ChartDef {
-            op: "sum_add".into(),
-            title: "Sum accumulator add cost vs N merges".into(),
-            y_label: "ns / add".into(),
-            metric: "p50_ns".into(),
-            guide: Some("flat".into()),
-        },
-        ChartDef {
-            op: "sum_read_pressure".into(),
-            title: "Sum read latency after N blind merges".into(),
-            y_label: "read latency".into(),
-            metric: "p50_ns".into(),
-            guide: None,
-        },
-        ChartDef {
-            op: "rebuild".into(),
-            title: "Projection rebuild (wipe + replay) vs N".into(),
-            y_label: "total rebuild time".into(),
-            metric: "p50_ns".into(),
-            guide: Some("linear".into()),
-        },
+        // List vs Vec
+        chart(
+            "list_push_batch",
+            "List push_back, batched: cost per push vs N",
+            "ns / push",
+            "p50_ns",
+            Some("flat"),
+        ),
+        chart(
+            "list_push_single",
+            "List push, single SyncWal commit",
+            "commit latency",
+            "p50_ns",
+            Some("flat"),
+        ),
+        chart(
+            "list_get",
+            "List get(i), cold",
+            "get latency",
+            "p50_ns",
+            Some("flat"),
+        ),
+        chart(
+            "list_iter",
+            "List full iteration time vs N",
+            "total time",
+            "p50_ns",
+            Some("linear"),
+        ),
+        chart(
+            "list_pop",
+            "List pop_back latency",
+            "pop latency",
+            "p50_ns",
+            Some("flat"),
+        ),
+        // Deque vs VecDeque
+        chart(
+            "deque_push_batch",
+            "Deque push (back+front), batched: cost per push vs N",
+            "ns / push",
+            "p50_ns",
+            Some("flat"),
+        ),
+        chart(
+            "deque_pop_front",
+            "Deque pop_front latency",
+            "pop latency",
+            "p50_ns",
+            Some("flat"),
+        ),
+        chart(
+            "deque_pop_back",
+            "Deque pop_back latency",
+            "pop latency",
+            "p50_ns",
+            Some("flat"),
+        ),
+        chart(
+            "deque_iter",
+            "Deque full iteration time vs N",
+            "total time",
+            "p50_ns",
+            Some("linear"),
+        ),
+        // Map vs BTreeMap
+        chart(
+            "map_put_batch",
+            "Map put, batched: cost per put vs N",
+            "ns / put",
+            "p50_ns",
+            Some("flat"),
+        ),
+        chart(
+            "map_get",
+            "Map get, cold",
+            "get latency",
+            "p50_ns",
+            Some("flat"),
+        ),
+        chart(
+            "map_iter",
+            "Map full iteration time vs N",
+            "total time",
+            "p50_ns",
+            Some("linear"),
+        ),
+        chart(
+            "map_keys",
+            "Map keys() scan time vs N",
+            "total time",
+            "p50_ns",
+            Some("linear"),
+        ),
+        chart(
+            "map_clear",
+            "Map clear() (whole-subtree delete) vs N",
+            "total time",
+            "p50_ns",
+            None,
+        ),
+        // Nested maps vs nested BTreeMaps
+        chart(
+            "nested_put_batch",
+            "3-deep map put, batched: cost per leaf vs leaves",
+            "ns / leaf",
+            "p50_ns",
+            Some("flat"),
+        ),
+        chart(
+            "nested_get_deep",
+            "3-deep map get at depth, cold",
+            "get latency",
+            "p50_ns",
+            Some("flat"),
+        ),
+        chart(
+            "nested_keys_l1",
+            "3-deep map level-1 keys() vs leaves",
+            "total time",
+            "p50_ns",
+            Some("linear"),
+        ),
+        chart(
+            "nested_scan_deep",
+            "3-deep map full recursive scan vs leaves",
+            "total time",
+            "p50_ns",
+            Some("linear"),
+        ),
+        // Records
+        chart(
+            "record_scan",
+            "List<Record> full scan vs N (O(N·F) vs O(N))",
+            "total time",
+            "p50_ns",
+            Some("linear"),
+        ),
+        // Rebuild
+        chart(
+            "rebuild",
+            "Projection rebuild (wipe + replay) vs N",
+            "total time",
+            "p50_ns",
+            Some("linear"),
+        ),
     ];
 
     let mut html = String::new();
@@ -682,11 +1099,12 @@ fn render(out_dir: &Path) -> durable::Result<()> {
          <title>durable backend benchmarks</title></head>\
          <body style=\"background:#0d1117;color:#e6edf3;font-family:sans-serif;\
          max-width:900px;margin:0 auto;padding:24px\">\
-         <h1>durable storage backends — BigO comparison</h1>",
+         <h1>durable structures on disk vs in memory</h1>",
     );
     html.push_str(
         "<p style=\"color:#8b949e\">Same workloads, same machine, sequential runs. \
          Log–log axes: O(1) is flat, O(N) follows the dashed slope-1 guide. \
+         <b>memory</b> is std Vec/VecDeque/BTreeMap measured in-process. \
          Medians over repeated samples; read phases run after a cold reopen. \
          Datasets top out at 1M rows (below the &gt;&gt;RAM ideal in \
          docs/bench-bigO.txt — slopes, not constants, are the claim.</p>",
@@ -725,15 +1143,20 @@ fn render(out_dir: &Path) -> durable::Result<()> {
                     .get(b)
                     .and_then(|ss| ss.iter().find(|s| s.op == def.op && s.n == n))
                     .map(|s| {
+                        let (a, b_) = if def.metric == "p99_ns" {
+                            (s.p99_ns, s.p99_ns)
+                        } else {
+                            (s.p50_ns, s.p99_ns)
+                        };
+                        let p99 = if s.p99_ns > 0.0 {
+                            fmt_time(b_)
+                        } else {
+                            "—".into()
+                        };
                         format!(
                             "<td style=\"text-align:right;padding:4px 12px\">{}</td>\
-                             <td style=\"text-align:right;padding:4px 12px;color:#8b949e\">{}</td>",
-                            fmt_time(if def.metric == "p99_ns" {
-                                s.p99_ns
-                            } else {
-                                s.p50_ns
-                            }),
-                            fmt_time(s.p99_ns)
+                             <td style=\"text-align:right;padding:4px 12px;color:#8b949e\">{p99}</td>",
+                            fmt_time(a)
                         )
                     })
                     .unwrap_or("<td></td><td></td>".into());
@@ -745,10 +1168,12 @@ fn render(out_dir: &Path) -> durable::Result<()> {
     }
     html.push_str(
         "<h2>Notes</h2><ul style=\"color:#8b949e\">\
-         <li>rocksdb: blind Sum merges fold at compaction; reads slow under merge pressure.</li>\
-         <li>redb: merges fold read-modify-write in the commit txn; reads stay flat.</li>\
-         <li>sled: merges lower to put/delete against a commit overlay; reads stay flat.</li>\
-         <li>SyncWal fsyncs per commit on rocksdb/redb; sled flush()es.</li>",
+         <li>List/Deque/Map/Nested/Record reads and writes go through the same \
+         key codec on every backend; only the storage engine differs.</li>\
+         <li>SyncWal single commits pay the fsync floor; batched DisableWal \
+         commits amortize it.</li>\
+         <li>map_clear is a range tombstone on rocksdb, key expansion on \
+         redb/sled — watch the shapes diverge.</li>",
     );
     for b in &order {
         let ver = versions.get(b).map(String::as_str).unwrap_or("?");

@@ -27,7 +27,7 @@
 
 use std::path::Path as FsPath;
 
-use super::{schema, Durability, Error, Result};
+use super::{codec, schema, Durability, Error, Result};
 
 /// One committed point operation, in arrival order as recorded by [`Batch`](super::Batch).
 ///
@@ -136,7 +136,13 @@ impl Store {
     }
 
     /// Forward scan starting at the first key `>= from`.
+    ///
+    /// Every caller scans a key *prefix*, so the scan is bounded above by
+    /// that prefix's upper bound. Unbounded tail scans would turn each
+    /// nested lookup into a full-table read (quadratic deep scans); the
+    /// callers' prefix-`break` stays as a safety net.
     pub(crate) fn iter_from(&self, from: &[u8]) -> Result<StoreIter<'_>> {
+        let end = codec::prefix_upper_bound(from);
         match self {
             #[cfg(feature = "backend-rocksdb")]
             Store::Rocksdb(db) => Ok(StoreIter::Rocksdb(db.iterator(
@@ -144,12 +150,12 @@ impl Store {
             ))),
             #[cfg(feature = "backend-redb")]
             Store::Redb(db) => Ok(StoreIter::Redb(
-                redb_be::scan(db, Some(from))?.into_iter(),
+                redb_be::scan(db, Some(from), end.as_deref())?.into_iter(),
                 std::marker::PhantomData,
             )),
             #[cfg(feature = "backend-sled")]
             Store::Sled(db) => Ok(StoreIter::Sled(
-                sled_be::scan(db, Some(from))?.into_iter(),
+                sled_be::scan(db, Some(from), end.as_deref())?.into_iter(),
                 std::marker::PhantomData,
             )),
         }
@@ -164,12 +170,12 @@ impl Store {
             )),
             #[cfg(feature = "backend-redb")]
             Store::Redb(db) => Ok(StoreIter::Redb(
-                redb_be::scan(db, None)?.into_iter(),
+                redb_be::scan(db, None, None)?.into_iter(),
                 std::marker::PhantomData,
             )),
             #[cfg(feature = "backend-sled")]
             Store::Sled(db) => Ok(StoreIter::Sled(
-                sled_be::scan(db, None)?.into_iter(),
+                sled_be::scan(db, None, None)?.into_iter(),
                 std::marker::PhantomData,
             )),
         }
@@ -255,29 +261,26 @@ mod redb_be {
     }
 
     /// Snapshot-consistent scan: materialized under one read transaction.
-    /// `from == None` scans the whole keyspace.
+    /// `from == None` scans the whole keyspace; otherwise the scan covers
+    /// `[from, end)` (`end == None` runs to the end of the keyspace).
     pub(super) fn scan(
         db: &redb::Database,
         from: Option<&[u8]>,
+        end: Option<&[u8]>,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let txn = db.begin_read().map_err(store_err)?;
         let table = txn.open_table(TABLE).map_err(store_err)?;
         let mut out = Vec::new();
-        match from {
-            Some(start) => {
-                let range = table.range(start..).map_err(store_err)?;
-                for item in range {
-                    let (k, v) = item.map_err(store_err)?;
-                    out.push((k.value().to_vec(), v.value().to_vec()));
-                }
-            }
-            None => {
-                let range = table.range::<&[u8]>(..).map_err(store_err)?;
-                for item in range {
-                    let (k, v) = item.map_err(store_err)?;
-                    out.push((k.value().to_vec(), v.value().to_vec()));
-                }
-            }
+        let range = match (from, end) {
+            (Some(start), Some(end)) => table
+                .range(start..end)
+                .map_err(store_err)?,
+            (Some(start), None) => table.range(start..).map_err(store_err)?,
+            (None, _) => table.range::<&[u8]>(..).map_err(store_err)?,
+        };
+        for item in range {
+            let (k, v) = item.map_err(store_err)?;
+            out.push((k.value().to_vec(), v.value().to_vec()));
         }
         Ok(out)
     }
@@ -382,22 +385,23 @@ mod sled_be {
         Ok(db.get(key).map_err(store_err)?.map(|v| v.to_vec()))
     }
 
-    /// Eagerly materialized scan. `from == None` scans the whole keyspace.
-    pub(super) fn scan(db: &sled::Db, from: Option<&[u8]>) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    /// Eagerly materialized scan. `from == None` scans the whole keyspace;
+    /// otherwise the scan covers `[from, end)` (`end == None` runs to the
+    /// end of the keyspace).
+    pub(super) fn scan(
+        db: &sled::Db,
+        from: Option<&[u8]>,
+        end: Option<&[u8]>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let mut out = Vec::new();
-        match from {
-            Some(start) => {
-                for item in db.range(start..) {
-                    let (k, v) = item.map_err(store_err)?;
-                    out.push((k.to_vec(), v.to_vec()));
-                }
-            }
-            None => {
-                for item in db.iter() {
-                    let (k, v) = item.map_err(store_err)?;
-                    out.push((k.to_vec(), v.to_vec()));
-                }
-            }
+        let range = match (from, end) {
+            (Some(start), Some(end)) => db.range(start..end),
+            (Some(start), None) => db.range(start..),
+            (None, _) => db.range::<&[u8], _>(..),
+        };
+        for item in range {
+            let (k, v) = item.map_err(store_err)?;
+            out.push((k.to_vec(), v.to_vec()));
         }
         Ok(out)
     }
