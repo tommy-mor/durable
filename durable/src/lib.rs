@@ -395,6 +395,12 @@ impl Batch {
     }
 
     /// Commit the batch with an explicit durability policy.
+    ///
+    /// Resolution is three-phase, in this order: blind point writes (in
+    /// arrival order), prefix-delete expansion, resolved collection
+    /// appends. In particular a [`Op::DeletePrefix`] in the batch removes
+    /// keys put in the same batch no matter where it sits — every backend
+    /// implements this same order.
     pub fn commit_with(mut self, durability: Durability) -> Result<()> {
         // Resolution order matches the old single-WriteBatch layout: point
         // ops first (arrival order), then prefix-delete expansion, then

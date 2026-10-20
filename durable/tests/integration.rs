@@ -212,6 +212,32 @@ fn map_clear_deletes_subtree_only() {
 }
 
 #[test]
+fn map_clear_in_same_batch_as_puts_covers_staged_writes() {
+    // Batch commit order is three-phase (point writes, then prefix
+    // deletes, then resolved appends), so a DeletePrefix in the batch
+    // removes keys put in the same batch no matter where it sits.
+    // Every backend must agree on this — it is long-standing behavior,
+    // not a backend quirk.
+    let (_dir, db) = open();
+    let nodes = Store::root().nodes();
+
+    // Puts staged BEFORE the clear are removed.
+    let mut batch = db.batch();
+    batch.write(nodes.key(&"a".to_string()).set(&"A".to_string()));
+    batch.write(nodes.key(&"b".to_string()).set(&"B".to_string()));
+    batch.write(nodes.clear());
+    batch.commit().unwrap();
+    assert!(nodes.is_empty(&db).unwrap());
+
+    // Puts staged AFTER the clear are removed too.
+    let mut batch = db.batch();
+    batch.write(nodes.clear());
+    batch.write(nodes.key(&"c".to_string()).set(&"C".to_string()));
+    batch.commit().unwrap();
+    assert!(nodes.is_empty(&db).unwrap());
+}
+
+#[test]
 fn transform_values_decays_all_edges_in_one_batch() {
     let (_dir, db) = open();
     let edges = Store::root().scopes().key(&"rust".to_string()).edges();
