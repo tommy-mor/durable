@@ -1,17 +1,21 @@
 //! # durable
 //!
-//! Event-sourced application state: a typed reducer writes a RocksDB
+//! Event-sourced application state: a typed reducer writes a storage-backend
 //! projection; a serializable query language reads it. Clients append events
 //! and issue queries. They do not mutate indexes.
 //!
 //! The projection itself is still deeply nested, precisely updatable
-//! RocksDB-backed data, built around **paths as data**.
+//! disk-backed data, built around **paths as data**.
 //!
 //! Instead of serializing a big struct into one blob, you describe your data with
 //! a *schema* of composable types — [`Leaf`], [`Map`], [`List`], [`Deque`],
 //! [`Sum`], and your own `#[derive(Durable)]` structs — and address any location
-//! with a typed [`Path`]. A path lowers to a deterministic RocksDB key with no
+//! with a typed [`Path`]. A path lowers to a deterministic storage key with no
 //! I/O, so a mutation touches exactly the keys it names and nothing else.
+//!
+//! The backend is a compile-time choice (`backend-rocksdb` by default,
+//! `backend-redb` / `backend-sled` for pure-Rust engines with no C++
+//! toolchain); see [`store`] for the contract each engine implements.
 //!
 //! Terminal operations on a path return reified [`Write`] values (not side
 //! effects). Compose several into one atomic [`Batch`] and commit them with an

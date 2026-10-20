@@ -27,7 +27,9 @@
 
 use std::path::Path as FsPath;
 
-use super::{codec, schema, Durability, Error, Result};
+#[cfg(any(feature = "backend-redb", feature = "backend-sled"))]
+use super::codec;
+use super::{schema, Durability, Error, Result};
 
 /// One committed point operation, in arrival order as recorded by [`Batch`](super::Batch).
 ///
@@ -142,6 +144,7 @@ impl Store {
     /// nested lookup into a full-table read (quadratic deep scans); the
     /// callers' prefix-`break` stays as a safety net.
     pub(crate) fn iter_from(&self, from: &[u8]) -> Result<StoreIter<'_>> {
+        #[cfg(any(feature = "backend-redb", feature = "backend-sled"))]
         let end = codec::prefix_upper_bound(from);
         match self {
             #[cfg(feature = "backend-rocksdb")]
@@ -237,6 +240,7 @@ impl Store {
 }
 
 /// Map any displayable backend error into [`Error::Store`].
+#[cfg(any(feature = "backend-redb", feature = "backend-sled"))]
 fn store_err<E: std::fmt::Display>(e: E) -> Error {
     Error::Store(e.to_string())
 }
