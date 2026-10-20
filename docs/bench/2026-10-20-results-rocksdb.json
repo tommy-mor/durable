@@ -1,0 +1,594 @@
+{
+  "backend": "rocksdb",
+  "backend_version": "rocksdb 0.25.0 (RocksDB 11.8.1)",
+  "samples": [
+    {
+      "n": 1000,
+      "op": "list_push_batch",
+      "p50_ns": 3413.525,
+      "p99_ns": 0.0,
+      "unit": "ns/op"
+    },
+    {
+      "n": 1000,
+      "op": "deque_push_batch",
+      "p50_ns": 5191.537,
+      "p99_ns": 0.0,
+      "unit": "ns/op"
+    },
+    {
+      "n": 1000,
+      "op": "map_put_batch",
+      "p50_ns": 3546.507,
+      "p99_ns": 0.0,
+      "unit": "ns/op"
+    },
+    {
+      "n": 1000,
+      "op": "record_put_batch",
+      "p50_ns": 4452.745,
+      "p99_ns": 0.0,
+      "unit": "ns/op"
+    },
+    {
+      "n": 1000,
+      "op": "nested_put_batch",
+      "p50_ns": 4587.432,
+      "p99_ns": 0.0,
+      "unit": "ns/op"
+    },
+    {
+      "n": 1000,
+      "op": "list_push_single",
+      "p50_ns": 37622.0,
+      "p99_ns": 23496390.0,
+      "unit": "ns/commit"
+    },
+    {
+      "n": 1000,
+      "op": "list_get",
+      "p50_ns": 16641.0,
+      "p99_ns": 21661.0,
+      "unit": "ns"
+    },
+    {
+      "n": 1000,
+      "op": "map_get",
+      "p50_ns": 9518.0,
+      "p99_ns": 14167.0,
+      "unit": "ns"
+    },
+    {
+      "n": 1000,
+      "op": "nested_get_deep",
+      "p50_ns": 10830.0,
+      "p99_ns": 16732.0,
+      "unit": "ns"
+    },
+    {
+      "n": 1000,
+      "op": "list_iter",
+      "p50_ns": 8670721.0,
+      "p99_ns": 0.0,
+      "unit": "ns total"
+    },
+    {
+      "n": 1000,
+      "op": "deque_iter",
+      "p50_ns": 17561392.0,
+      "p99_ns": 0.0,
+      "unit": "ns total"
+    },
+    {
+      "n": 1000,
+      "op": "map_iter",
+      "p50_ns": 2527316.0,
+      "p99_ns": 0.0,
+      "unit": "ns total"
+    },
+    {
+      "n": 1000,
+      "op": "map_keys",
+      "p50_ns": 2361089.0,
+      "p99_ns": 0.0,
+      "unit": "ns total"
+    },
+    {
+      "n": 1000,
+      "op": "nested_keys_l1",
+      "p50_ns": 1565252.0,
+      "p99_ns": 0.0,
+      "unit": "ns total"
+    },
+    {
+      "n": 1000,
+      "op": "nested_scan_deep",
+      "p50_ns": 8741877.0,
+      "p99_ns": 0.0,
+      "unit": "ns total"
+    },
+    {
+      "n": 1000,
+      "op": "record_scan",
+      "p50_ns": 11154254.0,
+      "p99_ns": 0.0,
+      "unit": "ns total"
+    },
+    {
+      "n": 1000,
+      "op": "list_pop",
+      "p50_ns": 51849.0,
+      "p99_ns": 67679.0,
+      "unit": "ns"
+    },
+    {
+      "n": 1000,
+      "op": "deque_pop_front",
+      "p50_ns": 68731.0,
+      "p99_ns": 83830.0,
+      "unit": "ns"
+    },
+    {
+      "n": 1000,
+      "op": "deque_pop_back",
+      "p50_ns": 59774.0,
+      "p99_ns": 74382.0,
+      "unit": "ns"
+    },
+    {
+      "n": 1000,
+      "op": "map_clear",
+      "p50_ns": 30548.0,
+      "p99_ns": 0.0,
+      "unit": "ns total"
+    },
+    {
+      "n": 1000,
+      "op": "rebuild",
+      "p50_ns": 6817540.0,
+      "p99_ns": 0.0,
+      "unit": "ns total"
+    },
+    {
+      "n": 10000,
+      "op": "list_push_batch",
+      "p50_ns": 3246.2986,
+      "p99_ns": 0.0,
+      "unit": "ns/op"
+    },
+    {
+      "n": 10000,
+      "op": "deque_push_batch",
+      "p50_ns": 4369.03835,
+      "p99_ns": 0.0,
+      "unit": "ns/op"
+    },
+    {
+      "n": 10000,
+      "op": "map_put_batch",
+      "p50_ns": 3503.8784,
+      "p99_ns": 0.0,
+      "unit": "ns/op"
+    },
+    {
+      "n": 10000,
+      "op": "record_put_batch",
+      "p50_ns": 4277.5024,
+      "p99_ns": 0.0,
+      "unit": "ns/op"
+    },
+    {
+      "n": 10648,
+      "op": "nested_put_batch",
+      "p50_ns": 4481.966942148761,
+      "p99_ns": 0.0,
+      "unit": "ns/op"
+    },
+    {
+      "n": 10000,
+      "op": "list_push_single",
+      "p50_ns": 37191.0,
+      "p99_ns": 22671309.0,
+      "unit": "ns/commit"
+    },
+    {
+      "n": 10000,
+      "op": "list_get",
+      "p50_ns": 17242.0,
+      "p99_ns": 29276.0,
+      "unit": "ns"
+    },
+    {
+      "n": 10000,
+      "op": "map_get",
+      "p50_ns": 9969.0,
+      "p99_ns": 22713.0,
+      "unit": "ns"
+    },
+    {
+      "n": 10648,
+      "op": "nested_get_deep",
+      "p50_ns": 11162.0,
+      "p99_ns": 24446.0,
+      "unit": "ns"
+    },
+    {
+      "n": 10000,
+      "op": "list_iter",
+      "p50_ns": 89979399.0,
+      "p99_ns": 0.0,
+      "unit": "ns total"
+    },
+    {
+      "n": 10000,
+      "op": "deque_iter",
+      "p50_ns": 185773907.0,
+      "p99_ns": 0.0,
+      "unit": "ns total"
+    },
+    {
+      "n": 10000,
+      "op": "map_iter",
+      "p50_ns": 24846864.0,
+      "p99_ns": 0.0,
+      "unit": "ns total"
+    },
+    {
+      "n": 10000,
+      "op": "map_keys",
+      "p50_ns": 23447697.0,
+      "p99_ns": 0.0,
+      "unit": "ns total"
+    },
+    {
+      "n": 10648,
+      "op": "nested_keys_l1",
+      "p50_ns": 16073116.0,
+      "p99_ns": 0.0,
+      "unit": "ns total"
+    },
+    {
+      "n": 10648,
+      "op": "nested_scan_deep",
+      "p50_ns": 73395500.0,
+      "p99_ns": 0.0,
+      "unit": "ns total"
+    },
+    {
+      "n": 10000,
+      "op": "record_scan",
+      "p50_ns": 117866305.0,
+      "p99_ns": 0.0,
+      "unit": "ns total"
+    },
+    {
+      "n": 10000,
+      "op": "list_pop",
+      "p50_ns": 52210.0,
+      "p99_ns": 73170.0,
+      "unit": "ns"
+    },
+    {
+      "n": 10000,
+      "op": "deque_pop_front",
+      "p50_ns": 71196.0,
+      "p99_ns": 86034.0,
+      "unit": "ns"
+    },
+    {
+      "n": 10000,
+      "op": "deque_pop_back",
+      "p50_ns": 63000.0,
+      "p99_ns": 83689.0,
+      "unit": "ns"
+    },
+    {
+      "n": 10000,
+      "op": "map_clear",
+      "p50_ns": 32011.0,
+      "p99_ns": 0.0,
+      "unit": "ns total"
+    },
+    {
+      "n": 10000,
+      "op": "rebuild",
+      "p50_ns": 65669948.0,
+      "p99_ns": 0.0,
+      "unit": "ns total"
+    },
+    {
+      "n": 100000,
+      "op": "list_push_batch",
+      "p50_ns": 3132.20476,
+      "p99_ns": 0.0,
+      "unit": "ns/op"
+    },
+    {
+      "n": 100000,
+      "op": "deque_push_batch",
+      "p50_ns": 4485.37993,
+      "p99_ns": 0.0,
+      "unit": "ns/op"
+    },
+    {
+      "n": 100000,
+      "op": "map_put_batch",
+      "p50_ns": 3375.01481,
+      "p99_ns": 0.0,
+      "unit": "ns/op"
+    },
+    {
+      "n": 100000,
+      "op": "record_put_batch",
+      "p50_ns": 4298.49363,
+      "p99_ns": 0.0,
+      "unit": "ns/op"
+    },
+    {
+      "n": 103823,
+      "op": "nested_put_batch",
+      "p50_ns": 4477.2566579659615,
+      "p99_ns": 0.0,
+      "unit": "ns/op"
+    },
+    {
+      "n": 100000,
+      "op": "list_push_single",
+      "p50_ns": 38864.0,
+      "p99_ns": 22596816.0,
+      "unit": "ns/commit"
+    },
+    {
+      "n": 100000,
+      "op": "list_get",
+      "p50_ns": 17864.0,
+      "p99_ns": 34205.0,
+      "unit": "ns"
+    },
+    {
+      "n": 100000,
+      "op": "map_get",
+      "p50_ns": 10480.0,
+      "p99_ns": 33824.0,
+      "unit": "ns"
+    },
+    {
+      "n": 103823,
+      "op": "nested_get_deep",
+      "p50_ns": 12694.0,
+      "p99_ns": 29035.0,
+      "unit": "ns"
+    },
+    {
+      "n": 100000,
+      "op": "list_iter",
+      "p50_ns": 922316697.0,
+      "p99_ns": 0.0,
+      "unit": "ns total"
+    },
+    {
+      "n": 100000,
+      "op": "deque_iter",
+      "p50_ns": 1868702031.0,
+      "p99_ns": 0.0,
+      "unit": "ns total"
+    },
+    {
+      "n": 100000,
+      "op": "map_iter",
+      "p50_ns": 247880624.0,
+      "p99_ns": 0.0,
+      "unit": "ns total"
+    },
+    {
+      "n": 100000,
+      "op": "map_keys",
+      "p50_ns": 234796274.0,
+      "p99_ns": 0.0,
+      "unit": "ns total"
+    },
+    {
+      "n": 103823,
+      "op": "nested_keys_l1",
+      "p50_ns": 157831013.0,
+      "p99_ns": 0.0,
+      "unit": "ns total"
+    },
+    {
+      "n": 103823,
+      "op": "nested_scan_deep",
+      "p50_ns": 642397541.0,
+      "p99_ns": 0.0,
+      "unit": "ns total"
+    },
+    {
+      "n": 100000,
+      "op": "record_scan",
+      "p50_ns": 1164799051.0,
+      "p99_ns": 0.0,
+      "unit": "ns total"
+    },
+    {
+      "n": 100000,
+      "op": "list_pop",
+      "p50_ns": 51808.0,
+      "p99_ns": 65114.0,
+      "unit": "ns"
+    },
+    {
+      "n": 100000,
+      "op": "deque_pop_front",
+      "p50_ns": 67538.0,
+      "p99_ns": 78409.0,
+      "unit": "ns"
+    },
+    {
+      "n": 100000,
+      "op": "deque_pop_back",
+      "p50_ns": 61006.0,
+      "p99_ns": 77117.0,
+      "unit": "ns"
+    },
+    {
+      "n": 100000,
+      "op": "map_clear",
+      "p50_ns": 33644.0,
+      "p99_ns": 0.0,
+      "unit": "ns total"
+    },
+    {
+      "n": 100000,
+      "op": "rebuild",
+      "p50_ns": 651311224.0,
+      "p99_ns": 0.0,
+      "unit": "ns total"
+    },
+    {
+      "n": 1000000,
+      "op": "list_push_batch",
+      "p50_ns": 3134.878129,
+      "p99_ns": 0.0,
+      "unit": "ns/op"
+    },
+    {
+      "n": 1000000,
+      "op": "deque_push_batch",
+      "p50_ns": 5058.781593,
+      "p99_ns": 0.0,
+      "unit": "ns/op"
+    },
+    {
+      "n": 1000000,
+      "op": "map_put_batch",
+      "p50_ns": 3507.929214,
+      "p99_ns": 0.0,
+      "unit": "ns/op"
+    },
+    {
+      "n": 1000000,
+      "op": "record_put_batch",
+      "p50_ns": 4458.935395,
+      "p99_ns": 0.0,
+      "unit": "ns/op"
+    },
+    {
+      "n": 1000000,
+      "op": "nested_put_batch",
+      "p50_ns": 4689.08592,
+      "p99_ns": 0.0,
+      "unit": "ns/op"
+    },
+    {
+      "n": 1000000,
+      "op": "list_push_single",
+      "p50_ns": 40457.0,
+      "p99_ns": 24580666.0,
+      "unit": "ns/commit"
+    },
+    {
+      "n": 1000000,
+      "op": "list_get",
+      "p50_ns": 37161.0,
+      "p99_ns": 66286.0,
+      "unit": "ns"
+    },
+    {
+      "n": 1000000,
+      "op": "map_get",
+      "p50_ns": 30519.0,
+      "p99_ns": 54464.0,
+      "unit": "ns"
+    },
+    {
+      "n": 1000000,
+      "op": "nested_get_deep",
+      "p50_ns": 32181.0,
+      "p99_ns": 54805.0,
+      "unit": "ns"
+    },
+    {
+      "n": 1000000,
+      "op": "list_iter",
+      "p50_ns": 15799091693.0,
+      "p99_ns": 0.0,
+      "unit": "ns total"
+    },
+    {
+      "n": 1000000,
+      "op": "deque_iter",
+      "p50_ns": 20902795313.0,
+      "p99_ns": 0.0,
+      "unit": "ns total"
+    },
+    {
+      "n": 1000000,
+      "op": "map_iter",
+      "p50_ns": 2583595595.0,
+      "p99_ns": 0.0,
+      "unit": "ns total"
+    },
+    {
+      "n": 1000000,
+      "op": "map_keys",
+      "p50_ns": 2379023329.0,
+      "p99_ns": 0.0,
+      "unit": "ns total"
+    },
+    {
+      "n": 1000000,
+      "op": "nested_keys_l1",
+      "p50_ns": 1564368041.0,
+      "p99_ns": 0.0,
+      "unit": "ns total"
+    },
+    {
+      "n": 1000000,
+      "op": "nested_scan_deep",
+      "p50_ns": 6064197789.0,
+      "p99_ns": 0.0,
+      "unit": "ns total"
+    },
+    {
+      "n": 1000000,
+      "op": "record_scan",
+      "p50_ns": 12582266606.0,
+      "p99_ns": 0.0,
+      "unit": "ns total"
+    },
+    {
+      "n": 1000000,
+      "op": "list_pop",
+      "p50_ns": 56568.0,
+      "p99_ns": 108777.0,
+      "unit": "ns"
+    },
+    {
+      "n": 1000000,
+      "op": "deque_pop_front",
+      "p50_ns": 70294.0,
+      "p99_ns": 131341.0,
+      "unit": "ns"
+    },
+    {
+      "n": 1000000,
+      "op": "deque_pop_back",
+      "p50_ns": 62469.0,
+      "p99_ns": 114127.0,
+      "unit": "ns"
+    },
+    {
+      "n": 1000000,
+      "op": "map_clear",
+      "p50_ns": 33955.0,
+      "p99_ns": 0.0,
+      "unit": "ns total"
+    },
+    {
+      "n": 1000000,
+      "op": "rebuild",
+      "p50_ns": 6868887663.0,
+      "p99_ns": 0.0,
+      "unit": "ns total"
+    }
+  ]
+}

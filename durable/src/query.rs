@@ -305,12 +305,10 @@ pub fn has(db: &Db, schema: &Shape, query: &Query) -> Result<bool> {
 /// Any key at or under this prefix? One seek: the exact key sorts first and
 /// children right after it.
 fn prefix_present(db: &Db, prefix: &[u8]) -> Result<bool> {
-    let mut iter = db
-        .raw()
-        .iterator(rocksdb::IteratorMode::From(prefix, rocksdb::Direction::Forward));
+    let mut iter = db.iter_from(prefix)?;
     match iter.next() {
         Some(Ok((db_key, _))) => Ok(db_key.starts_with(prefix)),
-        Some(Err(e)) => Err(e.into()),
+        Some(Err(e)) => Err(e),
         None => Ok(false),
     }
 }
@@ -703,9 +701,7 @@ fn scan_direct_children(
     kind: ChildKey,
 ) -> Result<Vec<(Option<Value>, Value)>> {
     let scan = codec::child_scan_prefix(prefix);
-    let iter = db
-        .raw()
-        .iterator(rocksdb::IteratorMode::From(&scan, rocksdb::Direction::Forward));
+    let iter = db.iter_from(&scan)?;
     let mut out = Vec::new();
     let mut logical = 0u64;
     for item in iter {
@@ -786,7 +782,7 @@ fn materialize(db: &Db, prefix: &[u8], shape: &Shape) -> Result<Value> {
     // is the probe, so nothing here pays an extra seek.
     match shape {
         Shape::Leaf => read_leaf(db, prefix),
-        Shape::Sum => match db.raw().get(prefix)? {
+        Shape::Sum => match db.get(prefix)? {
             Some(bytes) => {
                 if let Some(n) = decode_sum::<i64>(&bytes) {
                     return Ok(Value::Integer(Integer::from(n)));
@@ -847,7 +843,7 @@ fn materialize(db: &Db, prefix: &[u8], shape: &Shape) -> Result<Value> {
 }
 
 fn read_leaf(db: &Db, prefix: &[u8]) -> Result<Value> {
-    match db.raw().get(prefix)? {
+    match db.get(prefix)? {
         Some(bytes) => decode_value(&bytes),
         None => Ok(Value::Null),
     }
@@ -855,9 +851,7 @@ fn read_leaf(db: &Db, prefix: &[u8]) -> Result<Value> {
 
 fn map_keys(db: &Db, prefix: &[u8]) -> Result<Vec<Value>> {
     let scan = codec::child_scan_prefix(prefix);
-    let iter = db
-        .raw()
-        .iterator(rocksdb::IteratorMode::From(&scan, rocksdb::Direction::Forward));
+    let iter = db.iter_from(&scan)?;
     let mut keys = Vec::new();
     let mut last: Option<Vec<u8>> = None;
     for item in iter {

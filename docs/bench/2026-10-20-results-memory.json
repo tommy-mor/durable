@@ -1,0 +1,538 @@
+{
+  "backend": "memory",
+  "backend_version": "std Vec/VecDeque/BTreeMap",
+  "samples": [
+    {
+      "n": 1000,
+      "op": "list_push_batch",
+      "p50_ns": 25.368,
+      "p99_ns": 0.0,
+      "unit": "ns/op"
+    },
+    {
+      "n": 1000,
+      "op": "list_get",
+      "p50_ns": 30.0,
+      "p99_ns": 41.0,
+      "unit": "ns"
+    },
+    {
+      "n": 1000,
+      "op": "list_iter",
+      "p50_ns": 4618.0,
+      "p99_ns": 0.0,
+      "unit": "ns total"
+    },
+    {
+      "n": 1000,
+      "op": "list_pop",
+      "p50_ns": 30.0,
+      "p99_ns": 31.0,
+      "unit": "ns"
+    },
+    {
+      "n": 1000,
+      "op": "deque_push_batch",
+      "p50_ns": 9.8485,
+      "p99_ns": 0.0,
+      "unit": "ns/op"
+    },
+    {
+      "n": 1000,
+      "op": "deque_iter",
+      "p50_ns": 18224.0,
+      "p99_ns": 0.0,
+      "unit": "ns total"
+    },
+    {
+      "n": 1000,
+      "op": "deque_pop_front",
+      "p50_ns": 30.0,
+      "p99_ns": 31.0,
+      "unit": "ns"
+    },
+    {
+      "n": 1000,
+      "op": "deque_pop_back",
+      "p50_ns": 30.0,
+      "p99_ns": 31.0,
+      "unit": "ns"
+    },
+    {
+      "n": 1000,
+      "op": "map_put_batch",
+      "p50_ns": 771.75,
+      "p99_ns": 0.0,
+      "unit": "ns/op"
+    },
+    {
+      "n": 1000,
+      "op": "map_get",
+      "p50_ns": 401.0,
+      "p99_ns": 551.0,
+      "unit": "ns"
+    },
+    {
+      "n": 1000,
+      "op": "map_iter",
+      "p50_ns": 43563.0,
+      "p99_ns": 0.0,
+      "unit": "ns total"
+    },
+    {
+      "n": 1000,
+      "op": "map_keys",
+      "p50_ns": 73149.0,
+      "p99_ns": 0.0,
+      "unit": "ns total"
+    },
+    {
+      "n": 1000,
+      "op": "map_clear",
+      "p50_ns": 85002.0,
+      "p99_ns": 0.0,
+      "unit": "ns total"
+    },
+    {
+      "n": 1000,
+      "op": "nested_put_batch",
+      "p50_ns": 827.597,
+      "p99_ns": 0.0,
+      "unit": "ns/op"
+    },
+    {
+      "n": 1000,
+      "op": "nested_get_deep",
+      "p50_ns": 751.0,
+      "p99_ns": 962.0,
+      "unit": "ns"
+    },
+    {
+      "n": 1000,
+      "op": "nested_keys_l1",
+      "p50_ns": 2254.0,
+      "p99_ns": 0.0,
+      "unit": "ns total"
+    },
+    {
+      "n": 1000,
+      "op": "nested_scan_deep",
+      "p50_ns": 48953.0,
+      "p99_ns": 0.0,
+      "unit": "ns total"
+    },
+    {
+      "n": 1000,
+      "op": "record_put_batch",
+      "p50_ns": 123.546,
+      "p99_ns": 0.0,
+      "unit": "ns/op"
+    },
+    {
+      "n": 1000,
+      "op": "record_scan",
+      "p50_ns": 6172.0,
+      "p99_ns": 0.0,
+      "unit": "ns total"
+    },
+    {
+      "n": 10000,
+      "op": "list_push_batch",
+      "p50_ns": 12.0089,
+      "p99_ns": 0.0,
+      "unit": "ns/op"
+    },
+    {
+      "n": 10000,
+      "op": "list_get",
+      "p50_ns": 30.0,
+      "p99_ns": 31.0,
+      "unit": "ns"
+    },
+    {
+      "n": 10000,
+      "op": "list_iter",
+      "p50_ns": 44044.0,
+      "p99_ns": 0.0,
+      "unit": "ns total"
+    },
+    {
+      "n": 10000,
+      "op": "list_pop",
+      "p50_ns": 30.0,
+      "p99_ns": 31.0,
+      "unit": "ns"
+    },
+    {
+      "n": 10000,
+      "op": "deque_push_batch",
+      "p50_ns": 10.216,
+      "p99_ns": 0.0,
+      "unit": "ns/op"
+    },
+    {
+      "n": 10000,
+      "op": "deque_iter",
+      "p50_ns": 109228.0,
+      "p99_ns": 0.0,
+      "unit": "ns total"
+    },
+    {
+      "n": 10000,
+      "op": "deque_pop_front",
+      "p50_ns": 30.0,
+      "p99_ns": 31.0,
+      "unit": "ns"
+    },
+    {
+      "n": 10000,
+      "op": "deque_pop_back",
+      "p50_ns": 30.0,
+      "p99_ns": 31.0,
+      "unit": "ns"
+    },
+    {
+      "n": 10000,
+      "op": "map_put_batch",
+      "p50_ns": 972.7893,
+      "p99_ns": 0.0,
+      "unit": "ns/op"
+    },
+    {
+      "n": 10000,
+      "op": "map_get",
+      "p50_ns": 581.0,
+      "p99_ns": 822.0,
+      "unit": "ns"
+    },
+    {
+      "n": 10000,
+      "op": "map_iter",
+      "p50_ns": 429608.0,
+      "p99_ns": 0.0,
+      "unit": "ns total"
+    },
+    {
+      "n": 10000,
+      "op": "map_keys",
+      "p50_ns": 844398.0,
+      "p99_ns": 0.0,
+      "unit": "ns total"
+    },
+    {
+      "n": 10000,
+      "op": "map_clear",
+      "p50_ns": 1015635.0,
+      "p99_ns": 0.0,
+      "unit": "ns total"
+    },
+    {
+      "n": 10648,
+      "op": "nested_put_batch",
+      "p50_ns": 987.5669609316303,
+      "p99_ns": 0.0,
+      "unit": "ns/op"
+    },
+    {
+      "n": 10648,
+      "op": "nested_get_deep",
+      "p50_ns": 892.0,
+      "p99_ns": 1302.0,
+      "unit": "ns"
+    },
+    {
+      "n": 10648,
+      "op": "nested_keys_l1",
+      "p50_ns": 3006.0,
+      "p99_ns": 0.0,
+      "unit": "ns total"
+    },
+    {
+      "n": 10648,
+      "op": "nested_scan_deep",
+      "p50_ns": 486907.0,
+      "p99_ns": 0.0,
+      "unit": "ns total"
+    },
+    {
+      "n": 10000,
+      "op": "record_put_batch",
+      "p50_ns": 122.7548,
+      "p99_ns": 0.0,
+      "unit": "ns/op"
+    },
+    {
+      "n": 10000,
+      "op": "record_scan",
+      "p50_ns": 60425.0,
+      "p99_ns": 0.0,
+      "unit": "ns total"
+    },
+    {
+      "n": 100000,
+      "op": "list_push_batch",
+      "p50_ns": 13.44361,
+      "p99_ns": 0.0,
+      "unit": "ns/op"
+    },
+    {
+      "n": 100000,
+      "op": "list_get",
+      "p50_ns": 30.0,
+      "p99_ns": 31.0,
+      "unit": "ns"
+    },
+    {
+      "n": 100000,
+      "op": "list_iter",
+      "p50_ns": 441912.0,
+      "p99_ns": 0.0,
+      "unit": "ns total"
+    },
+    {
+      "n": 100000,
+      "op": "list_pop",
+      "p50_ns": 30.0,
+      "p99_ns": 31.0,
+      "unit": "ns"
+    },
+    {
+      "n": 100000,
+      "op": "deque_push_batch",
+      "p50_ns": 9.79381,
+      "p99_ns": 0.0,
+      "unit": "ns/op"
+    },
+    {
+      "n": 100000,
+      "op": "deque_iter",
+      "p50_ns": 1115746.0,
+      "p99_ns": 0.0,
+      "unit": "ns total"
+    },
+    {
+      "n": 100000,
+      "op": "deque_pop_front",
+      "p50_ns": 30.0,
+      "p99_ns": 31.0,
+      "unit": "ns"
+    },
+    {
+      "n": 100000,
+      "op": "deque_pop_back",
+      "p50_ns": 30.0,
+      "p99_ns": 31.0,
+      "unit": "ns"
+    },
+    {
+      "n": 100000,
+      "op": "map_put_batch",
+      "p50_ns": 1220.31367,
+      "p99_ns": 0.0,
+      "unit": "ns/op"
+    },
+    {
+      "n": 100000,
+      "op": "map_get",
+      "p50_ns": 1113.0,
+      "p99_ns": 3456.0,
+      "unit": "ns"
+    },
+    {
+      "n": 100000,
+      "op": "map_iter",
+      "p50_ns": 5054419.0,
+      "p99_ns": 0.0,
+      "unit": "ns total"
+    },
+    {
+      "n": 100000,
+      "op": "map_keys",
+      "p50_ns": 13232619.0,
+      "p99_ns": 0.0,
+      "unit": "ns total"
+    },
+    {
+      "n": 100000,
+      "op": "map_clear",
+      "p50_ns": 16075104.0,
+      "p99_ns": 0.0,
+      "unit": "ns total"
+    },
+    {
+      "n": 103823,
+      "op": "nested_put_batch",
+      "p50_ns": 1194.0978395923833,
+      "p99_ns": 0.0,
+      "unit": "ns/op"
+    },
+    {
+      "n": 103823,
+      "op": "nested_get_deep",
+      "p50_ns": 1403.0,
+      "p99_ns": 4218.0,
+      "unit": "ns"
+    },
+    {
+      "n": 103823,
+      "op": "nested_keys_l1",
+      "p50_ns": 7534.0,
+      "p99_ns": 0.0,
+      "unit": "ns total"
+    },
+    {
+      "n": 103823,
+      "op": "nested_scan_deep",
+      "p50_ns": 5346235.0,
+      "p99_ns": 0.0,
+      "unit": "ns total"
+    },
+    {
+      "n": 100000,
+      "op": "record_put_batch",
+      "p50_ns": 106.66239,
+      "p99_ns": 0.0,
+      "unit": "ns/op"
+    },
+    {
+      "n": 100000,
+      "op": "record_scan",
+      "p50_ns": 603961.0,
+      "p99_ns": 0.0,
+      "unit": "ns total"
+    },
+    {
+      "n": 1000000,
+      "op": "list_push_batch",
+      "p50_ns": 101.175001,
+      "p99_ns": 0.0,
+      "unit": "ns/op"
+    },
+    {
+      "n": 1000000,
+      "op": "list_get",
+      "p50_ns": 80.0,
+      "p99_ns": 370.0,
+      "unit": "ns"
+    },
+    {
+      "n": 1000000,
+      "op": "list_iter",
+      "p50_ns": 4590225.0,
+      "p99_ns": 0.0,
+      "unit": "ns total"
+    },
+    {
+      "n": 1000000,
+      "op": "list_pop",
+      "p50_ns": 30.0,
+      "p99_ns": 31.0,
+      "unit": "ns"
+    },
+    {
+      "n": 1000000,
+      "op": "deque_push_batch",
+      "p50_ns": 54.507573,
+      "p99_ns": 0.0,
+      "unit": "ns/op"
+    },
+    {
+      "n": 1000000,
+      "op": "deque_iter",
+      "p50_ns": 11476332.0,
+      "p99_ns": 0.0,
+      "unit": "ns total"
+    },
+    {
+      "n": 1000000,
+      "op": "deque_pop_front",
+      "p50_ns": 30.0,
+      "p99_ns": 31.0,
+      "unit": "ns"
+    },
+    {
+      "n": 1000000,
+      "op": "deque_pop_back",
+      "p50_ns": 30.0,
+      "p99_ns": 31.0,
+      "unit": "ns"
+    },
+    {
+      "n": 1000000,
+      "op": "map_put_batch",
+      "p50_ns": 3852.4809,
+      "p99_ns": 0.0,
+      "unit": "ns/op"
+    },
+    {
+      "n": 1000000,
+      "op": "map_get",
+      "p50_ns": 4498.0,
+      "p99_ns": 12614.0,
+      "unit": "ns"
+    },
+    {
+      "n": 1000000,
+      "op": "map_iter",
+      "p50_ns": 59086334.0,
+      "p99_ns": 0.0,
+      "unit": "ns total"
+    },
+    {
+      "n": 1000000,
+      "op": "map_keys",
+      "p50_ns": 1342440566.0,
+      "p99_ns": 0.0,
+      "unit": "ns total"
+    },
+    {
+      "n": 1000000,
+      "op": "map_clear",
+      "p50_ns": 208888978.0,
+      "p99_ns": 0.0,
+      "unit": "ns total"
+    },
+    {
+      "n": 1000000,
+      "op": "nested_put_batch",
+      "p50_ns": 1638.65477,
+      "p99_ns": 0.0,
+      "unit": "ns/op"
+    },
+    {
+      "n": 1000000,
+      "op": "nested_get_deep",
+      "p50_ns": 4098.0,
+      "p99_ns": 10280.0,
+      "unit": "ns"
+    },
+    {
+      "n": 1000000,
+      "op": "nested_keys_l1",
+      "p50_ns": 27132.0,
+      "p99_ns": 0.0,
+      "unit": "ns total"
+    },
+    {
+      "n": 1000000,
+      "op": "nested_scan_deep",
+      "p50_ns": 62140163.0,
+      "p99_ns": 0.0,
+      "unit": "ns total"
+    },
+    {
+      "n": 1000000,
+      "op": "record_put_batch",
+      "p50_ns": 2033.764464,
+      "p99_ns": 0.0,
+      "unit": "ns/op"
+    },
+    {
+      "n": 1000000,
+      "op": "record_scan",
+      "p50_ns": 6303869.0,
+      "p99_ns": 0.0,
+      "unit": "ns total"
+    }
+  ]
+}

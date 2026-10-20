@@ -1,0 +1,229 @@
+{
+  "backend": "sled",
+  "samples": [
+    {
+      "n": 1000,
+      "op": "load_bulk",
+      "p50_ns": 17783.4595,
+      "p99_ns": 0.0,
+      "unit": "ns/row"
+    },
+    {
+      "n": 1000,
+      "op": "append_single_syncwal",
+      "p50_ns": 80053.0,
+      "p99_ns": 1927735.0,
+      "unit": "ns/commit"
+    },
+    {
+      "n": 1000,
+      "op": "batch_commit_syncwal",
+      "p50_ns": 19737.0,
+      "p99_ns": 0.0,
+      "unit": "ns/row"
+    },
+    {
+      "n": 1000,
+      "op": "point_get_cold",
+      "p50_ns": 5561.0,
+      "p99_ns": 31219.0,
+      "unit": "ns"
+    },
+    {
+      "n": 1000,
+      "op": "scan_full",
+      "p50_ns": 9234035.0,
+      "p99_ns": 0.0,
+      "unit": "ns total"
+    },
+    {
+      "n": 1000,
+      "op": "sum_add",
+      "p50_ns": 2220.624,
+      "p99_ns": 0.0,
+      "unit": "ns/op"
+    },
+    {
+      "n": 1000,
+      "op": "sum_read_pressure",
+      "p50_ns": 3086.0,
+      "p99_ns": 9087.0,
+      "unit": "ns"
+    },
+    {
+      "n": 1000,
+      "op": "rebuild",
+      "p50_ns": 34365118.0,
+      "p99_ns": 0.0,
+      "unit": "ns total"
+    },
+    {
+      "n": 10000,
+      "op": "load_bulk",
+      "p50_ns": 21952.8941,
+      "p99_ns": 0.0,
+      "unit": "ns/row"
+    },
+    {
+      "n": 10000,
+      "op": "append_single_syncwal",
+      "p50_ns": 115029.0,
+      "p99_ns": 5080416.0,
+      "unit": "ns/commit"
+    },
+    {
+      "n": 10000,
+      "op": "batch_commit_syncwal",
+      "p50_ns": 20765.0,
+      "p99_ns": 0.0,
+      "unit": "ns/row"
+    },
+    {
+      "n": 10000,
+      "op": "point_get_cold",
+      "p50_ns": 6522.0,
+      "p99_ns": 157790.0,
+      "unit": "ns"
+    },
+    {
+      "n": 10000,
+      "op": "scan_full",
+      "p50_ns": 94733404.0,
+      "p99_ns": 0.0,
+      "unit": "ns total"
+    },
+    {
+      "n": 10000,
+      "op": "sum_add",
+      "p50_ns": 2144.5276,
+      "p99_ns": 0.0,
+      "unit": "ns/op"
+    },
+    {
+      "n": 10000,
+      "op": "sum_read_pressure",
+      "p50_ns": 3046.0,
+      "p99_ns": 11622.0,
+      "unit": "ns"
+    },
+    {
+      "n": 10000,
+      "op": "rebuild",
+      "p50_ns": 424534191.0,
+      "p99_ns": 0.0,
+      "unit": "ns total"
+    },
+    {
+      "n": 100000,
+      "op": "load_bulk",
+      "p50_ns": 22412.455475,
+      "p99_ns": 0.0,
+      "unit": "ns/row"
+    },
+    {
+      "n": 100000,
+      "op": "append_single_syncwal",
+      "p50_ns": 1891025.0,
+      "p99_ns": 8543018.0,
+      "unit": "ns/commit"
+    },
+    {
+      "n": 100000,
+      "op": "batch_commit_syncwal",
+      "p50_ns": 22041.0,
+      "p99_ns": 0.0,
+      "unit": "ns/row"
+    },
+    {
+      "n": 100000,
+      "op": "point_get_cold",
+      "p50_ns": 22673.0,
+      "p99_ns": 284853.0,
+      "unit": "ns"
+    },
+    {
+      "n": 100000,
+      "op": "scan_full",
+      "p50_ns": 676145761.0,
+      "p99_ns": 0.0,
+      "unit": "ns total"
+    },
+    {
+      "n": 100000,
+      "op": "sum_add",
+      "p50_ns": 2030.75392,
+      "p99_ns": 0.0,
+      "unit": "ns/op"
+    },
+    {
+      "n": 100000,
+      "op": "sum_read_pressure",
+      "p50_ns": 3026.0,
+      "p99_ns": 9418.0,
+      "unit": "ns"
+    },
+    {
+      "n": 100000,
+      "op": "rebuild",
+      "p50_ns": 4151663667.0,
+      "p99_ns": 0.0,
+      "unit": "ns total"
+    },
+    {
+      "n": 1000000,
+      "op": "load_bulk",
+      "p50_ns": 23864.061288,
+      "p99_ns": 0.0,
+      "unit": "ns/row"
+    },
+    {
+      "n": 1000000,
+      "op": "append_single_syncwal",
+      "p50_ns": 2229892.0,
+      "p99_ns": 9511153.0,
+      "unit": "ns/commit"
+    },
+    {
+      "n": 1000000,
+      "op": "batch_commit_syncwal",
+      "p50_ns": 25105.0,
+      "p99_ns": 0.0,
+      "unit": "ns/row"
+    },
+    {
+      "n": 1000000,
+      "op": "point_get_cold",
+      "p50_ns": 35518.0,
+      "p99_ns": 554577.0,
+      "unit": "ns"
+    },
+    {
+      "n": 1000000,
+      "op": "scan_full",
+      "p50_ns": 9939391623.0,
+      "p99_ns": 0.0,
+      "unit": "ns total"
+    },
+    {
+      "n": 1000000,
+      "op": "sum_add",
+      "p50_ns": 2029.924417,
+      "p99_ns": 0.0,
+      "unit": "ns/op"
+    },
+    {
+      "n": 1000000,
+      "op": "sum_read_pressure",
+      "p50_ns": 3005.0,
+      "p99_ns": 9198.0,
+      "unit": "ns"
+    },
+    {
+      "n": 1000000,
+      "op": "rebuild",
+      "p50_ns": 50734359616.0,
+      "p99_ns": 0.0,
+      "unit": "ns total"
+    }
+  ]
+}

@@ -7,7 +7,9 @@ description = "Event-sourced application-state runtime with typed reducers and a
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-rocksdb = "0.21"
+rocksdb = { version = "0.25", optional = true }
+redb = { version = "4", optional = true }
+sled = { version = "0.34", optional = true }
 serde = { version = "1.0", features = ["derive"] }
 thiserror = "1.0"
 ciborium = "0.2.2"
@@ -16,6 +18,13 @@ durable-derive = { path = "../durable-derive", version = "0.3.0" }
 crc32c = "0.6.8"
 
 [features]
+# Storage backend selection: exactly one must be enabled. The backend is
+# picked in the depending crate's `durable` dependency, e.g.
+# `durable = { version = "0.3", default-features = false, features = ["backend-sled"] }`.
+default = ["backend-rocksdb"]
+backend-rocksdb = ["dep:rocksdb"]
+backend-redb = ["dep:redb"]
+backend-sled = ["dep:sled"]
 # Test doubles for the tape writer's failure paths. Off in normal builds;
 # the crate's own tests enable it through the self dev-dependency below.
 fault-injection = []
@@ -24,7 +33,10 @@ fault-injection = []
 name = "durable-tape-migrate"
 path = "src/bin/migrate.rs"
 [dev-dependencies]
-durable = { path = ".", features = ["fault-injection"] }
+# default-features = false so the backend under test is selected solely by
+# the features passed on the cargo command line (otherwise this self-dep
+# would re-enable backend-rocksdb through feature unification).
+durable = { path = ".", default-features = false, features = ["fault-injection"] }
 tempfile = "3.8"
 proptest = "1.4"
 serde = { version = "1.0", features = ["derive"] }

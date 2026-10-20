@@ -212,6 +212,32 @@ fn map_clear_deletes_subtree_only() {
 }
 
 #[test]
+fn map_clear_in_same_batch_as_puts_covers_staged_writes() {
+    // Batch commit order is three-phase (point writes, then prefix
+    // deletes, then resolved appends), so a DeletePrefix in the batch
+    // removes keys put in the same batch no matter where it sits.
+    // Every backend must agree on this — it is long-standing behavior,
+    // not a backend quirk.
+    let (_dir, db) = open();
+    let nodes = Store::root().nodes();
+
+    // Puts staged BEFORE the clear are removed.
+    let mut batch = db.batch();
+    batch.write(nodes.key(&"a".to_string()).set(&"A".to_string()));
+    batch.write(nodes.key(&"b".to_string()).set(&"B".to_string()));
+    batch.write(nodes.clear());
+    batch.commit().unwrap();
+    assert!(nodes.is_empty(&db).unwrap());
+
+    // Puts staged AFTER the clear are removed too.
+    let mut batch = db.batch();
+    batch.write(nodes.clear());
+    batch.write(nodes.key(&"c".to_string()).set(&"C".to_string()));
+    batch.commit().unwrap();
+    assert!(nodes.is_empty(&db).unwrap());
+}
+
+#[test]
 fn transform_values_decays_all_edges_in_one_batch() {
     let (_dir, db) = open();
     let edges = Store::root().scopes().key(&"rust".to_string()).edges();
@@ -305,6 +331,30 @@ fn deque_behaves_like_a_double_ended_queue() {
     assert_eq!(dq.pop_front(&db).unwrap(), Some(v(1)));
     assert_eq!(dq.pop_front(&db).unwrap(), None);
     assert!(dq.is_empty(&db).unwrap());
+}
+
+#[test]
+fn deque_mixed_back_and_front_appends_share_one_batch() {
+    // Regression: back and front pushes to the same deque in ONE batch used
+    // to resolve against separate head/tail reads, so the second group
+    // clobbered the first's counter update with a stale value (len 3 here
+    // came back as 2 or 1 depending on order).
+    let (_dir, db) = open();
+    let dq = Store::root().scopes().key(&"s".to_string()).recent_votes();
+    let v = |n: i32| Vote { a: format!("a{n}"), b: format!("b{n}"), ratio: n };
+
+    let mut batch = db.batch();
+    batch.write(dq.push_back_op(&v(1)));
+    batch.write(dq.push_front_op(&v(0)));
+    batch.write(dq.push_back_op(&v(2)));
+    batch.write(dq.push_front_op(&v(-1)));
+    batch.commit().unwrap();
+
+    assert_eq!(dq.len(&db).unwrap(), 4);
+    assert_eq!(
+        dq.iter(&db).unwrap(),
+        vec![v(-1), v(0), v(1), v(2)]
+    );
 }
 
 #[test]
