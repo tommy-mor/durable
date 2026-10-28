@@ -54,7 +54,9 @@
 //! # }
 //! ```
 
-mod codec;
+/// Key encoding for durable paths: segment framing, order-preserving indexes,
+/// and the self-describing child tags external readers need to decode keys.
+pub mod codec;
 pub mod dynpath;
 mod path;
 pub mod query;
