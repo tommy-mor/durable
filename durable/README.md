@@ -230,6 +230,17 @@ batches, durability modes, persistence across reopen, property tests against
 filter / project / explain), and the runtime property
 `incremental execution == replay from zero`.
 
+For faster iteration without a C++ toolchain or disk I/O, run the same suite
+against the ephemeral in-memory backend (`backend-memory`, std-only,
+`BTreeMap` + `RwLock`). `Db::open(path)` ignores `path` there; `Db::open_memory()`
+is the explicit entry point. Data vanishes when the last `Db` clone drops, so
+persistence and "disagree-with-persisted-projection" tests are cfg'd out for
+it:
+
+```bash
+cargo test -p durable --no-default-features --features backend-memory
+```
+
 ```bash
 cargo run -p durable --example runtime
 ```

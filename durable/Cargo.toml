@@ -21,10 +21,13 @@ crc32c = "0.6.8"
 # Storage backend selection: exactly one must be enabled. The backend is
 # picked in the depending crate's `durable` dependency, e.g.
 # `durable = { version = "0.3", default-features = false, features = ["backend-sled"] }`.
+# `backend-memory` is an ephemeral in-memory `BTreeMap` for tests: no
+# dependencies, no disk writes, no persistence across `Db` instances.
 default = ["backend-rocksdb"]
 backend-rocksdb = ["dep:rocksdb"]
 backend-redb = ["dep:redb"]
 backend-sled = ["dep:sled"]
+backend-memory = []
 # Test doubles for the tape writer's failure paths. Off in normal builds;
 # the crate's own tests enable it through the self dev-dependency below.
 fault-injection = []

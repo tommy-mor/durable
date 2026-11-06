@@ -15,7 +15,8 @@
 //!
 //! The backend is a compile-time choice (`backend-rocksdb` by default,
 //! `backend-redb` / `backend-sled` for pure-Rust engines with no C++
-//! toolchain); see [`store`] for the contract each engine implements.
+//! toolchain, `backend-memory` for an ephemeral in-memory store for tests);
+//! see [`store`] for the contract each engine implements.
 //!
 //! Terminal operations on a path return reified [`Write`] values (not side
 //! effects). Compose several into one atomic [`Batch`] and commit them with an
@@ -69,16 +70,20 @@ pub mod watch;
 #[cfg(not(any(
     feature = "backend-rocksdb",
     feature = "backend-redb",
-    feature = "backend-sled"
+    feature = "backend-sled",
+    feature = "backend-memory"
 )))]
 compile_error!(
     "durable: enable exactly one storage backend feature \
-     (`backend-rocksdb`, `backend-redb`, or `backend-sled`)"
+     (`backend-rocksdb`, `backend-redb`, `backend-sled`, or `backend-memory`)"
 );
 #[cfg(any(
     all(feature = "backend-rocksdb", feature = "backend-redb"),
     all(feature = "backend-rocksdb", feature = "backend-sled"),
+    all(feature = "backend-rocksdb", feature = "backend-memory"),
     all(feature = "backend-redb", feature = "backend-sled"),
+    all(feature = "backend-redb", feature = "backend-memory"),
+    all(feature = "backend-sled", feature = "backend-memory"),
 ))]
 compile_error!("durable: only one storage backend feature may be enabled at a time");
 
@@ -109,7 +114,7 @@ pub enum Error {
     #[cfg(feature = "backend-rocksdb")]
     #[error("rocksdb error: {0}")]
     RocksDb(#[from] rocksdb::Error),
-    /// Storage backend failure (redb/sled; surrealkv when it lands).
+    /// Storage backend failure (redb/sled/memory; surrealkv when it lands).
     #[error("store error: {0}")]
     Store(String),
     #[error("serialization error: {0}")]
@@ -221,8 +226,24 @@ impl Db {
     ///
     /// The on-disk format is backend-specific (see [`store`]); switching
     /// backends means replaying the event tape into a fresh directory.
+    /// With `backend-memory` the `path` is ignored and the database is
+    /// ephemeral — nothing is written to disk and data vanishes when the
+    /// last `Db` handle is dropped. Use [`Db::open_memory`] in that case to
+    /// make the intent explicit.
     pub fn open<P: AsRef<FsPath>>(path: P) -> Result<Self> {
         let store = Store::open(path.as_ref())?;
+        Ok(Self {
+            inner: Arc::new(store),
+        })
+    }
+
+    /// Open an empty in-memory database. No path is needed and nothing is
+    /// persisted; dropping every clone discards all data.
+    ///
+    /// Available only with `backend-memory` (pure std, for tests).
+    #[cfg(feature = "backend-memory")]
+    pub fn open_memory() -> Result<Self> {
+        let store = Store::open_memory()?;
         Ok(Self {
             inner: Arc::new(store),
         })

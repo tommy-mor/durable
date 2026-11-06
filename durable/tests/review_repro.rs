@@ -43,6 +43,11 @@ fn a_unsealed_tape_is_refused_untouched() {
 /// Spec, Opening step 4: cross-check BEFORE truncating. Damage the final
 /// acknowledged batch while the projection has applied it: open must
 /// refuse with disagree and leave the file byte-identical.
+///
+/// The in-memory backend holds no projection across reopens, so there is
+/// no persisted `applied` to disagree with — the test only applies to
+/// on-disk backends.
+#[cfg(not(feature = "backend-memory"))]
 #[test]
 fn c_disagree_leaves_file_untouched() {
     let dir = TempDir::new().unwrap();
@@ -117,7 +122,9 @@ fn f_torn_first_sealed_batch_is_residue_not_legacy() {
     let log = dir.path().join("log.jsonl");
     let bytes = std::fs::read(&log).unwrap();
     std::fs::write(&log, &bytes[..bytes.len() / 2]).unwrap(); // torn, no newline
-    std::fs::remove_dir_all(dir.path().join("proj")).unwrap(); // projection never applied it
+    // Projection never applied it. The memory backend has no directory to
+    // remove (its projection is already gone with the dropped `Runtime`).
+    let _ = std::fs::remove_dir_all(dir.path().join("proj"));
     let rt = open(dir.path()).expect("torn first sealed batch must open as empty");
     assert_eq!(rt.applied().unwrap(), 0);
 }

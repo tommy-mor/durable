@@ -13,12 +13,18 @@
 //! * [`Durability`] maps onto each engine's fsync story; see the commit arms.
 //! * Merge ops fold through the shared [`crate::schema::fold_merge`]:
 //!   natively at compaction time on RocksDB, read-modify-write inside the
-//!   commit transaction on redb, and against a commit-time overlay on sled
-//!   (whose batches have no merge op). All three preserve single-writer
-//!   semantics exactly (and durable already assumes a single writer).
+//!   commit transaction on redb, against a commit-time overlay on sled
+//!   (whose batches have no merge op), and read-modify-write under one write
+//!   lock on the in-memory backend. All preserve single-writer semantics
+//!   exactly (and durable already assumes a single writer).
 //! * On-disk formats differ per backend. Switching backends for an existing
 //!   deployment means replaying the event tape into a fresh store directory —
 //!   which is the supported migration path everywhere durable is used.
+//! * `backend-memory` is ephemeral (`BTreeMap` + `RwLock`, no disk I/O,
+//!   [`Durability`] ignored). `Db::open(path)` ignores `path` and
+//!   [`Db::open_memory`](super::Db::open_memory) is the explicit entry point.
+//!   Data vanishes when the last `Db` clone drops, so persistence tests
+//!   must not run against it.
 //!
 //! Deliberately not a backend (yet): SurrealKV. Its commit path is `async`
 //! on top of tokio while this crate's API is fully synchronous — and the
@@ -27,7 +33,11 @@
 
 use std::path::Path as FsPath;
 
-#[cfg(any(feature = "backend-redb", feature = "backend-sled"))]
+#[cfg(any(
+    feature = "backend-redb",
+    feature = "backend-sled",
+    feature = "backend-memory"
+))]
 use super::codec;
 use super::{schema, Durability, Error, Result};
 
@@ -51,7 +61,8 @@ pub(crate) enum FinalOp {
 /// RocksDB iterates a live snapshot handle; redb materializes under one
 /// read transaction (also snapshot-consistent). sled has no read
 /// transactions, so scans materialize immediately — still exact under the
-/// single-writer contract.
+/// single-writer contract. The in-memory backend materializes under a read
+/// lock.
 pub(crate) enum StoreIter<'a> {
     #[cfg(feature = "backend-rocksdb")]
     Rocksdb(rocksdb::DBIterator<'a>),
@@ -62,6 +73,11 @@ pub(crate) enum StoreIter<'a> {
     ),
     #[cfg(feature = "backend-sled")]
     Sled(
+        std::vec::IntoIter<(Vec<u8>, Vec<u8>)>,
+        std::marker::PhantomData<&'a ()>,
+    ),
+    #[cfg(feature = "backend-memory")]
+    Memory(
         std::vec::IntoIter<(Vec<u8>, Vec<u8>)>,
         std::marker::PhantomData<&'a ()>,
     ),
@@ -81,6 +97,8 @@ impl Iterator for StoreIter<'_> {
             StoreIter::Redb(iter, _) => iter.next().map(Ok),
             #[cfg(feature = "backend-sled")]
             StoreIter::Sled(iter, _) => iter.next().map(Ok),
+            #[cfg(feature = "backend-memory")]
+            StoreIter::Memory(iter, _) => iter.next().map(Ok),
         }
     }
 }
@@ -92,10 +110,19 @@ pub(crate) enum Store {
     Redb(redb::Database),
     #[cfg(feature = "backend-sled")]
     Sled(sled::Db),
+    #[cfg(feature = "backend-memory")]
+    Memory(
+        std::sync::RwLock<
+            std::collections::BTreeMap<Vec<u8>, Vec<u8>>,
+        >,
+    ),
 }
 
 impl Store {
     /// Open (or create) the store inside directory `path`.
+    ///
+    /// With `backend-memory` the path is ignored and an empty ephemeral map
+    /// is created; see [`Store::open_memory`].
     pub(crate) fn open(path: &FsPath) -> Result<Self> {
         #[cfg(feature = "backend-rocksdb")]
         {
@@ -121,8 +148,23 @@ impl Store {
             let db = sled::open(path).map_err(store_err)?;
             return Ok(Store::Sled(db));
         }
+        #[cfg(feature = "backend-memory")]
+        {
+            let _ = path; // ephemeral: no directory, no files, no persistence
+            return Ok(Store::Memory(std::sync::RwLock::new(
+                std::collections::BTreeMap::new(),
+            )));
+        }
         #[allow(unreachable_code)]
         Err(Error::Log("no durable storage backend enabled".into()))
+    }
+
+    /// Open an empty in-memory store (no path, no disk writes).
+    #[cfg(feature = "backend-memory")]
+    pub(crate) fn open_memory() -> Result<Self> {
+        Ok(Store::Memory(std::sync::RwLock::new(
+            std::collections::BTreeMap::new(),
+        )))
     }
 
     /// Point read.
@@ -134,6 +176,8 @@ impl Store {
             Store::Redb(db) => redb_be::get(db, key),
             #[cfg(feature = "backend-sled")]
             Store::Sled(db) => sled_be::get(db, key),
+            #[cfg(feature = "backend-memory")]
+            Store::Memory(map) => memory_be::get(map, key),
         }
     }
 
@@ -144,7 +188,11 @@ impl Store {
     /// nested lookup into a full-table read (quadratic deep scans); the
     /// callers' prefix-`break` stays as a safety net.
     pub(crate) fn iter_from(&self, from: &[u8]) -> Result<StoreIter<'_>> {
-        #[cfg(any(feature = "backend-redb", feature = "backend-sled"))]
+        #[cfg(any(
+            feature = "backend-redb",
+            feature = "backend-sled",
+            feature = "backend-memory"
+        ))]
         let end = codec::prefix_upper_bound(from);
         match self {
             #[cfg(feature = "backend-rocksdb")]
@@ -159,6 +207,11 @@ impl Store {
             #[cfg(feature = "backend-sled")]
             Store::Sled(db) => Ok(StoreIter::Sled(
                 sled_be::scan(db, Some(from), end.as_deref())?.into_iter(),
+                std::marker::PhantomData,
+            )),
+            #[cfg(feature = "backend-memory")]
+            Store::Memory(map) => Ok(StoreIter::Memory(
+                memory_be::scan(map, Some(from), end.as_deref())?.into_iter(),
                 std::marker::PhantomData,
             )),
         }
@@ -179,6 +232,11 @@ impl Store {
             #[cfg(feature = "backend-sled")]
             Store::Sled(db) => Ok(StoreIter::Sled(
                 sled_be::scan(db, None, None)?.into_iter(),
+                std::marker::PhantomData,
+            )),
+            #[cfg(feature = "backend-memory")]
+            Store::Memory(map) => Ok(StoreIter::Memory(
+                memory_be::scan(map, None, None)?.into_iter(),
                 std::marker::PhantomData,
             )),
         }
@@ -235,6 +293,8 @@ impl Store {
             Store::Redb(db) => redb_be::commit(db, ops, durability),
             #[cfg(feature = "backend-sled")]
             Store::Sled(db) => sled_be::commit(db, ops, durability),
+            #[cfg(feature = "backend-memory")]
+            Store::Memory(map) => memory_be::commit(map, ops, durability),
         }
     }
 }
@@ -242,6 +302,12 @@ impl Store {
 /// Map any displayable backend error into [`Error::Store`].
 #[cfg(any(feature = "backend-redb", feature = "backend-sled"))]
 fn store_err<E: std::fmt::Display>(e: E) -> Error {
+    Error::Store(e.to_string())
+}
+
+/// Map a poisoned lock into [`Error::Store`].
+#[cfg(feature = "backend-memory")]
+fn locked_err<E: std::fmt::Display>(e: E) -> Error {
     Error::Store(e.to_string())
 }
 
@@ -490,6 +556,105 @@ mod sled_be {
             // batches still go through the WAL, background flush decides
             // when bytes hit disk. Documented, same as upstream behavior.
             Durability::WalOnly | Durability::DisableWal => {}
+        }
+        Ok(())
+    }
+}
+
+/// In-memory backend for tests: `RwLock<BTreeMap>` with no persistence.
+///
+/// Commits hold the write lock for the whole op stream, so readers never
+/// observe a partial batch — the same atomicity each on-disk engine
+/// provides, at the cost of blocking reads during a commit. [`Durability`]
+/// is accepted and ignored: there is no WAL to fsync and nothing to
+/// survive a crash.
+#[cfg(feature = "backend-memory")]
+mod memory_be {
+    use std::collections::BTreeMap;
+    use std::sync::RwLock;
+
+    use super::*;
+
+    pub(super) type Map = RwLock<BTreeMap<Vec<u8>, Vec<u8>>>;
+
+    pub(super) fn get(map: &Map, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let guard = map.read().map_err(locked_err)?;
+        Ok(guard.get(key).cloned())
+    }
+
+    /// Materialized scan under the read lock. `from == None` scans the whole
+    /// keyspace; otherwise the scan covers `[from, end)` (`end == None` runs
+    /// to the end of the keyspace).
+    pub(super) fn scan(
+        map: &Map,
+        from: Option<&[u8]>,
+        end: Option<&[u8]>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let guard = map.read().map_err(locked_err)?;
+        let mut out = Vec::new();
+        match (from, end) {
+            (Some(start), Some(end)) => {
+                for (k, v) in guard.range(start.to_vec()..end.to_vec()) {
+                    out.push((k.clone(), v.clone()));
+                }
+            }
+            (Some(start), None) => {
+                for (k, v) in guard.range(start.to_vec()..) {
+                    out.push((k.clone(), v.clone()));
+                }
+            }
+            (None, _) => {
+                for (k, v) in guard.iter() {
+                    out.push((k.clone(), v.clone()));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    pub(super) fn commit(map: &Map, ops: Vec<FinalOp>, _durability: Durability) -> Result<()> {
+        let mut guard = map.write().map_err(locked_err)?;
+        for op in ops {
+            match op {
+                FinalOp::Put(k, v) => {
+                    guard.insert(k, v);
+                }
+                FinalOp::Delete(k) => {
+                    guard.remove(&k);
+                }
+                FinalOp::Merge(k, operand) => {
+                    let current = guard.get(&k).cloned();
+                    match schema::fold_merge(current.as_deref(), &[operand.as_slice()]) {
+                        Some(next) => {
+                            guard.insert(k, next);
+                        }
+                        None => {
+                            guard.remove(&k);
+                        }
+                    }
+                }
+                FinalOp::DeleteRange { start, end } => {
+                    let mut keys = Vec::new();
+                    match end {
+                        Some(end) => {
+                            for (k, _) in guard.range(start.clone()..end) {
+                                keys.push(k.clone());
+                            }
+                        }
+                        None => {
+                            for (k, _) in guard.range(start.clone()..) {
+                                if !k.starts_with(&start) {
+                                    break;
+                                }
+                                keys.push(k.clone());
+                            }
+                        }
+                    }
+                    for key in keys {
+                        guard.remove(&key);
+                    }
+                }
+            }
         }
         Ok(())
     }
