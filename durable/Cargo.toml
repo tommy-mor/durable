@@ -16,6 +16,9 @@ ciborium = "0.2.2"
 serde_json = { version = "1.0", features = ["raw_value"] }
 durable-derive = { path = "../durable-derive", version = "0.3.0" }
 crc32c = "0.6.8"
+# Canonical shape hash and whole-projection digest. Already in Cargo.lock
+# (0.10.x, pulled in transitively); no new crate enters the build.
+sha2 = "0.10"
 
 [features]
 # Storage backend selection: exactly one must be enabled. The backend is
@@ -43,3 +46,7 @@ durable = { path = ".", default-features = false, features = ["fault-injection"]
 tempfile = "3.8"
 proptest = "1.4"
 serde = { version = "1.0", features = ["derive"] }
+
+[[bin]]
+name = "durable-tape"
+path = "src/bin/durable_tape.rs"

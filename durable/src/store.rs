@@ -2,16 +2,16 @@
 //!
 //! Exactly one `backend-*` feature must be enabled (see `Cargo.toml`); the
 //! choice is made by the depending crate. [`Db`](super::Db) talks to storage
-//! only through [`Store`], so adding a backend means adding an enum variant
+//! only through `Store`, so adding a backend means adding an enum variant
 //! plus its `open` / `get` / scan / commit arms below — no call-site changes.
 //!
 //! Backend contract notes:
 //!
 //! * Single keyspace, lexicographically ordered, forward scans from a key.
-//! * Commits are atomic: every [`FinalOp`] in one [`Store::write`] call lands
+//! * Commits are atomic: every `FinalOp` in one `Store::write` call lands
 //!   together or not at all.
 //! * [`Durability`] maps onto each engine's fsync story; see the commit arms.
-//! * Merge ops fold through the shared [`crate::schema::fold_merge`]:
+//! * Merge ops fold through the shared `schema::fold_merge`:
 //!   natively at compaction time on RocksDB, read-modify-write inside the
 //!   commit transaction on redb, against a commit-time overlay on sled
 //!   (whose batches have no merge op), and read-modify-write under one write
@@ -22,7 +22,7 @@
 //!   which is the supported migration path everywhere durable is used.
 //! * `backend-memory` is ephemeral (`BTreeMap` + `RwLock`, no disk I/O,
 //!   [`Durability`] ignored). `Db::open(path)` ignores `path` and
-//!   [`Db::open_memory`](super::Db::open_memory) is the explicit entry point.
+//!   `Db::open_memory` is the explicit entry point.
 //!   Data vanishes when the last `Db` clone drops, so persistence tests
 //!   must not run against it.
 //!

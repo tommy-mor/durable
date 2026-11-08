@@ -38,7 +38,7 @@ use crate::{
 };
 use ciborium::Value;
 
-const META_NS: &str = "__durable";
+pub(crate) const META_NS: &str = "__durable";
 
 /// Authoritative ingest metadata. Assigned by [`Runtime`] at append time.
 ///
@@ -69,10 +69,7 @@ pub struct Record<E> {
 }
 
 impl<E: Serialize> Serialize for Record<E> {
-    fn serialize<S: serde::Serializer>(
-        &self,
-        s: S,
-    ) -> std::result::Result<S::Ok, S::Error> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
         let mut st = s.serialize_struct("Record", 6)?;
         st.serialize_field("seq", &self.seq)?;
@@ -86,10 +83,9 @@ impl<E: Serialize> Serialize for Record<E> {
 }
 
 impl<'de, E: DeserializeOwned> Deserialize<'de> for Record<E> {
-    fn deserialize<D: serde::Deserializer<'de>>(
-        d: D,
-    ) -> std::result::Result<Self, D::Error> {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
         #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct Helper<E> {
             seq: u64,
             ts_ms: u64,
@@ -130,12 +126,16 @@ pub fn seal_crc(prefix_bytes: &[u8]) -> String {
 /// `grep '^{"seq":…`, envelope then body, CRC suffix always exactly
 /// `,"crc":"xxxxxxxx"}` (18 bytes) so checking is slicing, never
 /// canonical-JSON. The only raw `\n` is added by the writer.
-pub fn render_sealed<E: Serialize>(seq: u64, ts_ms: u64, from: u64, to: u64, event: &E) -> Result<String> {
-    let body =
-        serde_json::to_string(event).map_err(|e| Error::Serialize(e.to_string()))?;
-    let mut prefix = format!(
-        "{{\"seq\":{seq},\"ts_ms\":{ts_ms},\"from\":{from},\"to\":{to},\"event\":{body}"
-    );
+pub fn render_sealed<E: Serialize>(
+    seq: u64,
+    ts_ms: u64,
+    from: u64,
+    to: u64,
+    event: &E,
+) -> Result<String> {
+    let body = serde_json::to_string(event).map_err(|e| Error::Serialize(e.to_string()))?;
+    let mut prefix =
+        format!("{{\"seq\":{seq},\"ts_ms\":{ts_ms},\"from\":{from},\"to\":{to},\"event\":{body}");
     let crc = seal_crc(prefix.as_bytes());
     prefix.push_str(",\"crc\":\"");
     prefix.push_str(&crc);
@@ -185,6 +185,25 @@ pub struct Corruption {
 /// the committed prefix); a valid line past it with a foreign `from`
 /// proves acknowledged bytes were damaged and is fatal.
 pub fn scan(bytes: &[u8]) -> std::result::Result<Committed, Corruption> {
+    scan_reader(bytes)
+}
+
+/// Streaming form of [`scan`]: the same rules, one line of memory. Lines
+/// are read through a bounded reader, so an overlong or newline-free
+/// garbage run never grows the buffer past 16 MiB.
+///
+/// Classification of each physical line (see `classify`):
+///
+/// * a candidate line follows the batch rules;
+/// * a damaged line (bad CRC, bad suffix, overlong, batch-incoherent) ends
+///   the committed prefix, and the tail check decides whether it is
+///   in-flight residue or damage to acknowledged bytes;
+/// * a line whose CRC is VALID but whose envelope this build does not read
+///   (an unknown key, a missing or mistyped field) was written by a writer
+///   this build does not understand. A torn write can never produce a valid
+///   CRC, so this is never residue: it is fatal wherever it appears, and the
+///   file is left untouched. This is the strict-envelope rule.
+pub fn scan_reader<R: BufRead>(mut reader: R) -> std::result::Result<Committed, Corruption> {
     let mut committed = Committed {
         end: 0,
         len: 0,
@@ -192,118 +211,157 @@ pub fn scan(bytes: &[u8]) -> std::result::Result<Committed, Corruption> {
     };
     // Outside: between batches. Inside: mid-batch, expecting `next`.
     let mut inside: Option<(u64, u64, u64)> = None;
+    // Set at the first damaged line; every later line is tail-checked.
     let mut bad: Option<(usize, String)> = None;
-    // Physical lines: split on \n, terminator included in length math.
-    let mut start = 0usize;
-    while start <= bytes.len() {
-        let rel = bytes[start..].iter().position(|b| *b == b'\n');
-        let (chunk, next) = match rel {
-            Some(i) => (&bytes[start..start + i], start + i + 1),
-            None => (&bytes[start..], bytes.len() + 1),
-        };
-        let terminated = next <= bytes.len();
-        let offset = start;
-        if !terminated {
-            // Trailing bytes with no newline: torn write, stop here.
-            if !chunk.iter().all(|b| b.is_ascii_whitespace()) && !chunk.is_empty() {
-                bad = Some((offset, "torn tail without newline".into()));
-            }
+    let mut offset = 0usize;
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        let read = read_line_bounded(&mut reader, &mut buf).map_err(|e| Corruption {
+            offset,
+            reason: format!("read failed: {e}"),
+        })?;
+        let Some(read) = read else { break };
+        let start = offset;
+        offset += read.consumed;
+        if !read.terminated {
+            // Trailing bytes with no newline: a torn write. Never committed,
+            // never judged further (no later line can follow it).
             break;
+        }
+        let chunk: &[u8] = if read.overlong {
+            // Only ever "not a candidate": recorded as damage, never parsed.
+            &[]
+        } else {
+            &buf[..buf.len() - 1]
+        };
+        if read.overlong {
+            if bad.is_none() {
+                bad = Some((
+                    start,
+                    "not a candidate line: sealed line over 16 MiB".into(),
+                ));
+            }
+            continue;
         }
         // Blank lines are skipped, legacy compatibility.
         if chunk.iter().all(|b| b.is_ascii_whitespace()) {
-            start = next;
             continue;
         }
-        let (env, _event) = match parse_sealed(chunk) {
-            Ok(v) => v,
-            Err(e) => {
-                bad = Some((offset, format!("not a candidate line: {e}")));
-                break;
-            }
-        };
-        // Candidate-line envelope rules already checked part; require
-        // batch coherence against the scan state.
-        match inside {
-            None => {
-                if env.from != committed.len || env.seq != env.from {
-                    bad = Some((
-                        offset,
-                        format!(
-                            "batch opens at from={} seq={} but tape holds {}",
-                            env.from, env.seq, committed.len
-                        ),
-                    ));
-                    break;
-                }
-                inside = Some((env.from, env.to, env.seq + 1));
-            }
-            Some((from, to, next_seq)) => {
-                if env.from != from || env.to != to || env.seq != next_seq {
-                    bad = Some((
-                        offset,
-                        format!(
-                            "batch [{from}..{to}] expects seq {next_seq} but got seq {}",
-                            env.seq
-                        ),
-                    ));
-                    break;
-                }
-                inside = Some((from, to, next_seq + 1));
-            }
+        if let Some((_, _)) = bad {
+            tail_check(chunk, start, committed.len, &bad)?;
+            continue;
         }
-        if env.seq == env.to {
-            committed = Committed {
-                end: next,
-                len: env.to + 1,
-                last_ts: committed.last_ts.max(env.ts_ms),
-            };
-            inside = None;
-        }
-        start = next;
-    }
-    if let Some((off, reason)) = bad {
-        // Tail check: every candidate line past committed.end with
-        // from == committed.len is in-flight residue, even a surviving
-        // closing line. Any other from proves a later batch was written,
-        // so the bad bytes are damage to acknowledged data: fatal.
-        let mut pos = committed.end;
-        while pos < bytes.len() {
-            let rel = bytes[pos..].iter().position(|b| *b == b'\n');
-            let (chunk, next) = match rel {
-                Some(i) => (&bytes[pos..pos + i], pos + i + 1),
-                None => break,
-            };
-            if !chunk.iter().all(|b| b.is_ascii_whitespace()) && !chunk.is_empty() {
-                match parse_sealed(chunk) {
-                    Ok((env, _)) => {
-                        if env.from != committed.len {
-                            return Err(Corruption { offset: off, reason });
+        match classify(chunk) {
+            Classified::Foreign(reason) => {
+                return Err(Corruption {
+                    offset: start,
+                    reason,
+                })
+            }
+            Classified::Damaged(reason) => {
+                bad = Some((start, format!("not a candidate line: {reason}")));
+                tail_check(chunk, start, committed.len, &bad)?;
+            }
+            Classified::Candidate(env, _event) => {
+                // Batch coherence against the scan state.
+                let coherent = match inside {
+                    None => {
+                        if env.from == committed.len && env.seq == env.from {
+                            inside = Some((env.from, env.to, env.seq + 1));
+                            true
+                        } else {
+                            bad = Some((
+                                start,
+                                format!(
+                                    "batch opens at from={} seq={} but tape holds {}",
+                                    env.from, env.seq, committed.len
+                                ),
+                            ));
+                            false
                         }
                     }
-                    Err(_) if is_unsealed_json(chunk) => {
-                        // A complete line that is valid JSON but carries no
-                        // crc suffix can't come from the sealed writer: a
-                        // torn write never ends in `}\n`, and zero-filled
-                        // pages are not valid JSON. It is someone else's
-                        // history (an unmigrated tape, a hand edit), never
-                        // residue. Refuse; never truncate it away.
-                        return Err(Corruption {
-                            offset: pos,
-                            reason: "unsealed line: not written by the sealed writer \
-                                     (migrate old tapes offline before opening)"
-                                .into(),
-                        });
+                    Some((from, to, next_seq)) => {
+                        if env.from == from && env.to == to && env.seq == next_seq {
+                            inside = Some((from, to, next_seq + 1));
+                            true
+                        } else {
+                            bad = Some((
+                                start,
+                                format!(
+                                    "batch [{from}..{to}] expects seq {next_seq} but got seq {}",
+                                    env.seq
+                                ),
+                            ));
+                            false
+                        }
                     }
-                    Err(_) => {}
+                };
+                if !coherent {
+                    tail_check(chunk, start, committed.len, &bad)?;
+                    continue;
+                }
+                if env.seq == env.to {
+                    committed = Committed {
+                        end: offset,
+                        len: env.to + 1,
+                        last_ts: committed.last_ts.max(env.ts_ms),
+                    };
+                    inside = None;
                 }
             }
-            pos = next;
         }
-        // Residue only: the committed prefix stands.
-        return Ok(committed);
     }
+    // Residue only: the committed prefix stands. (Any tail damage that
+    // proved acknowledged bytes were hit already returned Err above.)
     Ok(committed)
+}
+
+/// Tail rule for lines after the first damaged one. A candidate line with
+/// `from == committed.len` is in-flight residue; any other `from` proves a
+/// later batch was written, so the first bad line is damage to acknowledged
+/// data. Unsealed JSON and foreign envelopes are never residue.
+fn tail_check(
+    chunk: &[u8],
+    line_offset: usize,
+    committed_len: u64,
+    bad: &Option<(usize, String)>,
+) -> std::result::Result<(), Corruption> {
+    if chunk.iter().all(|b| b.is_ascii_whitespace()) {
+        return Ok(());
+    }
+    match classify(chunk) {
+        Classified::Candidate(env, _) => {
+            if env.from != committed_len {
+                let (off, reason) = bad.clone().unwrap_or((line_offset, String::new()));
+                return Err(Corruption {
+                    offset: off,
+                    reason,
+                });
+            }
+            Ok(())
+        }
+        Classified::Foreign(reason) => Err(Corruption {
+            offset: line_offset,
+            reason,
+        }),
+        Classified::Damaged(_) => {
+            if is_unsealed_json(chunk) {
+                // A complete line that is valid JSON but carries no crc
+                // suffix can't come from the sealed writer: a torn write
+                // never ends in `}\n`, and zero-filled pages are not valid
+                // JSON. It is someone else's history (an unmigrated tape, a
+                // hand edit), never residue. Refuse; never truncate it away.
+                return Err(Corruption {
+                    offset: line_offset,
+                    reason: "unsealed line: not written by the sealed writer \
+                             (migrate old tapes offline before opening)"
+                        .into(),
+                });
+            }
+            Ok(())
+        }
+    }
 }
 
 /// Valid JSON without the sealed `,"crc":"xxxxxxxx"}` suffix shape. A sealed
@@ -317,47 +375,81 @@ fn is_unsealed_json(line: &[u8]) -> bool {
     !has_crc_suffix && serde_json::from_slice::<serde::de::IgnoredAny>(line).is_ok()
 }
 
-pub fn parse_sealed(line: &[u8]) -> Result<(SealedEnvelope, Vec<u8>)> {
+/// One line, classified without ever searching inside damaged bytes.
+pub(crate) enum Classified<'a> {
+    /// Passes every candidate rule. Carries the envelope and the raw event.
+    Candidate(SealedEnvelope, &'a [u8]),
+    /// Not a candidate, for a reason a torn or damaged write can produce.
+    Damaged(String),
+    /// CRC-valid, but the envelope is not one this build reads.
+    Foreign(String),
+}
+
+pub(crate) fn classify(line: &[u8]) -> Classified<'_> {
     if line.len() > MAX_SEALED_LINE {
-        return Err(Error::Deserialize("sealed line over 16 MiB".into()));
+        return Classified::Damaged("sealed line over 16 MiB".into());
     }
     if line.len() < CRC_SUFFIX_LEN + 2 {
-        return Err(Error::Deserialize("sealed line too short for a crc".into()));
+        return Classified::Damaged("sealed line too short for a crc".into());
     }
     let (prefix, suffix) = line.split_at(line.len() - CRC_SUFFIX_LEN);
     if !suffix.starts_with(b",\"crc\":\"") || !suffix.ends_with(b"\"}") {
-        return Err(Error::Deserialize("sealed line missing crc suffix".into()));
+        return Classified::Damaged("sealed line missing crc suffix".into());
     }
-    let got = std::str::from_utf8(&suffix[8..16])
-        .map_err(|e| Error::Deserialize(e.to_string()))?;
+    let got = match std::str::from_utf8(&suffix[8..16]) {
+        Ok(s) => s,
+        Err(e) => return Classified::Damaged(e.to_string()),
+    };
     if !got.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(Error::Deserialize("sealed crc not hex".into()));
+        return Classified::Damaged("sealed crc not hex".into());
     }
-    let want = seal_crc(prefix);
-    if got != want {
-        return Err(Error::Deserialize("sealed crc mismatch".into()));
+    if got != seal_crc(prefix) {
+        return Classified::Damaged("sealed crc mismatch".into());
     }
-    let env: SealedEnvelopeWire =
-        serde_json::from_slice(line).map_err(|e| Error::Deserialize(e.to_string()))?;
+    // The CRC is valid: the sealed writer wrote exactly these bytes. From
+    // here an unreadable envelope is not damage a torn write could make.
+    let env: SealedEnvelopeWire = match serde_json::from_slice(line) {
+        Ok(env) => env,
+        Err(e) => {
+            return Classified::Foreign(format!(
+                "crc-valid sealed line this build does not read (unknown or mistyped envelope field?): {e}"
+            ))
+        }
+    };
     if env.from > env.to || env.seq < env.from || env.seq > env.to {
-        return Err(Error::Deserialize("sealed envelope seq outside batch".into()));
+        return Classified::Damaged("sealed envelope seq outside batch".into());
     }
     if env.to - env.from >= MAX_SEALED_BATCH {
-        return Err(Error::Deserialize("sealed batch too large".into()));
+        return Classified::Damaged("sealed batch too large".into());
     }
-    let event_bytes = env.event.get().as_bytes().to_vec();
-    Ok((
+    Classified::Candidate(
         SealedEnvelope {
             seq: env.seq,
             ts_ms: env.ts_ms,
             from: env.from,
             to: env.to,
         },
-        event_bytes,
-    ))
+        env.event.get().as_bytes(),
+    )
 }
 
+/// Parse one sealed line into its envelope and raw event bytes. Strict:
+/// unknown envelope keys are refused (see [`scan_reader`]).
+pub fn parse_sealed(line: &[u8]) -> Result<(SealedEnvelope, Vec<u8>)> {
+    match classify(line) {
+        Classified::Candidate(env, event) => Ok((env, event.to_vec())),
+        Classified::Damaged(reason) | Classified::Foreign(reason) => {
+            Err(Error::Deserialize(reason))
+        }
+    }
+}
+
+/// The sealed envelope as this build reads it. `crc` is declared (it is
+/// checked by slicing, not here) so that `deny_unknown_fields` refuses any
+/// other key. Adding an envelope key is a format change: a binary built
+/// before it must refuse the tape loudly, which this rule guarantees.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SealedEnvelopeWire<'a> {
     seq: u64,
     ts_ms: u64,
@@ -365,6 +457,93 @@ struct SealedEnvelopeWire<'a> {
     to: u64,
     #[serde(borrow)]
     event: &'a serde_json::value::RawValue,
+    #[allow(dead_code)]
+    crc: serde::de::IgnoredAny,
+}
+
+/// Result of one bounded line read.
+struct LineRead {
+    /// Bytes consumed from the reader, including the newline if present.
+    consumed: usize,
+    terminated: bool,
+    overlong: bool,
+}
+
+/// Read one physical line into `buf` (newline included when present),
+/// refusing to hold more than the maximum line. Returns `None` at EOF.
+fn read_line_bounded<R: BufRead>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+) -> std::io::Result<Option<LineRead>> {
+    let mut consumed = 0usize;
+    let mut terminated = false;
+    let mut overlong = false;
+    loop {
+        let avail = reader.fill_buf()?;
+        if avail.is_empty() {
+            break;
+        }
+        let (take, done) = match avail.iter().position(|b| *b == b'\n') {
+            Some(i) => (i + 1, true),
+            None => (avail.len(), false),
+        };
+        if !overlong {
+            if buf.len() + take > MAX_SEALED_LINE + 1 {
+                overlong = true;
+                buf.clear();
+            } else {
+                buf.extend_from_slice(&avail[..take]);
+            }
+        }
+        reader.consume(take);
+        consumed += take;
+        if done {
+            terminated = true;
+            break;
+        }
+    }
+    if consumed == 0 {
+        return Ok(None);
+    }
+    Ok(Some(LineRead {
+        consumed,
+        terminated,
+        overlong,
+    }))
+}
+
+/// Fold one record into `db` exactly as the runtime does: the reducer's
+/// writes and the applied offset in one commit, with the log as truth.
+pub(crate) fn fold_one<E>(
+    db: &Db,
+    reducer: &impl Fn(&mut Tx, &E) -> Result<()>,
+    meta: Meta,
+    event: &E,
+) -> Result<()> {
+    let mut tx = Tx::new(db, meta);
+    reducer(&mut tx, event)?;
+    tx.write(applied_leaf().set(&(meta.seq + 1)));
+    tx.commit(Durability::DisableWal)?;
+    Ok(())
+}
+
+/// Render a sealed line whose event is already-valid JSON bytes, copied
+/// verbatim. Same envelope bytes as [`render_sealed`] for the same inputs.
+pub(crate) fn render_sealed_raw(
+    seq: u64,
+    ts_ms: u64,
+    from: u64,
+    to: u64,
+    event_json: &[u8],
+) -> String {
+    let mut prefix =
+        format!("{{\"seq\":{seq},\"ts_ms\":{ts_ms},\"from\":{from},\"to\":{to},\"event\":");
+    prefix.push_str(std::str::from_utf8(event_json).expect("event JSON is UTF-8"));
+    let crc = seal_crc(prefix.as_bytes());
+    prefix.push_str(",\"crc\":\"");
+    prefix.push_str(&crc);
+    prefix.push_str("\"}");
+    prefix
 }
 
 /// A reducer transaction: reified writes plus committed-state reads.
@@ -381,7 +560,7 @@ pub struct Tx {
 }
 
 impl Tx {
-    fn new(db: &Db, meta: Meta) -> Self {
+    pub(crate) fn new(db: &Db, meta: Meta) -> Self {
         Self {
             batch: db.batch(),
             meta,
@@ -459,7 +638,7 @@ impl Tx {
         self.batch.db()
     }
 
-    fn commit(self, durability: Durability) -> Result<Vec<Write>> {
+    pub(crate) fn commit(self, durability: Durability) -> Result<Vec<Write>> {
         let writes = self.writes.clone();
         self.batch.commit_with(durability)?;
         Ok(writes)
@@ -468,7 +647,7 @@ impl Tx {
 
 /// Append-only JSONL event log. One object per line; the file is canonical.
 ///
-/// Length is counted once at open and maintained by [`JsonlLog::append`].
+/// Length is counted once at open and maintained by `JsonlLog::append_all`.
 /// This process is the writer; do not append to the same file from elsewhere
 /// and expect `len` to notice.
 pub struct JsonlLog<E> {
@@ -637,7 +816,10 @@ impl<E> JsonlLog<E> {
             .open(&path)
             .map_err(|e| Error::Log(e.to_string()))?;
         let len = count_jsonl_lines(&mut file)?;
-        let end = file.metadata().map_err(|e| Error::Log(e.to_string()))?.len();
+        let end = file
+            .metadata()
+            .map_err(|e| Error::Log(e.to_string()))?
+            .len();
         Ok(Self {
             path,
             file: Box::new(file),
@@ -661,7 +843,14 @@ impl<E> JsonlLog<E> {
         }
         if !path.exists() {
             let log = Self::open(&path)?;
-            return Ok((log, Committed { end: 0, len: 0, last_ts: 0 }));
+            return Ok((
+                log,
+                Committed {
+                    end: 0,
+                    len: 0,
+                    last_ts: 0,
+                },
+            ));
         }
         // Spec order: scan read-only FIRST, cross-check (by the caller)
         // against the projection, and only then seal. Truncating before
@@ -873,7 +1062,7 @@ impl<E: Serialize + DeserializeOwned> JsonlLog<Record<E>> {
     }
 }
 
-fn applied_leaf() -> DPath<Leaf<u64>> {
+pub(crate) fn applied_leaf() -> DPath<Leaf<u64>> {
     let mut prefix = Vec::new();
     codec::put_segment(&mut prefix, META_NS.as_bytes());
     DPath::from_prefix(codec::child_key(&prefix, &field_segment(0)))
@@ -893,7 +1082,7 @@ struct Inner<E> {
 pub struct Runtime<E> {
     inner: Mutex<Inner<E>>,
     applied: AtomicU64,
-    db: Db,
+    pub(crate) db: Db,
     schema: Shape,
     namespace: Option<String>,
     reducer: Arc<dyn Fn(&mut Tx, &E) -> Result<()> + Send + Sync>,
@@ -905,10 +1094,22 @@ pub struct Runtime<E> {
     /// lock; the store binding pulls them right after `append` returns to
     /// wake parked waiters — same thread, no race.
     last_writes: Mutex<Vec<Write>>,
+    /// The projection identity this runtime was opened with.
+    pub(crate) identity: Option<crate::projection::ProjectionStamp>,
+    /// Exclusive writer lock on the tape (open_with only); released on drop.
+    #[allow(dead_code)]
+    tape_lock: Option<std::fs::File>,
 }
 
 impl<E: Serialize + DeserializeOwned + 'static> Runtime<E> {
     /// Open (or create) a runtime and catch the projection up to the log.
+    ///
+    /// Legacy entry point, kept byte-for-byte in behaviour: no tape lock and
+    /// no projection identity check. Any identity stamp already in the
+    /// projection must carry reducer id 0 (what `open` implies), whatever its
+    /// shape hash; otherwise the open is refused with
+    /// [`Error::ProjectionMismatch`] before anything is written. New code
+    /// should use [`Runtime::open_with`].
     pub fn open(
         db_path: impl AsRef<Path>,
         log_path: impl AsRef<Path>,
@@ -916,38 +1117,135 @@ impl<E: Serialize + DeserializeOwned + 'static> Runtime<E> {
         namespace: Option<String>,
         reducer: impl Fn(&mut Tx, &E) -> Result<()> + Send + Sync + 'static,
     ) -> Result<Self> {
-        let db_path = db_path.as_ref().to_path_buf();
+        Self::open_impl(
+            db_path.as_ref(),
+            log_path.as_ref(),
+            schema,
+            namespace,
+            Arc::new(reducer),
+            None,
+        )
+    }
+
+    /// Open with a projection identity (see [`crate::ProjectionId`]).
+    ///
+    /// Takes an exclusive advisory lock on the tape for the lifetime of the
+    /// returned runtime; a second `open_with` on the same tape fails with
+    /// [`Error::Log`] instead of racing the writer. The identity check runs
+    /// BEFORE any reducer call: on mismatch with `OnMismatch::Rebuild` the
+    /// projection is wiped and re-stamped first, then catch-up starts from 0.
+    pub fn open_with(
+        db_path: impl AsRef<Path>,
+        log_path: impl AsRef<Path>,
+        options: crate::projection::OpenOptions<E>,
+    ) -> Result<Self> {
+        let crate::projection::OpenOptions {
+            schema,
+            namespace,
+            projection,
+            on_mismatch,
+            reducer,
+        } = options;
+        Self::open_impl(
+            db_path.as_ref(),
+            log_path.as_ref(),
+            schema,
+            namespace,
+            reducer,
+            Some((projection, on_mismatch)),
+        )
+    }
+
+    fn open_impl(
+        db_path: &Path,
+        log_path: &Path,
+        schema: Shape,
+        namespace: Option<String>,
+        reducer: crate::projection::Reducer<E>,
+        managed: Option<(
+            crate::projection::ProjectionId,
+            crate::projection::OnMismatch,
+        )>,
+    ) -> Result<Self> {
+        use crate::projection::{read_stamp, reset, OnMismatch, ProjectionStamp};
         if let Some(parent) = db_path.parent() {
             fs::create_dir_all(parent).map_err(|e| Error::Log(e.to_string()))?;
         }
-        let log_path = log_path.as_ref().to_path_buf();
         if let Some(parent) = log_path.parent() {
             fs::create_dir_all(parent).map_err(|e| Error::Log(e.to_string()))?;
         }
+        // Lock first, so nothing below races another writer's seal or batch.
+        let tape_lock = match managed {
+            Some(_) => Some(crate::projection::lock_tape(log_path)?),
+            None => None,
+        };
         // Spec Opening order: scan read-only, open the projection, then
         // cross-check BEFORE sealing. Sealing first would destroy the
         // evidence disagreement needs — the file must stay byte-identical
         // on every fatal path.
         let found = if log_path.exists() {
-            JsonlLog::<Record<E>>::scan_file(&log_path)?
+            JsonlLog::<Record<E>>::scan_file(log_path)?
         } else {
-            Committed { end: 0, len: 0, last_ts: 0 }
+            Committed {
+                end: 0,
+                len: 0,
+                last_ts: 0,
+            }
         };
         // No legacy path, ever: an unsealed line is refused by the scan
         // with the file untouched, never dropped as residue. Old tapes
         // migrate through the offline migration script, never the writer.
-        let db = Db::open(&db_path)?;
+        let db = Db::open(db_path)?;
+        let stored = read_stamp(&db)?;
         let applied = applied_leaf().get(&db)?.unwrap_or(0);
-        if applied > found.len {
-            return Err(Error::Corruption(format!(
-                "projection and tape disagree (applied={applied}, tape has {})",
-                found.len
-            )));
-        }
+        let (identity, rebuild) = match managed {
+            None => {
+                if let Some(s) = stored {
+                    if s.reducer != 0 {
+                        return Err(Error::ProjectionMismatch {
+                            stored: Some(s),
+                            wanted: ProjectionStamp::new(0, &schema),
+                        });
+                    }
+                }
+                (stored, false)
+            }
+            Some((projection, mode)) => {
+                let wanted = ProjectionStamp::new(projection.reducer, &schema);
+                if stored == Some(wanted) {
+                    (Some(wanted), false)
+                } else {
+                    // Nothing applied and nothing stamped is a fresh store:
+                    // there is no state to protect, so adopt it under Refuse
+                    // too. Everything else that disagrees is a mismatch.
+                    let fresh = stored.is_none() && applied == 0;
+                    if mode == OnMismatch::Refuse && !fresh {
+                        return Err(Error::ProjectionMismatch { stored, wanted });
+                    }
+                    (Some(wanted), true)
+                }
+            }
+        };
+        let applied = if rebuild {
+            // Wipe and stamp are two commits, in this order, BEFORE any
+            // catch-up. See `projection::reset` for the crash analysis.
+            reset(&db, identity)?;
+            0
+        } else {
+            // Cross-check BEFORE sealing: a projection ahead of the tape is
+            // evidence that must survive untouched.
+            if applied > found.len {
+                return Err(Error::Corruption(format!(
+                    "projection and tape disagree (applied={applied}, tape has {})",
+                    found.len
+                )));
+            }
+            applied
+        };
         if log_path.exists() {
-            JsonlLog::<Record<E>>::seal_to(&log_path, &found)?;
+            JsonlLog::<Record<E>>::seal_to(log_path, &found)?;
         }
-        let mut log = JsonlLog::open(&log_path)?;
+        let mut log = JsonlLog::open(log_path)?;
         log.len = found.len;
         log.end = found.end as u64;
         let last_ts_ms = found.last_ts;
@@ -961,9 +1259,11 @@ impl<E: Serialize + DeserializeOwned + 'static> Runtime<E> {
             db,
             schema,
             namespace,
-            reducer: Arc::new(reducer),
+            reducer,
             on_commit: Mutex::new(None),
             last_writes: Mutex::new(Vec::new()),
+            identity,
+            tape_lock,
         };
         rt.catch_up()?;
         Ok(rt)
@@ -1121,6 +1421,7 @@ impl<E: Serialize + DeserializeOwned + 'static> Runtime<E> {
     }
 
     fn apply_record(&self, inner: &mut Inner<E>, rec: &Record<E>) -> Result<()> {
+        crate::fault::hit("projection.apply")?;
         let mut tx = Tx::new(&self.db, rec.meta());
         (self.reducer)(&mut tx, &rec.event)?;
         tx.write(applied_leaf().set(&(rec.seq + 1)));
@@ -1139,15 +1440,14 @@ impl<E: Serialize + DeserializeOwned + 'static> Runtime<E> {
         Ok(())
     }
 
-    /// Drop the projection and rebuild it from event 0.
+    /// Drop the projection and rebuild it from event 0. A runtime opened with
+    /// an identity is re-stamped with it after the wipe and before replay.
     pub fn rebuild(&self) -> Result<()> {
         let mut inner = self
             .inner
             .lock()
             .map_err(|_| Error::Log("runtime lock poisoned".into()))?;
-        let mut tx = Tx::new(&self.db, Meta { seq: 0, ts_ms: 0 });
-        tx.write(Write::new(crate::Op::DeletePrefix { prefix: Vec::new() }));
-        tx.commit(Durability::DisableWal)?;
+        crate::projection::reset(&self.db, self.identity)?;
         inner.applied = 0;
         self.applied.store(0, Ordering::Release);
         self.catch_up_locked(&mut inner)?;
@@ -1177,8 +1477,11 @@ impl<E: Serialize + DeserializeOwned + 'static> Runtime<E> {
             move |tx, ev| reducer(tx, ev),
         )?;
         other.rebuild()?;
-        let left = dump(&self.db)?;
-        let right = dump(&other.db)?;
+        // The replay is an unidentified runtime, so the identity stamp keys
+        // (which only an identified runtime writes) are compared by the
+        // identity tests, not here. Everything else must match exactly.
+        let left = crate::projection::without_stamp(dump(&self.db)?);
+        let right = crate::projection::without_stamp(dump(&other.db)?);
         drop(other);
         let _ = fs::remove_dir_all(&tmp);
         if left != right {

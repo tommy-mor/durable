@@ -57,10 +57,15 @@
 
 /// Key encoding for durable paths: segment framing, order-preserving indexes,
 /// and the self-describing child tags external readers need to decode keys.
+pub mod census;
 pub mod codec;
 pub mod dynpath;
+mod equiv;
+pub mod fault;
 mod path;
+mod projection;
 pub mod query;
+mod rewrite;
 pub mod runtime;
 mod schema;
 mod shape;
@@ -96,11 +101,14 @@ use thiserror::Error;
 
 pub use durable_derive::Durable;
 pub use dynpath::{cbor_to_json, json_to_cbor, navs_for, Location};
+pub use equiv::{digest_pairs, fold_dump, testing};
 pub use path::Path;
+pub use projection::{shape_hash, OnMismatch, OpenOptions, ProjectionId, ProjectionStamp};
 pub use query::{
     entries, explain, one, project, select, subtree, CostClass, Expr, Nav, Plan, Predicate, Query,
     Terminal,
 };
+pub use rewrite::{dry_run, rewrite, Emit, Mode, RewriteReport, Step};
 pub use runtime::{JsonlLog, Meta, Record, Runtime, TapeFile, Tx};
 #[cfg(feature = "fault-injection")]
 pub use runtime::{FailMode, FailingFile, FakeDisk};
@@ -129,6 +137,14 @@ pub enum Error {
     Log(String),
     #[error("reducer error: {0}")]
     Reducer(String),
+    /// The projection's stored identity disagrees with the one requested, and
+    /// the open asked to refuse rather than rebuild. Nothing was written.
+    /// Added with projection identity; no existing variant changed.
+    #[error("projection mismatch: stored {stored:?}, wanted {wanted}")]
+    ProjectionMismatch {
+        stored: Option<ProjectionStamp>,
+        wanted: ProjectionStamp,
+    },
 }
 
 /// Result alias used throughout the crate.
@@ -228,7 +244,7 @@ impl Db {
     /// backends means replaying the event tape into a fresh directory.
     /// With `backend-memory` the `path` is ignored and the database is
     /// ephemeral — nothing is written to disk and data vanishes when the
-    /// last `Db` handle is dropped. Use [`Db::open_memory`] in that case to
+    /// last `Db` handle is dropped. Use `Db::open_memory` in that case to
     /// make the intent explicit.
     pub fn open<P: AsRef<FsPath>>(path: P) -> Result<Self> {
         let store = Store::open(path.as_ref())?;
