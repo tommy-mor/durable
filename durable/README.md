@@ -100,6 +100,13 @@ fn main() -> durable::Result<()> {
 }
 ```
 
+## Evolving a tape
+
+Changing how history is interpreted: bump `ProjectionId` to re-derive the
+projection, record decisions as data, and rewrite old records once offline
+with `durable::rewrite` (proven equal by `testing::assert_rewrite_equivalent`).
+Read `docs/evolving-a-tape.md`. Operators: `durable-tape status|verify|cat|census`.
+
 ## The model
 
 ### Schema types
