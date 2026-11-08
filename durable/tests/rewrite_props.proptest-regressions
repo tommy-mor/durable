@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 6abe68f38d812a2ca9677912f5a25f1a0a417b7c5b7729e499893297219e23b0 # shrinks to tape = Tape { batches: [[(18446744073709551604, Add { key: "amhy", n: 799 })], [(18446744073709551605, Note("\\🕴?`%B:"))], [(18446744073709551606, Note("")), (18446744073709551607, Pair { a: 3078284573102872726, b: "xar" })], [(18446744073709551608, Add { key: "é", n: 353 }), (18446744073709551609, Pair { a: 18358124893611758854, b: "é" })], [(18446744073709551610, Note("}, ] { [ : ,")), (18446744073709551611, Note("emoji 😀 and \u{2028} separator")), (18446744073709551612, Reset), (18446744073709551613, Add { key: "é", n: 582 }), (18446744073709551614, Pair { a: 12974680182550414262, b: "b c" })]], raw: [[false], [true], [false, true], [true, false], [false, true, true, true, true]] }
