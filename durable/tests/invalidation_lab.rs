@@ -383,8 +383,8 @@ impl Rng {
         self.0 ^= self.0 << 17;
         self.0
     }
-    fn pick<'a, T>(&mut self, xs: &'a [T]) -> &'a T {
-        &xs[(self.next() % xs.len() as u64) as usize]
+    fn pick<T: Copy>(&mut self, xs: &[T]) -> T {
+        xs[(self.next() % xs.len() as u64) as usize]
     }
     fn n(&mut self, m: u64) -> u64 {
         self.next() % m
@@ -395,8 +395,8 @@ const NAMES: [&str; 5] = ["bob", "bobby", "al", "carol", "zed"];
 const ROOMS: [&str; 3] = ["lobby", "dev", "x"];
 
 fn random_write(s: &Shape, r: &mut Rng) -> Vec<Write> {
-    let u = *r.pick(&NAMES);
-    let room = *r.pick(&ROOMS);
+    let u = r.pick(&NAMES);
+    let room = r.pick(&ROOMS);
     let root = Lab::root();
     match r.n(20) {
         0 => put(s, vec![f("users"), k(u), f("name")], t(r.pick(&NAMES))),
@@ -423,8 +423,8 @@ fn random_write(s: &Shape, r: &mut Rng) -> Vec<Write> {
 }
 
 fn random_query(r: &mut Rng) -> Vec<Nav> {
-    let u = *r.pick(&NAMES);
-    let room = *r.pick(&ROOMS);
+    let u = r.pick(&NAMES);
+    let room = r.pick(&ROOMS);
     let banned_true = Nav::Where(Predicate::Eq(Expr::Field("banned".into()), Expr::Lit(Value::Bool(true))));
     match r.n(22) {
         0 => vec![f("users"), k(u), f("name")],
