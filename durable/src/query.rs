@@ -772,7 +772,7 @@ fn materialize_focus(db: &Db, focus: &Focus) -> Result<Value> {
 }
 
 fn materialize(db: &Db, prefix: &[u8], shape: &Shape) -> Result<Value> {
-    // Missing reads nil for CONTAINERS (the hop-store contract): a map,
+    // Missing reads nil for CONTAINERS (the presence contract): a map,
     // record, list, or deque nothing was written under answers nil, not an
     // empty costume — truthiness is presence there. Scalars keep their
     // natural defaults: a missing leaf is nil, a missing sum is 0 (a

@@ -46,4 +46,4 @@ Expectations to confirm (from code, not yet measured):
 Deliverables: one graph per structure + a table of actuals folded into
 durable/docs/design.md ("measured on <date>, <sizes>, cold cache").
 Open questions: merge-accumulation vs read latency curves; compaction debt
-under sustained append; block-cache sizing guidance for hopd operators.
+under sustained append; block-cache sizing guidance for operators.
