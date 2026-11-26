@@ -1,0 +1,87 @@
+// whiteboard.hop — multiplayer with linear marks + cast.
+//
+// The 1:1 browser↔server path is linear marks. Fan-out cannot be linear
+// (you can't continue a body on 500 tabs and hop home), so broadcast and
+// direct sends are `cast`: run this block over there, no value, no wait,
+// at-most-once.
+
+// ---------------------------------------------------------------------------
+// Server-side session bookkeeping: session id → display color.
+
+server let palette = ["tomato", "steelblue", "seagreen", "orchid"];
+server let members = {};
+
+server fn on_connect(sid) {
+  members[sid] = palette[#members % #palette + 1];
+}
+
+server fn on_close(sid) {
+  members[sid] = nil;
+}
+
+// ---------------------------------------------------------------------------
+// A stroke: optimistic echo, server-stamped authority, broadcast.
+
+fn stroke(from, to) {
+  canvas.draw(from, to, "silver");    // zero-latency local ink
+
+  server!();
+  // ── crossed: { from, to }. Color is server-assigned; session identity
+  //    comes from the connection, never from a var the client sent.
+  let color = members[session()];
+
+  cast browsers {
+    // every connected tab, including the origin: the silver echo gets
+    // repainted in its true color, everyone else sees the stroke for the
+    // first time. per-pair FIFO: one author's strokes never arrive swapped.
+    canvas.draw(from, to, color);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Cursor presence: same shape, higher frequency, skip self on receive.
+
+fn cursor(pos) {
+  server!();
+  let who = session();
+  let color = members[who];
+  cast browsers {
+    if session() != who {
+      canvas.ghost(who, pos, color);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Direct to one tab — and because the function boundary returns to the
+// caller, an acknowledged poke is just... a function with marks in it.
+
+fn poke(target) {
+  server!();
+  let color = members[session()];
+  cast session(target) {
+    canvas.flash(color);
+  }
+}
+
+fn poke_with_receipt(target) {
+  server!();
+  let color = members[session()];
+  try {
+    session(target)!();               // direct mark: continue on that tab
+    canvas.flash(color);
+    return "seen";                    // boundary hop: value → caller's side
+  } catch Disconnect {
+    return "gone";
+  }
+}
+
+// ---------------------------------------------------------------------------
+
+on_drag("#board", stroke);
+on_move("#board", throttle(50, cursor));
+on_click("#poke", fn() { dom.toast(poke_with_receipt(dom.selected_peer())); });
+
+// Deliberately missing: persistence. When ramalite plugs in, stroke()'s
+// server segment appends an event to the durable log before the cast, and
+// late joiners replay the tape to repaint the board. The marks don't move.

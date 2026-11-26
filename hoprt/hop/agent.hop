@@ -1,0 +1,471 @@
+// agent.hop — a coding agent in one file: chat UI, streamed LLM turns,
+// an approval-gated bash tool, and a transcript that survives restarts
+// because it lives on the tape. Thread-aware: the store is a map of
+// threads, every event names its thread, and each *user* views (and
+// works) their own thread — a user is the durable identity behind the
+// tab (hopd's cookie), so a reload lands back in the same thread and
+// every tab of one user stays in sync via `cast user(uid)`.
+//
+//   export OPENAI_API_KEY=...           (and optionally OPENAI_BASE_URL)
+//   export HOP_LLM_MODEL=gpt-4o-mini    (or pass model in the request)
+//   cargo run -p hoprt --bin hopd -- hoprt/hop/agent.hop
+//   open http://localhost:9000 — ask something, approve a command.
+//   restart hopd mid-conversation: the transcripts are still there.
+//
+// The shape of the thing: the model loop lives on the server as events on
+// the tape (user / assistant / tool_request / tool_result, all carrying a
+// tid), placement marks appear only at the human gates (send, approve,
+// deny, open, new), and the long calls — llm.stream, llm.next, bash —
+// suspend the flow while the VM keeps serving every connected tab. The
+// browser can append events and render; it never sees the API key and
+// cannot reach bash.
+
+schema {
+  threads: map<record {
+    title: leaf,              // first user message (or "thread N")
+    msgs: list<blob<map {     // { role, text } — the transcript
+      role: string,
+      text: string,
+      call_id: string
+    }>>,
+    pending: leaf,            // command string awaiting approval
+    busy: leaf                // a turn is in flight on this thread
+  }>,
+  views: map<string, leaf>,   // uid -> tid: what each user is viewing
+  next: leaf,                 // next thread id to mint
+  auto: leaf,                 // auto-approve: tools run ungated
+  model: leaf,                // chosen model (nil = env default)
+  models: leaf,               // the provider's catalog, for the picker
+  home: leaf                  // working directory for bash
+}
+
+fn reduce(event) {
+  match event {
+    thread { tid } => {
+      store(["threads", tid, "title", store.set("thread " .. tid)]);
+      store(["next", store.set(tid + 1)]);
+    }
+    retitle { tid, title } => {
+      store(["threads", tid, "title", store.set(title)]);
+    }
+    open { uid, tid } => {
+      store(["views", uid, store.set(tid)]);
+    }
+    user { tid, text } => {
+      store(["threads", tid, "msgs", store.push({ role = "user", text = text })]);
+      store(["threads", tid, "busy", store.set(true)]);
+    }
+    assistant { tid, text } => {
+      store(["threads", tid, "msgs", store.push({ role = "assistant", text = text })]);
+      store(["threads", tid, "busy", store.set(false)]);
+    }
+    tool_request { tid, cmd, call_id } => {
+      store(["threads", tid, "msgs", store.push({ role = "tool_request", text = cmd, call_id = call_id })]);
+      store(["threads", tid, "pending", store.set({ cmd = cmd, call_id = call_id })]);
+      store(["threads", tid, "busy", store.set(false)]);
+    }
+    tool_result { tid, output, call_id } => {
+      store(["threads", tid, "msgs", store.push({ role = "tool", text = output, call_id = call_id })]);
+      store(["threads", tid, "pending", store.del]);
+      store(["threads", tid, "busy", store.set(true)]);
+    }
+    tool_denied { tid, call_id } => {
+      store(["threads", tid, "msgs", store.push({ role = "tool", text = "(user declined to run the command)", call_id = call_id })]);
+      store(["threads", tid, "pending", store.del]);
+      store(["threads", tid, "busy", store.set(true)]);
+    }
+    set_auto { on } => {
+      store(["auto", store.set(on)]);
+    }
+    set_model { model } => {
+      if model == "" {
+        store(["model", store.del]);
+      } else {
+        store(["model", store.set(model)]);
+      }
+    }
+    set_home { dir } => {
+      if dir == "" {
+        store(["home", store.del]);
+      } else {
+        store(["home", store.set(dir)]);
+      }
+    }
+    models { list } => {
+      store(["models", store.set(list)]);
+    }
+  }
+}
+
+// ── the turn: stream, parse, either answer or ask to run a tool ─────────
+
+// The bash tool, bound for real: models trained on function calling
+// check what tools their request actually carries, and a text-only
+// protocol reads as "no tools available" — some will honestly refuse.
+fn bash_tool() {
+  return [{
+    type = "function",
+    function = {
+      name = "bash",
+      description = "Run a shell command in the user's project directory and return its output. One command per call; you will receive stdout/stderr and can then issue the next.",
+      parameters = {
+        type = "object",
+        properties = { cmd = { type = "string", description = "the shell command to run" } },
+        required = ["cmd"]
+      }
+    }
+  }];
+}
+
+fn llm_messages(tid) {
+  let sys = "You are a coding agent running in the user's project directory. Use the bash tool to run shell commands — one command per call; its output comes back as the tool result, and you can then issue the next. If your harness has no bash tool bound, reply instead with a single JSON object {\"tool\":\"bash\",\"cmd\":\"...\"} and nothing else. When you are done (or need nothing), answer the user in plain text.";
+  let home = store(["home"]);
+  if home {
+    sys = sys .. " Your working directory is " .. home .. ".";
+  }
+  let out = [{ role = "system", content = sys }];
+  let msgs = store(["threads", tid, "msgs"]);
+  if msgs {
+    for i, m in msgs {
+      if m.role == "user" {
+        push(out, { role = "user", content = m.text });
+      } else if m.role == "tool" {
+        if m.call_id {
+          push(out, { role = "tool", tool_call_id = m.call_id, content = m.text });
+        } else {
+          push(out, { role = "user", content = "tool output:\n" .. m.text });
+        }
+      } else if m.role == "tool_request" {
+        if m.call_id {
+          // replay the model's own call in the shape it emitted it
+          push(out, { role = "assistant", tool_calls = [{
+            id = m.call_id,
+            type = "function",
+            function = { name = "bash", arguments = json.encode({ cmd = m.text }) }
+          }] });
+        } else {
+          push(out, { role = "assistant", content = m.text });
+        }
+      } else {
+        push(out, { role = "assistant", content = m.text });
+      }
+    }
+  }
+  return out;
+}
+
+fn run_turn(tid) {
+  let req = { messages = llm_messages(tid), tools = bash_tool() };
+  let model = store(["model"]);
+  if model {
+    req.model = model;
+  }
+  let h = llm.stream(req);
+  let acc = "";
+  let out = llm.next(h);
+  while out.delta {
+    acc = acc .. out.delta;
+    paint_stream(tid, "assistant: " .. acc);
+    out = llm.next(h);
+  }
+  if out.error {
+    store.append({ type = "assistant", tid = tid, text = "[llm error] " .. out.error });
+    paint_all();
+    return;
+  }
+  let text = out.text;
+  // native protocol first: a structured tool call from the API
+  if out.tool_calls && len(out.tool_calls) > 0 {
+    let c = out.tool_calls[0];
+    let args = json.decode(c.args);
+    if type(args) == "map" && type(args.cmd) == "string" {
+      request_tool(tid, args.cmd, c.id);
+      return;
+    }
+  }
+  // fallback: fish a JSON tool call out of the text — for models
+  // without function calling (and prose-wrapped or fenced replies)
+  let call = json.first(text);
+  if type(call) == "map" && call.tool == "bash" && type(call.cmd) == "string" {
+    request_tool(tid, call.cmd, nil);
+    return;
+  }
+  store.append({ type = "assistant", tid = tid, text = text });
+  paint_all();
+}
+
+// Put a tool request on the tape; run it now if the gate is open.
+fn request_tool(tid, cmd, call_id) {
+  store.append({ type = "tool_request", tid = tid, cmd = cmd, call_id = call_id });
+  paint_all();
+  if store(["auto"]) {
+    run_tool(tid, cmd, call_id);
+  }
+}
+
+// Run one approved (or auto-approved) command and resume the turn.
+// Server-side, unmarked: called from approve's server segment and from
+// request_tool; bash suspends the flow, never the VM.
+fn run_tool(tid, cmd, call_id) {
+  let r = bash(cmd, store(["home"]));
+  let output = "";
+  if r.ok {
+    output = r.stdout;
+  } else if r.error {
+    output = "error: " .. r.error;
+  } else {
+    output = "exit " .. r.status .. "\n" .. r.stderr .. r.stdout;
+  }
+  store.append({ type = "tool_result", tid = tid, cmd = cmd, output = output, call_id = call_id });
+  paint_all();
+  flow ("turn-" .. tid) run_turn(tid);
+}
+
+// ── human gates: the only marked functions in the file ──────────────────
+
+fn send(tid) {
+  let text = dom.get("#draft");
+  if text == "" {
+    return;
+  }
+  dom.clear("#draft");
+  server!();
+  let msgs = store(["threads", tid, "msgs"]);
+  if !msgs || len(msgs) == 0 {
+    // the first message names the thread
+    store.append({ type = "retitle", tid = tid, title = text });
+  }
+  store.append({ type = "user", tid = tid, text = text });
+  paint_all();
+  flow ("turn-" .. tid) run_turn(tid);
+}
+
+fn approve(tid) {
+  server!();
+  let p = store(["threads", tid, "pending"]);
+  if !p {
+    return;
+  }
+  run_tool(tid, p.cmd, p.call_id);
+}
+
+fn deny(tid) {
+  server!();
+  let p = store(["threads", tid, "pending"]);
+  if !p {
+    return;
+  }
+  store.append({ type = "tool_denied", tid = tid, call_id = p.call_id });
+  paint_all();
+  flow ("turn-" .. tid) run_turn(tid);
+}
+
+fn open_thread(uid, tid) {
+  server!();
+  store.append({ type = "open", uid = uid, tid = tid });
+  paint_user(uid);
+}
+
+fn new_thread(uid) {
+  server!();
+  let tid = store(["next"]) || 1;
+  store.append({ type = "thread", tid = tid });
+  store.append({ type = "open", uid = uid, tid = tid });
+  paint_all(); // everyone's thread list grew
+}
+
+fn toggle_auto() {
+  server!();
+  let auto = store(["auto"]);
+  store.append({ type = "set_auto", on = !auto });
+  paint_all();
+}
+
+fn set_model() {
+  let m = dom.get("#model_pick");
+  dom.clear("#model_pick");
+  server!();
+  store.append({ type = "set_model", model = m });
+  paint_all();
+}
+
+fn set_home() {
+  let d = dom.get("#home_pick");
+  dom.clear("#home_pick");
+  server!();
+  store.append({ type = "set_home", dir = d });
+  paint_all();
+}
+
+// Ask the provider for its catalog (GET {base}/models) and remember it.
+fn fetch_models() {
+  let r = llm.models();
+  if r.ok {
+    store.append({ type = "models", list = r.models });
+    paint_all();
+  }
+}
+
+// ── view ─────────────────────────────────────────────────────────────────
+
+fn thread_list() {
+  let out = [];
+  let tids = store(["threads", store.keys]);
+  if tids {
+    for i, tid in tids {
+      push(out, { tid = tid, title = store(["threads", tid, "title"]) });
+    }
+  }
+  return out;
+}
+
+fn agent_app(uid, tid, threads, msgs, pending, busy, auto, model, models, home) {
+  let tabs = [];
+  for i, th in threads {
+    push(tabs, [:button, {
+      class = th.tid == tid && "tab current" || "tab",
+      onclick = fn(e) { open_thread(uid, th.tid); }
+    }, th.title]);
+  }
+  push(tabs, [:button, { class = "tab", id = "new_thread",
+    onclick = fn(e) { new_thread(uid); } }, "+ new"]);
+
+  let rows = [];
+  if msgs {
+    for i, m in msgs {
+      if m.role == "tool_request" {
+        push(rows, [:li, { class = "tool_request" },
+          [:span, { class = "meta" }, "$ "],
+          [:code, {}, m.text]
+        ]);
+      } else if m.role == "tool" {
+        push(rows, [:li, { class = "tool" }, [:pre, {}, m.text]]);
+      } else if m.role == "assistant" {
+        push(rows, [:li, { class = "assistant" },
+          [:span, { class = "meta" }, "assistant: "],
+          markdown(m.text)
+        ]);
+      } else {
+        push(rows, [:li, { class = m.role },
+          [:span, { class = "meta" }, m.role .. ": "],
+          m.text
+        ]);
+      }
+    }
+  }
+  let gate = [];
+  if pending {
+    gate = [:div, { class = "row", id = "approval" },
+      [:span, {}, "run `" .. pending.cmd .. "` ? "],
+      [:button, { id = "approve", onclick = fn(e) { approve(tid); } }, "run it"],
+      [:button, { id = "deny", onclick = fn(e) { deny(tid); } }, "no"]
+    ];
+  }
+  return [:div, {},
+    [:h1, {}, "agent"],
+    [:div, { class = "tabs" }, tabs],
+    [:ul, { id = "transcript" }, rows],
+    [:p, { class = "meta", id = "stream" }],
+    gate,
+    [:div, { class = "row" },
+      [:input, {
+        id = "draft",
+        placeholder = busy && "thinking..." || "ask, or try: RUN: echo hi",
+        onkeydown = fn(e) { if e.key == "Enter" { send(tid); } }
+      }],
+      [:button, { id = "send", onclick = fn(e) { send(tid); } }, "send"],
+      [:button, { id = "auto", class = "meta", onclick = fn(e) { toggle_auto(); } },
+        auto && "auto-approve: on" || "auto-approve: off"]
+    ],
+    settings_row(model, models, home)
+  ];
+}
+
+// Model picker (a search box over the provider's catalog, via datalist)
+// and the working directory for bash. Enter (or picking an option) applies;
+// applying an empty value falls back to the default.
+fn settings_row(model, models, home) {
+  let opts = [];
+  if models {
+    for i, mo in models {
+      push(opts, [:option, { value = mo }]);
+    }
+  }
+  return [:div, { class = "row settings" },
+    [:input, {
+      id = "model_pick",
+      list = "model_options",
+      placeholder = "model: " .. (model || "env default"),
+      onchange = fn(e) { set_model(); },
+      onkeydown = fn(e) { if e.key == "Enter" { set_model(); } }
+    }],
+    [:datalist, { id = "model_options" }, opts],
+    [:input, {
+      id = "home_pick",
+      placeholder = "dir: " .. (home || "server cwd"),
+      onchange = fn(e) { set_home(); },
+      onkeydown = fn(e) { if e.key == "Enter" { set_home(); } }
+    }]
+  ];
+}
+
+// Repaint every tab of one user (their view of the store).
+fn paint_user(uid) {
+  let tid = store(["views", uid]);
+  if !tid {
+    return;
+  }
+  let threads = thread_list();
+  let msgs = store(["threads", tid, "msgs"]);
+  let pending = store(["threads", tid, "pending"]);
+  let busy = store(["threads", tid, "busy"]);
+  let auto = store(["auto"]);
+  let model = store(["model"]);
+  let models = store(["models"]);
+  let home = store(["home"]);
+  cast user(uid) {
+    hui.render("#app", agent_app(uid, tid, threads, msgs, pending, busy, auto, model, models, home));
+  }
+}
+
+// Repaint everyone, each user through their own view of the store.
+fn paint_all() {
+  let uids = store(["views", store.keys]);
+  if uids {
+    for i, uid in uids {
+      paint_user(uid);
+    }
+  }
+}
+
+// Streamed partials go only to the users watching this thread.
+fn paint_stream(tid, text) {
+  let uids = store(["views", store.keys]);
+  if uids {
+    for i, uid in uids {
+      if store(["views", uid]) == tid {
+        cast user(uid) { hui.render("#stream", markdown(text)); }
+      }
+    }
+  }
+}
+
+fn on_connect() {
+  // a returning user lands back in their thread; a new user gets the
+  // latest one (minting the first if the tape is empty). Identity is
+  // ambient: user() is whoever owns this tab's connection.
+  let uid = user();
+  if !store(["views", uid]) {
+    let next = store(["next"]) || 1;
+    let tid = next - 1;
+    if tid < 1 {
+      tid = 1;
+      store.append({ type = "thread", tid = tid });
+    }
+    store.append({ type = "open", uid = uid, tid = tid });
+  }
+  if !store(["models"]) {
+    flow "models" fetch_models();
+  }
+  paint_user(uid);
+}

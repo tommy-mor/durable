@@ -1,0 +1,17 @@
+# guardian2 — the decision-model deluge
+
+## done
+- rank centrality ported to hop (`rank.scores` native), oracle-proven vs rank-eric.py
+- `fs.list`, `str.dirname`, `env.get` natives
+- `file_browser.hop` — rooted file picker (list / drill / `..` / pick), Playwright-tested
+- offline judge + OpenRouter `/systemone` judge (`jev-latest`), model field, key from `.env`
+
+## next
+- visualization: wasm/webgl/custom stack — intricate, satisfying visuals
+- ranking display aware of ranking groups / unranked set
+- view toggle: original file line order, with color encoding the measured ranking
+- named "run" scoping: a sidebar of runs (like chat threads); start/pause a run,
+  select one to view; each run locked to one model + paramset (a parallelism
+  dial?) + one itemset + one set of votes
+- integrate file_browser.hop into guardian2 (replace the raw "load file" input)
+- (design) first-class store shapes — see the schema/grammar thinking in chat

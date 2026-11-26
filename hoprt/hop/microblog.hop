@@ -1,0 +1,162 @@
+// microblog.hop — follows, posts, fan-out-on-write home timelines.
+//
+// A post is one event. The reducer peeks the author's follower list
+// (committed state) and pushes the new post id onto every reader's
+// timeline, including the author's. Two tabs: follow someone, see their
+// next post land on your home feed.
+//
+//   cargo run -p hoprt --bin hopd -- hoprt/hop/microblog.hop
+
+schema {
+  users: map<record {
+    name: leaf
+  }>,
+  followers: map<list<leaf>>,
+  posts: map<record {
+    author: leaf,
+    text: leaf
+  }>,
+  timelines: map<list<leaf>>,
+  post_count: sum
+}
+
+fn reduce(event) {
+  match event {
+    join { sid, name } => {
+      store(["users", sid, "name", store.set(name)]);
+    }
+    follow { who, sid } => {
+      store(["followers", who, store.push(sid)]);
+    }
+    post { seq, sid, text } => {
+      store(["posts", seq, store.set({ author = sid, text = text })]);
+      store(["post_count", store.add(1)]);
+      store(["timelines", sid, store.push(seq)]);
+      let fans = store(["followers", sid]);
+      if fans {
+        for i, fan in fans {
+          store(["timelines", fan, store.push(seq)]);
+        }
+      }
+    }
+  }
+}
+
+fn gather_timeline(sid) {
+  let ids = store(["timelines", sid]);
+  let rows = [];
+  if ids {
+    for i, id in ids {
+      let p = store(["posts", id]);
+      if p {
+        p.id = id;
+        push(rows, p);
+      }
+    }
+  }
+  return rows;
+}
+
+fn name_of(sid, users) {
+  for i, u in users {
+    if u.id == sid {
+      return u.name;
+    }
+  }
+  return sid;
+}
+
+fn blog_view(me, users, feed) {
+  let people = [];
+  for i, u in users {
+    if u.id != me {
+      let id = u.id;
+      push(people, [:li, { class = "user" },
+        u.name .. " (" .. id .. ") ",
+        [:button, {
+          class = "follow",
+          id = "follow-" .. id,
+          onclick = fn(e) { follow(id); }
+        }, "follow"]
+      ]);
+    }
+  }
+  let posts = [];
+  for i, p in feed {
+    push(posts, [:li, { class = "post" },
+      [:span, { class = "meta" }, name_of(p.author, users) .. ": "],
+      p.text
+    ]);
+  }
+  return [:div, {},
+    [:h1, {}, "microblog"],
+    [:p, { class = "meta", id = "whoami" }, "you are " .. me],
+    [:div, { class = "row" },
+      [:input, { id = "name", placeholder = "display name" }],
+      [:button, { id = "join", onclick = fn(e) { join(); } }, "join"]
+    ],
+    [:div, { class = "row" },
+      [:input, { id = "draft", placeholder = "what's happening?" }],
+      [:button, { id = "post", onclick = fn(e) { publish(); } }, "post"]
+    ],
+    [:div, { class = "cols" },
+      [:div, {},
+        [:h2, {}, "people"],
+        [:ul, { id = "users" }, people]
+      ],
+      [:div, {},
+        [:h2, {}, "home"],
+        [:ul, { id = "feed" }, posts]
+      ]
+    ]
+  ];
+}
+
+// Writers append and return. Panels wake themselves — no broadcast,
+// no refresh token, no per-session rebuild dance.
+fn follow(id) {
+  server!();
+  store.append({ type = "follow", sid = session(), who = id });
+}
+
+fn join() {
+  let name = dom.get("#name");
+  if name == "" {
+    return;
+  }
+  server!();
+  store.append({ type = "join", sid = session(), name = name });
+}
+
+fn publish() {
+  let text = dom.get("#draft");
+  if text == "" {
+    return;
+  }
+  server!();
+  store.append({ type = "post", sid = session(), text = text });
+}
+
+// One panel per tab: show my feed, wait until the store moves, show it
+// again. Root watch — the view reads users, timelines, and posts
+// together, so the whole store is the honest watch.
+fn feed_panel() {
+  let me = session();
+  server!();
+  while true {
+    let users = store.items(["users"]);
+    let feed = gather_timeline(me);
+    browser!();
+    hui.render("#app", blog_view(me, users, feed));
+    server!();
+    store.wait([]);
+  }
+}
+
+fn open_board() {
+  flow "board" feed_panel();
+}
+
+fn on_connect() {
+  open_board();
+}

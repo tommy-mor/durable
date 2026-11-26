@@ -1,0 +1,107 @@
+// ranking.hop — pairwise votes into a Sum edge graph, per scope.
+//
+// Each vote is two durable writes: a blind merge on the winner→loser edge
+// and a vote counter. Decay is an event on the tape, so replay reproduces
+// it. Two tabs stay in sync; restart hopd and the graph is still there.
+//
+//   cargo run -p hoprt --bin hopd -- hoprt/hop/ranking.hop
+
+schema {
+  scopes: map<record {
+    votes: sum,
+    edges: map<sum>
+  }>
+}
+
+fn reduce(event) {
+  match event {
+    vote { scope, winner, loser } => {
+      let key = winner .. ">" .. loser;
+      store(["scopes", scope, "edges", key, store.add(1)]);
+      store(["scopes", scope, "votes", store.add(1)]);
+    }
+    decay { scope } => {
+      let edges = store(["scopes", scope, "edges"]);
+      if edges {
+        for k, w in edges {
+          store(["scopes", scope, "edges", k, store.set(w * 0.9)]);
+        }
+      }
+    }
+  }
+}
+
+fn cast_vote(scope, a, b) {
+  server!();
+  store.append({ type = "vote", scope = scope, winner = a, loser = b });
+}
+
+fn pair_button(scope, a, b) {
+  return [:button, {
+    class = "pair",
+    id = "vote-" .. a .. "-" .. b,
+    onclick = fn(e) { cast_vote(scope, a, b); }
+  }, a .. " beats " .. b];
+}
+
+fn ranking_view(scope, votes, edges) {
+  if !votes {
+    votes = 0;
+  }
+  let rows = [];
+  if edges {
+    for i, pair in edges {
+      push(rows, [:li, { class = "edge" }, pair[0] .. "  " .. pair[1]]);
+    }
+  }
+  return [:div, {},
+    [:h1, {}, "ranking"],
+    [:p, { class = "meta", id = "vote-count" }, "" .. votes .. " votes in " .. scope],
+    [:h2, {}, "cast a vote"],
+    [:div, { class = "row" },
+      pair_button(scope, "ripgrep", "grep"),
+      pair_button(scope, "ripgrep", "ag"),
+      pair_button(scope, "grep", "ag")
+    ],
+    [:div, { class = "row" },
+      [:button, { id = "decay", onclick = fn(e) { decay_scope(scope); } }, "decay 10%"]
+    ],
+    [:h2, {}, "edges"],
+    [:ul, { id = "edges" }, rows]
+  ];
+}
+
+fn decay_scope(scope) {
+  server!();
+  store.append({ type = "decay", scope = scope });
+}
+
+fn vote(scope, winner, loser) {
+  server!();
+  store.append({ type = "vote", scope = scope, winner = winner, loser = loser });
+}
+
+// One panel per tab on the tools scope: show, wait on the scope, show
+// again. Writers append and return; the panel wakes itself.
+fn ranking_panel() {
+  server!();
+  while true {
+    let votes = store(["scopes", "tools", "votes"]);
+    let edges = store(["scopes", "tools", "edges", store.entries]);
+    if !votes {
+      votes = 0;
+    }
+    browser!();
+    hui.render("#app", ranking_view("tools", votes, edges));
+    server!();
+    store.wait(["scopes", "tools"]);
+  }
+}
+
+fn open_board() {
+  flow "board" ranking_panel();
+}
+
+fn on_connect() {
+  open_board();
+}
