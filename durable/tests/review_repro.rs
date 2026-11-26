@@ -172,7 +172,7 @@ fn h_append_cost_is_independent_of_tape_size() {
     assert!(late < early * 4, "append slowed from {early:?} to {late:?} as the tape grew");
 }
 
-/// The operator path that used to wipe history: an old server directory
+/// The operator path that used to wipe history: an old hopd directory
 /// (unsealed tape + projection) is refused; deleting proj/ to "rebuild"
 /// must still be refused, never truncate the tape to zero.
 #[test]

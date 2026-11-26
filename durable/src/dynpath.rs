@@ -1,7 +1,7 @@
 //! Untyped path algebra: the write-side counterpart of [`crate::query`].
 //!
 //! Typed [`crate::Path<S>`] navigators are for Rust reducers that know the
-//! schema at compile time. Clients — other languages, a REPL — speak paths as data.
+//! schema at compile time. Clients — Lua, hopc, a REPL — speak paths as data.
 //! This module lowers a [`Shape`] plus a list of [`Nav`]s to the same RocksDB
 //! keys the typed navigators would have produced, and emits reified [`Write`]s.
 //!

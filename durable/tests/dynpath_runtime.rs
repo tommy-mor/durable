@@ -1,4 +1,4 @@
-//! Dynamic paths + JSON events: the untyped client surface, exercised in Rust.
+//! Dynamic paths + JSON events: the Lua/hop surface, exercised in Rust.
 
 use ciborium::value::Integer;
 use ciborium::Value;

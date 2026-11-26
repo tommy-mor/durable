@@ -211,7 +211,7 @@ heard. Only deduplication fixes that.
   `Halted` for every append and never appends, so a retry can't create a
   second copy; after the reducer is fixed and catch-up completes, the
   retry gets `Duplicate`.
-- The runtime mints a fresh operation id per `store.append`. A flow id is only
+- hop mints a fresh operation id per `store.append`. A flow id is only
   suitable if the flow appends exactly once.
 - Expiry of old ids is a later projection policy.
 

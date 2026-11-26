@@ -1,0 +1,69 @@
+// handle_check.hop — linear placement marks in ordinary code.
+//
+// Surface syntax is illustrative (deferred); the semantics are binding:
+// marks are statements, locals flow across them, the function boundary
+// returns to the caller's side, errors unwind through hops.
+
+// No marks anywhere in this function: location-agnostic, callable on
+// either side, runs where called.
+fn hint_text(ok) {
+  return ok ? "available" : "taken";
+}
+
+// Server-only state. `taken` lives in the server VM; browser segments
+// never see it — referencing it from a browser segment is a compile error,
+// not a runtime surprise.
+server let taken = { alice = true, bob = true, root = true };
+
+fn check_handle(handle) {
+  // flow starts in the tab (DOM event → origin session)
+  dom.spinner(true);
+
+  server!();
+  // ── hop 1 crossed: { handle }  (the only local live below)
+  let ok = !taken[handle];
+
+  browser!();
+  // ── hop 2 crossed: { ok }  (handle is dead after the lookup; the
+  //    compiler's liveness pass keeps it off the wire)
+  dom.spinner(false);
+  dom.hint(hint_text(ok));   // location-agnostic helper, running tab-side
+
+  return ok;                 // already on the caller's side: free
+}
+
+// Errors are normal control flow across hops. A dropped connection while
+// suspended raises Disconnect at the call site.
+fn check_handle_safely(handle) {
+  try {
+    return check_handle(handle);
+  } catch Disconnect {
+    dom.hint("offline");
+    return false;
+  }
+}
+
+// Marks in a loop are legal — the segment split handles it — and the cost
+// is visible: two hops per iteration. If that reads chatty, it is; hoist
+// the loop into one server segment instead:
+fn check_many(handles) {
+  server!();
+  // one hop carries { handles }; the loop runs entirely server-side
+  let results = {};
+  for h in handles {
+    results[h] = !taken[h];
+  }
+  browser!();
+  // one hop carries { results }
+  return results;
+}
+
+on_input("#handle", fn(e) {
+  // each event fires a flow: a coroutine that marks suspend and replies
+  // resume. The tab never blocks; concurrent flows interleave.
+  dom.hint(check_handle_safely(e.value) ? "✓" : "✗");
+});
+
+// Route table for this file (`hopc routes`): the client-reachable server
+// segments are check_handle:1 (vars: handle) and check_many:1 (vars:
+// handles). That enumeration is the security review surface.

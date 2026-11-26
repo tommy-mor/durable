@@ -252,3 +252,22 @@ cargo test -p durable --no-default-features --features backend-memory
 cargo run -p durable --example runtime
 ```
 
+## Hop apps
+
+[`hoprt/`](../hoprt/) is the Hop runtime (a native Rust IR
+interpreter): placement marks hop a
+function body between a browser tab and the server. When a `.hop` file
+declares `schema` and `fn reduce`, the server VM opens this crate's
+`Runtime` — JSONL log, typed-path projection, `store.append` from server
+segments only. The multiplayer todo app is the full loop:
+
+```bash
+cargo run -p hoprt --bin hopd -- hoprt/hop/todo.hop
+# open http://localhost:9000 — restart hopd; the board is still there
+```
+
+`hoprt/hop/agent.hop` is a coding agent in one file: streamed LLM turns
+(suspending `llm.stream`/`llm.next` natives), an approval-gated `bash`
+tool, and a transcript on the tape — restart hopd mid-conversation and
+the session replays. `OPENAI_API_KEY` + `HOP_LLM_MODEL` configure the
+model; the test harness fakes it so the loop is asserted offline.
