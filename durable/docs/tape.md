@@ -127,12 +127,10 @@ Blank lines are skipped (legacy compatibility).
 
 ## Opening
 
-1. **Open and lock.** Open the tape. If it was just created, fsync the
-   parent directory. Take `flock(LOCK_EX | LOCK_NB)` on the tape file
-   (lock scope is one tape; tapes in the same directory never block each
-   other). Then compare the inode of the path with the inode of the open
-   handle; if they differ, the file was replaced while we waited — reopen
-   and retry.
+1. **Open and lock.** `Runtime::open_with` takes `flock(LOCK_EX | LOCK_NB)`
+   on the tape file for the runtime's lifetime (lock scope is one tape).
+   A second writer fails with a lock error. Not yet done: the inode
+   re-check after a rename race. The legacy `Runtime::open` takes no lock.
 2. **Scan read-only.** No mutation yet. Corruption → stop, report, file
    untouched.
 3. **Open the projection** and read `applied`. If RocksDB won't open,
@@ -279,10 +277,22 @@ keys and turns integers past 64 bits into floats).
 
 ## Operator commands
 
-- `durable tape status <tape>` — committed end, record count, last seq and
-  ts, uncommitted tail bytes, sealed or legacy.
-- `durable tape verify <tape>` — full scan.
-- `durable tape cat <tape> [--from SEQ]` — committed records only, for `jq`.
+Implemented in the `durable-tape` binary (read-only; never writes, truncates
+or locks the tape). The spec's `durable tape ...` spelling maps to
+`durable-tape ...`.
+
+- `durable-tape status <tape>` — committed end, record count, last seq and
+  ts, uncommitted tail bytes.
+- `durable-tape verify <tape>` — full scan plus JSON check of every event.
+  Exit 0 clean; exit 4 if a committed prefix is followed by a torn tail;
+  exit 1 if corrupt.
+- `durable-tape cat <tape> [--from SEQ]` — committed records only, for `jq`.
+- `durable-tape census <tape> [--tag KEY] [--json]` — counts per event kind,
+  per (kind, field present), seq and ts range, batch-size histogram, byte
+  totals. Kind detection by serde tagging is described in `src/census.rs`.
+
+Offline rewrites (`durable::rewrite`) and their guarantees are in
+`docs/evolving-a-tape.md`.
 
 ## Deferred
 

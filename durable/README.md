@@ -100,6 +100,13 @@ fn main() -> durable::Result<()> {
 }
 ```
 
+## Evolving a tape
+
+Changing how history is interpreted: bump `ProjectionId` to re-derive the
+projection, record decisions as data, and rewrite old records once offline
+with `durable::rewrite` (proven equal by `testing::assert_rewrite_equivalent`).
+Read `docs/evolving-a-tape.md`. Operators: `durable-tape status|verify|cat|census`.
+
 ## The model
 
 ### Schema types
@@ -229,6 +236,17 @@ batches, durability modes, persistence across reopen, property tests against
 `BTreeMap`/`VecDeque`/sum-of-deltas models, the query engine (point / scan /
 filter / project / explain), and the runtime property
 `incremental execution == replay from zero`.
+
+For faster iteration without a C++ toolchain or disk I/O, run the same suite
+against the ephemeral in-memory backend (`backend-memory`, std-only,
+`BTreeMap` + `RwLock`). `Db::open(path)` ignores `path` there; `Db::open_memory()`
+is the explicit entry point. Data vanishes when the last `Db` clone drops, so
+persistence and "disagree-with-persisted-projection" tests are cfg'd out for
+it:
+
+```bash
+cargo test -p durable --no-default-features --features backend-memory
+```
 
 ```bash
 cargo run -p durable --example runtime

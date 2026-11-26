@@ -37,6 +37,8 @@ const BACKEND: &str = "rocksdb";
 const BACKEND: &str = "redb";
 #[cfg(feature = "backend-sled")]
 const BACKEND: &str = "sled";
+#[cfg(feature = "backend-memory")]
+const BACKEND: &str = "memory-store";
 
 const NS: [usize; 4] = [1_000, 10_000, 100_000, 1_000_000];
 const QUICK_NS: [usize; 2] = [1_000, 10_000];
@@ -53,6 +55,8 @@ const BACKEND_VERSION: &str = "rocksdb 0.25.0 (RocksDB 11.8.1)";
 const BACKEND_VERSION: &str = "redb 4.4.0";
 #[cfg(feature = "backend-sled")]
 const BACKEND_VERSION: &str = "sled 0.34.7";
+#[cfg(feature = "backend-memory")]
+const BACKEND_VERSION: &str = "std BTreeMap + RwLock (ephemeral)";
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 struct Rec {
@@ -265,8 +269,15 @@ fn work(out_dir: &Path, quick: bool) -> durable::Result<()> {
         samples.push(stats("list_push_single", n, "ns/commit", lat));
 
         // ---- cold reopen, then all read phases ----
-        drop(db);
-        let db = Db::open(&path)?;
+        // The in-memory backend has nothing persisted to cold-reopen from;
+        // its "cold" state is the same live map.
+        #[cfg(feature = "backend-memory")]
+        let db = db;
+        #[cfg(not(feature = "backend-memory"))]
+        let db = {
+            drop(db);
+            Db::open(&path)?
+        };
 
         let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
         let mut lat = Vec::with_capacity(GET_SAMPLES);
@@ -669,14 +680,15 @@ fn fmt_n(n: f64) -> String {
     }
 }
 
-const COLORS: [(&str, &str); 4] = [
+const COLORS: [(&str, &str); 5] = [
     ("rocksdb", "#f0883e"),
     ("redb", "#58a6ff"),
     ("sled", "#3fb950"),
+    ("memory-store", "#a371f7"),
     ("memory", "#d29922"),
 ];
 
-const ORDER: [&str; 4] = ["rocksdb", "redb", "sled", "memory"];
+const ORDER: [&str; 5] = ["rocksdb", "redb", "sled", "memory-store", "memory"];
 
 fn color_of(backend: &str) -> &str {
     COLORS

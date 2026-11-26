@@ -395,6 +395,7 @@ fn deque_truncate_back_caps_length_keeping_front() {
     assert_eq!(dq.len(&db).unwrap(), 3);
 }
 
+#[cfg(not(feature = "backend-memory"))]
 #[test]
 fn one_batch_commits_all_or_nothing_and_persists() {
     let dir = TempDir::new().unwrap();
@@ -455,6 +456,9 @@ fn namespaced_roots_do_not_collide() {
     assert_eq!(b.nodes().key(&"k".to_string()).get(&db).unwrap(), Some("bv".to_string()));
 }
 
+/// The in-memory backend is ephemeral by design: reopening yields an empty
+/// store, so this persistence assertion only applies to on-disk backends.
+#[cfg(not(feature = "backend-memory"))]
 #[test]
 fn persistence_across_reopen_for_all_collection_kinds() {
     let dir = TempDir::new().unwrap();

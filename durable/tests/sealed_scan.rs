@@ -174,6 +174,9 @@ fn runtime_opens_through_torn_tail_and_keeps_prefix() {
     rt.verify().unwrap();
 }
 
+/// Requires a persisted projection to disagree with (applied=2 > tape=1);
+/// the ephemeral backend holds no such overlap across reopens.
+#[cfg(not(feature = "backend-memory"))]
 #[test]
 fn cutting_acknowledged_history_is_fatal_not_silent() {
     use durable::{Durable, Leaf, Map, Runtime};
