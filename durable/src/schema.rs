@@ -1,61 +1,128 @@
-//! Type-level schema markers.
+//! Type-level schema markers and structural fingerprinting.
 //!
 //! A *schema* describes the shape of a durable location at the type level. It is
-//! never instantiated; it only parameterizes a [`crate::Path`] so the compiler
-//! knows which navigation steps and terminal operations are legal.
+//! never instantiated; it parameterizes a [`crate::Path`] so the compiler knows
+//! which navigation steps and operations are legal, and provides a deterministic
+//! [`Schema::fingerprint`] so [`crate::Runtime::open_with`] detects schema
+//! changes automatically.
 //!
 //! - [`Leaf<T>`] — a single CBOR-encoded scalar value.
-//! - [`Map<K, V>`] — keys of type `K` to sub-schema `V`.
-//! - [`List<V>`] — an index-addressed sequence of sub-schema `V`.
-//! - [`Deque<V>`] — a double-ended queue of sub-schema `V` (O(1) ends).
-//! - [`Sum<N>`] — a numeric accumulator updated with blind merge writes.
-//! - any `#[derive(Durable)]` struct — a fixed set of named fields.
+//! - [`Sum<N>`] — a numeric accumulator (`i64`, `u64`, `f64`).
+//! - [`Map<K, V>`] — ordered map from [`crate::Key`] `K` to sub-schema `V`.
+//! - [`Set<K>`] — ordered set of [`crate::Key`] `K` (0-byte values).
+//! - [`List<V>`] — index-addressed sequence of sub-schema `V`.
+//! - [`Deque<V>`] — double-ended queue of sub-schema `V` (O(1) ends).
+//! - any `#[derive(Durable)]` struct — fixed named fields (top-level fields map
+//!   to dedicated `redb` tables; nested structs live inline under their parent's
+//!   table prefix).
 
 use std::marker::PhantomData;
 
+use sha2::{Digest as _, Sha256};
+
+use crate::codec::FORMAT_VERSION;
+use crate::key::Key;
+
 /// Marker trait implemented by every durable schema.
-///
-/// Implemented for [`Leaf`], [`Map`], [`List`], [`Deque`], [`Sum`], and by
-/// `#[derive(Durable)]` for user structs. It is intentionally minimal; behaviour
-/// lives on `Path<S>` impls keyed by the concrete schema.
-pub trait Schema {}
+pub trait Schema {
+    /// `true` for scalar schemas (`Leaf`, `Sum`) that live in `"__scalars"`
+    /// when placed at the root of a store rather than getting their own table.
+    const IS_SCALAR: bool = false;
+
+    /// `true` when every entry occupies exactly one physical key (no child
+    /// sub-keys). Enables O(1) `table.len()` and non-deduping range scans on
+    /// `Map<K, V>` / `List<V>` / `Deque<V>`.
+    const IS_FLAT: bool = false;
+
+    /// Append a canonical structural description of this schema to `out`.
+    fn encode_schema(out: &mut Vec<u8>);
+
+    /// Stable 64-bit structural fingerprint of this schema (including
+    /// [`FORMAT_VERSION`], key types, field names, and leaf type names).
+    fn fingerprint() -> u64 {
+        let mut bytes = b"durable.schema.v2\0".to_vec();
+        bytes.extend_from_slice(&FORMAT_VERSION.to_be_bytes());
+        Self::encode_schema(&mut bytes);
+        let digest = Sha256::digest(&bytes);
+        u64::from_be_bytes(digest[..8].try_into().expect("8 bytes"))
+    }
+}
+
+fn put_str(out: &mut Vec<u8>, s: &str) {
+    out.extend_from_slice(&(s.len() as u64).to_be_bytes());
+    out.extend_from_slice(s.as_bytes());
+}
 
 /// A single CBOR-encoded scalar value of type `T`.
 pub struct Leaf<T>(PhantomData<T>);
-impl<T> Schema for Leaf<T> {}
+impl<T: 'static> Schema for Leaf<T> {
+    const IS_SCALAR: bool = true;
+    const IS_FLAT: bool = true;
 
-/// A map from keys of type `K` to sub-schema `V`.
+    fn encode_schema(out: &mut Vec<u8>) {
+        out.push(0);
+        put_str(out, std::any::type_name::<T>());
+    }
+}
+
+/// A numeric accumulator (`i64`, `u64`, `f64`).
+pub struct Sum<N>(PhantomData<N>);
+impl<N: Summable> Schema for Sum<N> {
+    const IS_SCALAR: bool = true;
+    const IS_FLAT: bool = true;
+
+    fn encode_schema(out: &mut Vec<u8>) {
+        out.push(1);
+        out.push(N::TAG);
+    }
+}
+
+/// An ordered map from keys of type `K` to sub-schema `V`.
 pub struct Map<K, V>(PhantomData<(K, V)>);
-impl<K, V: Schema> Schema for Map<K, V> {}
+impl<K: Key, V: Schema> Schema for Map<K, V> {
+    fn encode_schema(out: &mut Vec<u8>) {
+        out.push(2);
+        put_str(out, &K::key_type_name());
+        V::encode_schema(out);
+    }
+}
+
+/// An ordered set of keys of type `K` (stored with 0-byte values).
+pub struct Set<K>(PhantomData<K>);
+impl<K: Key> Schema for Set<K> {
+    fn encode_schema(out: &mut Vec<u8>) {
+        out.push(6);
+        put_str(out, &K::key_type_name());
+    }
+}
 
 /// An index-addressed growable sequence of sub-schema `V`.
 pub struct List<V>(PhantomData<V>);
-impl<V: Schema> Schema for List<V> {}
+impl<V: Schema> Schema for List<V> {
+    fn encode_schema(out: &mut Vec<u8>) {
+        out.push(3);
+        V::encode_schema(out);
+    }
+}
 
 /// A double-ended queue of sub-schema `V` with O(1) push/pop at both ends.
 pub struct Deque<V>(PhantomData<V>);
-impl<V: Schema> Schema for Deque<V> {}
-
-/// A numeric accumulator. Updated with blind, associative merge writes so
-/// incrementing is O(1) and never reads the current value.
-pub struct Sum<N>(PhantomData<N>);
-impl<N: Summable> Schema for Sum<N> {}
+impl<V: Schema> Schema for Deque<V> {
+    fn encode_schema(out: &mut Vec<u8>) {
+        out.push(4);
+        V::encode_schema(out);
+    }
+}
 
 /// Numbers that can back a [`Sum`] accumulator.
 ///
 /// Stored on disk as `[TAG, b0..b7]`: a one-byte type tag plus the 8-byte
-/// little-endian payload. The tag lets a single RocksDB merge operator fold
-/// `f64` and `i64` accumulators correctly.
+/// little-endian payload.
 pub trait Summable: Copy + 'static {
-    /// Disk type tag, unique per numeric type.
     const TAG: u8;
-    /// Additive identity.
     fn zero() -> Self;
-    /// Combine two values (sum).
     fn combine(self, other: Self) -> Self;
-    /// Little-endian 8-byte payload.
     fn to_le_payload(self) -> [u8; 8];
-    /// Decode from a little-endian 8-byte payload.
     fn from_le_payload(bytes: [u8; 8]) -> Self;
 }
 
@@ -108,10 +175,10 @@ impl Summable for u64 {
 }
 
 /// Encode a `Summable` to its tagged on-disk form `[TAG, b0..b7]`.
-pub(crate) fn encode_sum<N: Summable>(value: N) -> Vec<u8> {
-    let mut out = Vec::with_capacity(9);
-    out.push(N::TAG);
-    out.extend_from_slice(&value.to_le_payload());
+pub(crate) fn encode_sum<N: Summable>(value: N) -> [u8; 9] {
+    let mut out = [0u8; 9];
+    out[0] = N::TAG;
+    out[1..9].copy_from_slice(&value.to_le_payload());
     out
 }
 
@@ -125,81 +192,6 @@ pub(crate) fn decode_sum<N: Summable>(bytes: &[u8]) -> Option<N> {
     Some(N::from_le_payload(payload))
 }
 
-/// Fold one tagged operand into a running tagged accumulator.
-///
-/// Used by the RocksDB merge operator. Operands of mismatched tags are skipped
-/// rather than panicking, keeping compaction resilient to stray bytes.
-fn fold_tagged(acc: &mut Option<[u8; 9]>, operand: &[u8]) {
-    if operand.len() != 9 {
-        return;
-    }
-    let tag = operand[0];
-    let mut op_payload = [0u8; 8];
-    op_payload.copy_from_slice(&operand[1..9]);
-
-    match acc {
-        Some(existing) if existing[0] == tag => {
-            let mut acc_payload = [0u8; 8];
-            acc_payload.copy_from_slice(&existing[1..9]);
-            let combined = match tag {
-                0 => f64::from_le_bytes(acc_payload)
-                    .combine(f64::from_le_bytes(op_payload))
-                    .to_le_payload(),
-                1 => i64::from_le_bytes(acc_payload)
-                    .combine(i64::from_le_bytes(op_payload))
-                    .to_le_payload(),
-                2 => u64::from_le_bytes(acc_payload)
-                    .combine(u64::from_le_bytes(op_payload))
-                    .to_le_payload(),
-                _ => return,
-            };
-            existing[1..9].copy_from_slice(&combined);
-        }
-        Some(_) => {} // tag mismatch: ignore stray operand
-        None => {
-            let mut start = [0u8; 9];
-            start[0] = tag;
-            start[1..9].copy_from_slice(&op_payload);
-            *acc = Some(start);
-        }
-    }
-}
-
-/// Fold merge operands over an optional existing accumulator.
-///
-/// Pure byte-level fold shared by every storage backend: [`sum_merge`] (the
-/// RocksDB merge operator) calls this at compaction time, and backends
-/// without native merge support call it read-modify-write at commit time.
-/// Operands of mismatched tags are skipped rather than panicking, keeping
-/// compaction resilient to stray bytes.
-pub(crate) fn fold_merge(existing: Option<&[u8]>, operands: &[&[u8]]) -> Option<Vec<u8>> {
-    let mut acc: Option<[u8; 9]> = None;
-    if let Some(existing) = existing {
-        if existing.len() == 9 {
-            let mut start = [0u8; 9];
-            start.copy_from_slice(existing);
-            acc = Some(start);
-        }
-    }
-    for operand in operands {
-        fold_tagged(&mut acc, operand);
-    }
-    acc.map(|bytes| bytes.to_vec())
-}
-
-/// Associative merge operator registered on every RocksDB-backed durable
-/// database so that [`Sum`] accumulators can be incremented with blind
-/// `merge` writes.
-#[cfg(feature = "backend-rocksdb")]
-pub(crate) fn sum_merge(
-    _key: &[u8],
-    existing: Option<&[u8]>,
-    operands: &rocksdb::MergeOperands,
-) -> Option<Vec<u8>> {
-    let ops: Vec<&[u8]> = operands.iter().collect();
-    fold_merge(existing, &ops)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -209,25 +201,26 @@ mod tests {
         assert_eq!(decode_sum::<f64>(&encode_sum(2.5f64)), Some(2.5));
         assert_eq!(decode_sum::<i64>(&encode_sum(-7i64)), Some(-7));
         assert_eq!(decode_sum::<u64>(&encode_sum(9u64)), Some(9));
-        // Tag mismatch is rejected.
         assert_eq!(decode_sum::<i64>(&encode_sum(2.5f64)), None);
     }
 
     #[test]
-    fn fold_accumulates_same_tag() {
-        let mut acc = None;
-        fold_tagged(&mut acc, &encode_sum(1.5f64));
-        fold_tagged(&mut acc, &encode_sum(2.0f64));
-        let bytes = acc.unwrap();
-        assert_eq!(decode_sum::<f64>(&bytes), Some(3.5));
-    }
-
-    #[test]
-    fn fold_skips_mismatched_tag() {
-        let mut acc = None;
-        fold_tagged(&mut acc, &encode_sum(5i64));
-        fold_tagged(&mut acc, &encode_sum(1.0f64)); // ignored
-        let bytes = acc.unwrap();
-        assert_eq!(decode_sum::<i64>(&bytes), Some(5));
+    fn fingerprint_distinguishes_key_and_leaf_and_sum_types() {
+        assert_ne!(
+            <Map<String, Leaf<i64>> as Schema>::fingerprint(),
+            <Map<i64, Leaf<i64>> as Schema>::fingerprint(),
+        );
+        assert_ne!(
+            <Map<String, Leaf<i64>> as Schema>::fingerprint(),
+            <Map<String, Leaf<String>> as Schema>::fingerprint(),
+        );
+        assert_ne!(
+            <Sum<i64> as Schema>::fingerprint(),
+            <Sum<f64> as Schema>::fingerprint(),
+        );
+        assert_ne!(
+            <Set<String> as Schema>::fingerprint(),
+            <Map<String, Leaf<()>> as Schema>::fingerprint(),
+        );
     }
 }

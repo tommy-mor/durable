@@ -37,14 +37,14 @@ use std::path::{Path, PathBuf};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
-use crate::equiv::scratch_dir;
 use crate::fault;
-use crate::projection::{lock_tape_shared, stamp_writes_for, ProjectionStamp};
+use crate::projection::{lock_tape_shared, write_stamp, ProjectionStamp};
 use crate::runtime::{
     fold_one, parse_sealed, render_sealed, render_sealed_raw, scan_reader, Committed, Record,
-    SealedEnvelope, Tx, CRC_SUFFIX_LEN,
+    SealedEnvelope, CRC_SUFFIX_LEN,
 };
-use crate::{Db, Durability, Error, Result, Shape};
+use crate::store::{Db, Tx};
+use crate::{Durability, Error, Result, Schema};
 
 /// How sequence numbers look in the output tape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,20 +131,20 @@ impl RewriteReport {
 /// is missing, corrupt, or exclusively locked by a live writer; `map` returns
 /// `Drop` in `SameSeq`; an event does not decode as `E`; `map` or the old
 /// reducer errors.
-pub fn rewrite<E, N>(
+pub fn rewrite<S, E, N>(
     src: &Path,
     dst: &Path,
-    schema: Shape,
     old_reducer: impl Fn(&mut Tx, &E) -> Result<()>,
     mode: Mode,
     map: impl FnMut(Step<'_, E>) -> Result<Emit<N>>,
 ) -> Result<RewriteReport>
 where
+    S: Schema,
     E: DeserializeOwned,
     N: Serialize,
 {
     let mut out = Output::create(dst)?;
-    let result = run(src, Some(&mut out), &schema, &old_reducer, mode, map);
+    let result = run::<S, E, N>(src, Some(&mut out), &old_reducer, mode, map);
     match result {
         Ok(mut report) => {
             // Commit point: publish. Nothing after this may fail the call.
@@ -159,18 +159,18 @@ where
 /// Run the whole pipeline (validation, fold, `map`, verification) without
 /// writing any output. Use it to see what a rewrite would do, and how many
 /// records it would drop or replace, before running it for real.
-pub fn dry_run<E, N>(
+pub fn dry_run<S, E, N>(
     src: &Path,
-    schema: Shape,
     old_reducer: impl Fn(&mut Tx, &E) -> Result<()>,
     mode: Mode,
     map: impl FnMut(Step<'_, E>) -> Result<Emit<N>>,
 ) -> Result<RewriteReport>
 where
+    S: Schema,
     E: DeserializeOwned,
     N: Serialize,
 {
-    let mut report = run(src, None, &schema, &old_reducer, mode, map)?;
+    let mut report = run::<S, E, N>(src, None, &old_reducer, mode, map)?;
     report.dry_run = true;
     Ok(report)
 }
@@ -280,15 +280,15 @@ struct Pending<N> {
     emit: Emit<N>,
 }
 
-fn run<E, N>(
+fn run<S, E, N>(
     src: &Path,
     mut out: Option<&mut Output>,
-    schema: &Shape,
     old_reducer: &impl Fn(&mut Tx, &E) -> Result<()>,
     mode: Mode,
     mut map: impl FnMut(Step<'_, E>) -> Result<Emit<N>>,
 ) -> Result<RewriteReport>
 where
+    S: Schema,
     E: DeserializeOwned,
     N: Serialize,
 {
@@ -319,100 +319,92 @@ where
         .seek(SeekFrom::Start(0))
         .map_err(|e| Error::Log(e.to_string()))?;
 
-    let scratch_parent = match &out {
-        Some(o) => parent_dir(&o.dst),
-        None => std::env::temp_dir(),
-    };
-    let scratch = scratch_dir(&scratch_parent, "rewrite")?;
-    let result = (|| {
-        let db = Db::open(&scratch)?;
-        db.apply(
-            &stamp_writes_for(ProjectionStamp::new(0, schema)),
-            Durability::DisableWal,
-        )?;
-        let mut reader = BufReader::new(&src_file);
-        let mut batch: Vec<Pending<N>> = Vec::new();
-        let mut out_seq = 0u64;
-        let mut buf = Vec::new();
-        let mut offset = 0usize;
-        let mut line = Vec::new();
-        while offset < committed.end {
-            line.clear();
-            let n = reader
-                .read_until(b'\n', &mut line)
-                .map_err(|e| Error::Log(e.to_string()))?;
-            if n == 0 {
-                break;
-            }
-            offset += n;
-            let body = line.strip_suffix(b"\n").unwrap_or(&line);
-            if body.iter().all(|b| b.is_ascii_whitespace()) {
-                continue;
-            }
-            let (env, event_bytes) = parse_sealed(body)?;
-            let event: E = serde_json::from_slice(&event_bytes).map_err(|e| {
-                Error::Deserialize(format!(
-                    "seq {}: event does not decode as the source enum: {e}",
-                    env.seq
-                ))
-            })?;
-            let rec = Record {
-                seq: env.seq,
-                ts_ms: env.ts_ms,
-                from: env.from,
-                to: env.to,
-                event,
-                crc: crc_of(body),
-            };
-            let emit = map(Step {
-                rec: &rec,
-                before: &db,
-            })?;
-            fold_one(&db, old_reducer, rec.meta(), &rec.event)?;
-            report.read += 1;
-            if matches!(emit, Emit::Drop) && mode == Mode::SameSeq {
-                return Err(Error::Log(format!(
-                    "map returned Drop for seq {} in Mode::SameSeq (use Mode::Renumber)",
-                    env.seq
-                )));
-            }
-            batch.push(Pending {
-                line: body.to_vec(),
-                env,
-                event: event_bytes,
-                emit,
-            });
-            if env.seq == env.to {
-                buf.clear();
-                flush_batch(&mut batch, mode, &mut out_seq, &mut buf, &mut report)?;
-                if !buf.is_empty() {
-                    report.batches_written += 1;
-                    if let Some(o) = out.as_deref_mut() {
-                        fault::hit("rewrite.write")?;
-                        o.file_mut()
-                            .write_all(&buf)
-                            .map_err(|e| Error::Log(format!("write {}: {e}", o.tmp.display())))?;
-                        report.dst_bytes += buf.len() as u64;
-                    }
+    let db = Db::open_memory()?;
+    {
+        let mut tx = db.write_with(Durability::DisableWal)?;
+        write_stamp(&mut tx, ProjectionStamp::for_schema::<S>(0))?;
+        tx.commit()?;
+    }
+    let mut reader = BufReader::new(&src_file);
+    let mut batch: Vec<Pending<N>> = Vec::new();
+    let mut out_seq = 0u64;
+    let mut buf = Vec::new();
+    let mut offset = 0usize;
+    let mut line = Vec::new();
+    while offset < committed.end {
+        line.clear();
+        let n = reader
+            .read_until(b'\n', &mut line)
+            .map_err(|e| Error::Log(e.to_string()))?;
+        if n == 0 {
+            break;
+        }
+        offset += n;
+        let body = line.strip_suffix(b"\n").unwrap_or(&line);
+        if body.iter().all(|b| b.is_ascii_whitespace()) {
+            continue;
+        }
+        let (env, event_bytes) = parse_sealed(body)?;
+        let event: E = serde_json::from_slice(&event_bytes).map_err(|e| {
+            Error::Deserialize(format!(
+                "seq {}: event does not decode as the source enum: {e}",
+                env.seq
+            ))
+        })?;
+        let rec = Record {
+            seq: env.seq,
+            ts_ms: env.ts_ms,
+            from: env.from,
+            to: env.to,
+            event,
+            crc: crc_of(body),
+        };
+        let emit = map(Step {
+            rec: &rec,
+            before: &db,
+        })?;
+        fold_one(&db, old_reducer, rec.meta(), &rec.event)?;
+        report.read += 1;
+        if matches!(emit, Emit::Drop) && mode == Mode::SameSeq {
+            return Err(Error::Log(format!(
+                "map returned Drop for seq {} in Mode::SameSeq (use Mode::Renumber)",
+                env.seq
+            )));
+        }
+        let seq = env.seq;
+        let to = env.to;
+        batch.push(Pending {
+            line: body.to_vec(),
+            env,
+            event: event_bytes,
+            emit,
+        });
+        if seq == to {
+            buf.clear();
+            flush_batch(&mut batch, mode, &mut out_seq, &mut buf, &mut report)?;
+            if !buf.is_empty() {
+                report.batches_written += 1;
+                if let Some(o) = out.as_deref_mut() {
+                    fault::hit("rewrite.write")?;
+                    o.file_mut()
+                        .write_all(&buf)
+                        .map_err(|e| Error::Log(format!("write {}: {e}", o.tmp.display())))?;
+                    report.dst_bytes += buf.len() as u64;
                 }
             }
         }
-        if !batch.is_empty() {
-            return Err(Error::Corruption(
-                "committed prefix ends inside a batch (scan and reader disagree)".into(),
-            ));
-        }
-        if let Some(o) = out.as_deref_mut() {
-            o.file_mut()
-                .flush()
-                .map_err(|e| Error::Log(e.to_string()))?;
-            verify_output(o, out_seq)?;
-        }
-        drop(db);
-        Ok(())
-    })();
-    let _ = fs::remove_dir_all(&scratch);
-    result?;
+    }
+    if !batch.is_empty() {
+        return Err(Error::Corruption(
+            "committed prefix ends inside a batch (scan and reader disagree)".into(),
+        ));
+    }
+    if let Some(o) = out.as_deref_mut() {
+        o.file_mut()
+            .flush()
+            .map_err(|e| Error::Log(e.to_string()))?;
+        verify_output(o, out_seq)?;
+    }
     Ok(report)
 }
 

@@ -18,6 +18,12 @@ pub struct Totals {
     pub last_seq: Leaf<u64>,
 }
 
+/// An alternate schema used to test schema-change rebuilds.
+#[derive(Durable)]
+pub struct AltStore {
+    pub other: Leaf<String>,
+}
+
 /// The payload shared by all three enums, so they fold identically.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct Pay {
@@ -63,11 +69,17 @@ pub enum Action {
 pub fn apply(tx: &mut Tx, action: Action) -> durable::Result<()> {
     let root = Totals::root();
     match action {
-        Action::Add(key, n) => tx.write(root.sums().key(&key).add(n)),
-        Action::Note => tx.write(root.count().add(1)),
-        Action::Reset => tx.write(root.sums().key(&"reset".to_string()).add(1)),
+        Action::Add(key, n) => {
+            root.sums().add(tx, &key, n)?;
+        }
+        Action::Note => {
+            root.count().add(tx, 1)?;
+        }
+        Action::Reset => {
+            root.sums().add(tx, "reset", 1)?;
+        }
     }
-    tx.write(root.last_seq().set(&tx.seq()));
+    root.last_seq().set(tx, &tx.seq())?;
     Ok(())
 }
 
@@ -115,20 +127,13 @@ pub fn reduce_value(tx: &mut Tx, ev: &serde_json::Value) -> durable::Result<()> 
         .unwrap_or("?")
         .to_string();
     let root = Totals::root();
-    tx.write(root.sums().key(&kind).add(1));
-    tx.write(root.count().add(1));
-    tx.write(root.last_seq().set(&tx.seq()));
+    root.sums().add(tx, &kind, 1)?;
+    root.count().add(tx, 1)?;
+    root.last_seq().set(tx, &tx.seq())?;
     Ok(())
 }
 
-pub fn schema() -> durable::Shape {
-    <Totals as durable::Describe>::shape()
-}
-
 /// Build one sealed line whose event is `raw` JSON, copied byte for byte.
-/// Same envelope as `render_sealed`, so it is a valid tape line; unlike
-/// `render_sealed` it keeps the event text exactly as given (spacing, key
-/// order, escapes), which is what byte-identity tests need.
 pub fn sealed_raw(seq: u64, ts_ms: u64, from: u64, to: u64, raw: &str) -> String {
     let prefix =
         format!("{{\"seq\":{seq},\"ts_ms\":{ts_ms},\"from\":{from},\"to\":{to},\"event\":{raw}");
@@ -193,7 +198,6 @@ pub fn tmp_dir(label: &str) -> PathBuf {
     dir
 }
 
-/// Durability used by test writers that need an immediate commit.
 pub fn sync() -> Durability {
     Durability::SyncWal
 }

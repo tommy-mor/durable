@@ -44,10 +44,9 @@ fn the_rewrite_report_counts_only_the_round_records() {
     let src = write_old_tape(&dir).unwrap();
     let before = read_bytes(&src);
     let dst = dir.join("out.jsonl");
-    let report = rewrite::<Old, New>(
+    let report = rewrite::<Ladder, Old, New>(
         &src,
         &dst,
-        worked::schema(),
         reduce_old,
         Mode::SameSeq,
         map_old_to_new,
@@ -66,10 +65,9 @@ fn a_map_that_ignores_the_pre_record_state_is_caught() {
     let dir = tmp_dir("worked-control");
     let src = write_old_tape(&dir).unwrap();
     let dst = dir.join("naive.jsonl");
-    rewrite::<Old, New>(
+    rewrite::<Ladder, Old, New>(
         &src,
         &dst,
-        worked::schema(),
         reduce_old,
         Mode::SameSeq,
         |s| {
@@ -85,10 +83,9 @@ fn a_map_that_ignores_the_pre_record_state_is_caught() {
         },
     )
     .unwrap();
-    let diff = check_rewrite_equivalent::<Old, New>(
+    let diff = check_rewrite_equivalent::<Ladder, Old, New>(
         &src,
         &dst,
-        worked::schema(),
         reduce_old,
         reduce_new,
         app_keys_only,
@@ -101,25 +98,18 @@ fn a_map_that_ignores_the_pre_record_state_is_caught() {
 fn the_new_writer_and_the_rewritten_tape_agree_on_projection_digest() {
     let dir = tmp_dir("worked-digest");
     let dst = run(&dir).unwrap();
-    let rt = Runtime::open(
-        dir.join("proj-new"),
-        &dst,
-        worked::schema(),
-        None,
-        reduce_new,
-    )
-    .unwrap();
+    let rt = Runtime::open::<Ladder>(dir.join("proj-new"), &dst, reduce_new).unwrap();
     rt.verify().unwrap();
-    let folded = durable::fold_dump::<New>(&dst, worked::schema(), reduce_new).unwrap();
+    let folded = durable::fold_dump::<Ladder, New>(&dst, reduce_new).unwrap();
     let app_rt: Vec<_> = rt
         .dump()
         .unwrap()
         .into_iter()
-        .filter(|(k, _)| app_keys_only(k))
+        .filter(|(t, k, _)| app_keys_only(t, k))
         .collect();
     let app_fold: Vec<_> = folded
         .into_iter()
-        .filter(|(k, _)| app_keys_only(k))
+        .filter(|(t, k, _)| app_keys_only(t, k))
         .collect();
     assert_eq!(app_rt, app_fold);
 }

@@ -1,14 +1,8 @@
 //! Nested maps ending in a leaf: `Map<String, Map<String, Leaf<User>>>`.
 //!
 //! Run with: `cargo run -p durable --example nested_maps`
-//!
-//! The outer map is keyed by org, the inner map by username, and each `User`
-//! is stored as one CBOR blob. Both map levels are part of the RocksDB key;
-//! the `User`'s own fields are not, so they can only be read or replaced whole
-//! (or reached by the query engine as "leaf interior" steps).
 
-use ciborium::Value;
-use durable::{query, Db, Describe, Durability, Durable, Leaf, Map, Nav, Query};
+use durable::{Db, Durability, Durable, Leaf, Map};
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -21,7 +15,6 @@ struct User {
 #[derive(Durable)]
 #[allow(dead_code)]
 struct Directory {
-    /// org -> username -> user
     orgs: Map<String, Map<String, Leaf<User>>>,
 }
 
@@ -36,73 +29,57 @@ fn user(name: &str, admin: bool) -> User {
 fn main() -> durable::Result<()> {
     let dir = tempfile::tempdir().unwrap();
     let db = Db::open(dir.path())?;
-
     let orgs = Directory::root().orgs();
-    let org = |name: &str| orgs.key(&name.to_string());
-    let s = |x: &str| x.to_string();
 
-    // Each set addresses exactly one key: orgs/<org>/<username>.
-    db.apply(
-        &[
-            org("acme").key(&s("alice")).set(&user("Alice", true)),
-            org("acme").key(&s("bob")).set(&user("Bob", false)),
-            org("globex").key(&s("carol")).set(&user("Carol", true)),
-            org("globex").key(&s("dave")).set(&user("Dave", false)),
-            org("initech").key(&s("erin")).set(&user("Erin", false)),
-        ],
-        Durability::SyncWal,
-    )?;
+    db.txn(Durability::SyncWal, |tx| {
+        orgs.key("acme").set(tx, "alice", &user("Alice", true))?;
+        orgs.key("acme").set(tx, "bob", &user("Bob", false))?;
+        orgs.key("globex").set(tx, "carol", &user("Carol", true))?;
+        orgs.key("globex").set(tx, "dave", &user("Dave", false))?;
+        orgs.key("initech").set(tx, "erin", &user("Erin", false))?;
+        Ok(())
+    })?;
 
-    // Point read, through both maps.
-    let alice = org("acme").key(&s("alice")).get(&db)?;
-    println!("acme/alice = {alice:?}");
-
-    // The outer map's values are maps, so it offers `keys`/`entries`, not `iter`.
-    // `entries` yields a typed sub-path per org.
-    println!("\norgs: {:?}", orgs.keys(&db)?);
-    for (name, members) in orgs.entries(&db)? {
-        // The inner map is leaf-valued, so it has `iter` / `get` / `transform_values`.
-        let users = members.iter(&db)?;
+    let r = db.read()?;
+    println!("acme/alice = {:?}", orgs.key("acme").get(&r, "alice")?);
+    println!("\norgs: {:?}", orgs.keys(&r)?);
+    for (name, members) in orgs.entries(&r)? {
+        let users = members.iter(&r)?;
         println!("  {name}: {} member(s)", users.len());
         for (username, u) in users {
             println!("    {username:<6} {:<20} admin={}", u.email, u.admin);
         }
     }
 
-    // Blind delete of one user, and a range delete of a whole org.
-    db.apply(
-        &[org("acme").key(&s("bob")).delete(), org("initech").clear()],
-        Durability::SyncWal,
-    )?;
-    println!("\nafter removing acme/bob and clearing initech:");
-    println!("  orgs: {:?}", orgs.keys(&db)?);
-    println!("  acme contains bob? {}", org("acme").contains(&db, &s("bob"))?);
-
-    // Bulk rewrite of one org: one scan, one atomic batch of blind writes.
-    let promote = org("globex").transform_values(&db, |_, mut u| {
-        u.admin = true;
-        Some(u)
+    // Delete one user and clear a whole org in one transaction.
+    db.txn(Durability::SyncWal, |tx| {
+        orgs.key("acme").remove(tx, "bob")?;
+        orgs.remove(tx, "initech")?;
+        Ok(())
     })?;
-    db.apply(&promote, Durability::SyncWal)?;
+    let r2 = db.read()?;
+    println!("\nafter removing acme/bob and clearing initech:");
+    println!("  orgs: {:?}", orgs.keys(&r2)?);
+    println!("  acme contains bob? {}", orgs.key("acme").contains(&r2, "bob")?);
+
+    // Prefix search on usernames
+    let a_users: Vec<String> = orgs
+        .key("acme")
+        .prefix_keys(&r2, "al")?
+        .collect::<Result<_, _>>()?;
+    println!("  acme users starting with 'al': {a_users:?}");
+
+    // Bulk rewrite of one org in one transaction.
+    db.txn(Durability::SyncWal, |tx| {
+        orgs.key("globex").transform_values(tx, |_, mut u| {
+            u.admin = true;
+            Some(u)
+        })
+    })?;
     println!(
         "  globex/dave admin after promote: {}",
-        org("globex").get(&db, &s("dave"))?.unwrap().admin
+        orgs.key("globex").get(&db, "dave")?.unwrap().admin
     );
-
-    // The same data through the query engine. `orgs` and both keys are
-    // storage navigation; `email` is a step inside the decoded User blob.
-    let shape = Directory::shape();
-    let q = Query::new(vec![
-        Nav::Field(s("orgs")),
-        Nav::Key(Value::Text(s("globex"))),
-        Nav::Key(Value::Text(s("carol"))),
-        Nav::Field(s("email")),
-    ]);
-    println!("\nquery plan for orgs[globex][carol].email:");
-    for step in query::explain(&shape, &q)?.steps {
-        println!("  {step}");
-    }
-    println!("result: {:?}", query::one(&db, &shape, &q)?);
 
     Ok(())
 }

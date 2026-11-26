@@ -1,201 +1,153 @@
-//! The prefix-invalidation bridge: the load-bearing claim behind `store.wait`.
+//! Typed key-range invalidation for reactive subscribers.
 //!
-//! A commit's write set and a watched path's key range overlap whenever the
-//! write could change what that path reads. The schema *is* the dependency
-//! graph; prefix overlap just reads it.
-//!
-//! Rules:
-//! 1. Watch whole subtrees, never the rows you saw — stop at the first
-//!    collecting step (`where`, `first`, `slice`, `keys`, …), at a deque
-//!    index, or on entering a leaf blob's interior.
-//! 2. Check overlap in both directions — a write *above* the watcher
-//!    (deleting `users/bob` while watching `users/bob/banned`) still hits.
-//! 3. Only RocksDB is visible — server lets, fs, http never wake anyone.
-//!
-//! This module is what the courier calls.
+//! Every [`crate::Path`] lowers to a [`WatchRange`] naming its table and key
+//! interval, and every [`crate::Tx`] records the [`WatchRange`]s touched by its
+//! mutations. Checking whether a commit could affect a watched path is a pure
+//! interval overlap check in both directions (a write *above* a watched path —
+//! e.g. deleting a parent user record while watching one of its fields — still
+//! hits).
 
-use crate::{dynpath, Nav, Op, Shape, Write};
+use crate::codec;
 
-/// Half-open key interval `[lo, hi)`; `hi = None` means "to the end".
-#[derive(Clone, Debug)]
-pub struct WatchRange {
-    lo: Vec<u8>,
-    hi: Option<Vec<u8>>,
-}
-
-fn upper(p: &[u8]) -> Option<Vec<u8>> {
-    let mut e = p.to_vec();
-    while let Some(last) = e.last_mut() {
-        if *last != 0xff {
-            *last += 1;
-            return Some(e);
-        }
-        e.pop();
-    }
-    None
+/// A watched or modified region of the database.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WatchRange {
+    /// Every table in the database (database root).
+    All,
+    /// Every table under a namespace (`"{ns}/..."`).
+    Namespace(String),
+    /// Half-open key interval `[lo, hi)` within a single table (`hi = None`
+    /// runs to the end of the table).
+    Range {
+        table: String,
+        lo: Vec<u8>,
+        hi: Option<Vec<u8>>,
+    },
 }
 
 impl WatchRange {
-    /// Every key under `p` (a whole subtree).
-    pub fn prefix(p: &[u8]) -> Self {
-        Self { lo: p.to_vec(), hi: upper(p) }
+    /// Matches every table in the database.
+    pub fn all() -> Self {
+        Self::All
     }
 
-    /// Exactly one key.
-    pub fn point(key: &[u8]) -> Self {
+    /// Matches every table belonging to `namespace`.
+    pub fn namespace(ns: impl Into<String>) -> Self {
+        Self::Namespace(ns.into())
+    }
+
+    /// Matches an entire table.
+    pub fn table(table: impl Into<String>) -> Self {
+        Self::Range {
+            table: table.into(),
+            lo: Vec::new(),
+            hi: None,
+        }
+    }
+
+    /// Matches every key prefixed by `prefix` within `table`.
+    pub fn prefix(table: impl Into<String>, prefix: &[u8]) -> Self {
+        let hi = codec::prefix_upper_bound(prefix);
+        Self::Range {
+            table: table.into(),
+            lo: prefix.to_vec(),
+            hi,
+        }
+    }
+
+    /// Matches one exact key within `table`.
+    pub fn point(table: impl Into<String>, key: &[u8]) -> Self {
         let mut hi = key.to_vec();
         hi.push(0);
-        Self { lo: key.to_vec(), hi: Some(hi) }
+        Self::Range {
+            table: table.into(),
+            lo: key.to_vec(),
+            hi: Some(hi),
+        }
     }
 
-    /// Interval overlap — both directions. For two *prefix* ranges this is
-    /// exactly `a.starts_with(b) || b.starts_with(a)`: prefix ranges either
-    /// nest or are disjoint.
-    pub fn overlaps(&self, o: &WatchRange) -> bool {
-        let a_before_o_end = o.hi.as_ref().map_or(true, |h| self.lo < *h);
-        let o_before_a_end = self.hi.as_ref().map_or(true, |h| o.lo < *h);
-        a_before_o_end && o_before_a_end
+    /// Matches a custom half-open byte interval `[lo, hi)` within `table`.
+    pub fn interval(table: impl Into<String>, lo: Vec<u8>, hi: Option<Vec<u8>>) -> Self {
+        Self::Range {
+            table: table.into(),
+            lo,
+            hi,
+        }
+    }
+
+    /// Symmetric overlap check: returns `true` iff there exists at least one
+    /// `(table, key)` that belongs to both ranges.
+    pub fn overlaps(&self, other: &WatchRange) -> bool {
+        match (self, other) {
+            (WatchRange::All, _) | (_, WatchRange::All) => true,
+            (WatchRange::Namespace(a), WatchRange::Namespace(b)) => a == b,
+            (WatchRange::Namespace(ns), WatchRange::Range { table, .. })
+            | (WatchRange::Range { table, .. }, WatchRange::Namespace(ns)) => {
+                table_in_namespace(table, ns)
+            }
+            (
+                WatchRange::Range {
+                    table: t1,
+                    lo: lo1,
+                    hi: hi1,
+                },
+                WatchRange::Range {
+                    table: t2,
+                    lo: lo2,
+                    hi: hi2,
+                },
+            ) => {
+                if t1 != t2 {
+                    return false;
+                }
+                let a_before_b_end = hi2.as_ref().map_or(true, |h| lo1 < h);
+                let b_before_a_end = hi1.as_ref().map_or(true, |h| lo2 < h);
+                a_before_b_end && b_before_a_end
+            }
+        }
     }
 }
 
-/// Two prefix ranges either nest or are disjoint — so this one-liner *is*
-/// interval overlap for the prefix-prefix case.
+pub(crate) fn table_in_namespace(table: &str, ns: &str) -> bool {
+    table
+        .strip_prefix(ns)
+        .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// Did any touched range in a commit overlap `watch`?
+pub fn watch_hit(watch: &WatchRange, touched: &[WatchRange]) -> bool {
+    touched.iter().any(|w| w.overlaps(watch))
+}
+
+/// Two prefix ranges either nest or are disjoint — pure byte-prefix overlap.
 pub fn prefix_overlap(a: &[u8], b: &[u8]) -> bool {
     a.starts_with(b) || b.starts_with(a)
-}
-
-/// The longest *point* prefix of a query's path: walk `Field`/`Key`/`Index`
-/// steps while they resolve, stop at the first collecting/positional nav,
-/// at anything that fails to resolve (deque index, leaf interior), and
-/// watch everything under that point. Returns the prefix bytes (empty =
-/// the root, which overlaps every write).
-pub fn watch_prefix(schema: &Shape, namespace: Option<&str>, navs: &[Nav]) -> Vec<u8> {
-    let mut best = match namespace {
-        Some(ns) => {
-            let mut p = Vec::new();
-            crate::codec::put_segment(&mut p, ns.as_bytes());
-            p
-        }
-        None => Vec::new(),
-    };
-    for n in 0..navs.len() {
-        match &navs[n] {
-            Nav::Field(_) | Nav::Key(_) | Nav::Index(_) => {}
-            _ => break,
-        }
-        match dynpath::resolve(schema, namespace, &navs[..=n]) {
-            Ok(loc) => best = loc.prefix,
-            Err(_) => break,
-        }
-    }
-    best
-}
-
-/// What one committed write touched, as a key range. Point ops
-/// (`Put`/`Delete`/`Merge`) are exact keys; subtree ops (`DeletePrefix`,
-/// collection pushes) are whole-prefix ranges — conservative, never missed.
-pub fn write_range(w: &Write) -> WatchRange {
-    match w.op() {
-        Op::Put { key, .. } | Op::Delete { key } | Op::Merge { key, .. } => {
-            WatchRange::point(key)
-        }
-        Op::DeletePrefix { prefix }
-        | Op::ListPush { prefix, .. }
-        | Op::DequePushBack { prefix, .. }
-        | Op::DequePushFront { prefix, .. } => WatchRange::prefix(prefix),
-    }
-}
-
-/// Did any write in this commit touch anything under the watched prefix?
-/// Both directions checked — a write above the watcher still wakes her.
-pub fn watch_hit(watch: &[u8], writes: &[Write]) -> bool {
-    let read = WatchRange::prefix(watch);
-    writes.iter().any(|w| write_range(w).overlaps(&read))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ciborium::Value;
 
-    fn shape() -> Shape {
-        Shape::record(vec![
-            (
-                "users".into(),
-                Shape::map(Shape::record(vec![
-                    ("name".into(), Shape::Leaf),
-                    ("banned".into(), Shape::Leaf),
-                ])),
-            ),
-            ("count".into(), Shape::Sum),
-            ("title".into(), Shape::Leaf),
-        ])
-    }
+    #[test]
+    fn point_and_prefix_overlap_both_directions() {
+        let user_bob = WatchRange::prefix("users", b"bob\0\0");
+        let bob_banned = WatchRange::point("users", b"bob\0\0\x01\x01");
+        let bobby_banned = WatchRange::point("users", b"bobby\0\0\x01\x01");
+        let other_table = WatchRange::point("votes", b"bob\0\0");
 
-    fn t(s: &str) -> Value {
-        Value::Text(s.into())
+        assert!(user_bob.overlaps(&bob_banned));
+        assert!(bob_banned.overlaps(&user_bob));
+        assert!(!user_bob.overlaps(&bobby_banned));
+        assert!(!user_bob.overlaps(&other_table));
     }
 
     #[test]
-    fn delete_parent_hits_child_watch() {
-        let s = shape();
-        let watch_navs = dynpath::navs_for(&s, &[t("users"), t("bob"), t("banned")]).unwrap();
-        let watch = watch_prefix(&s, None, &watch_navs);
-        let del_navs = dynpath::navs_for(&s, &[t("users"), t("bob")]).unwrap();
-        let w = dynpath::delete(&s, None, &del_navs).unwrap();
-        assert!(watch_hit(&watch, std::slice::from_ref(&w)));
-    }
-
-    #[test]
-    fn sibling_stays_disjoint() {
-        let s = shape();
-        let watch_navs = dynpath::navs_for(&s, &[t("users"), t("bob"), t("name")]).unwrap();
-        let watch = watch_prefix(&s, None, &watch_navs);
-        let navs = dynpath::navs_for(&s, &[t("users"), t("bobby"), t("banned")]).unwrap();
-        let ws = dynpath::put(&s, None, &navs, &Value::Bool(true)).unwrap();
-        assert!(!watch_hit(&watch, &ws));
-    }
-
-    #[test]
-    fn collecting_watch_covers_whole_collection() {
-        use crate::{Expr, Predicate};
-        let s = shape();
-        let q = vec![
-            Nav::Field("users".into()),
-            Nav::Where(Predicate::Eq(
-                Expr::Field("banned".into()),
-                Expr::Lit(Value::Bool(true)),
-            )),
-            Nav::Field("name".into()),
-        ];
-        let watch = watch_prefix(&s, None, &q);
-        // stops at the Where: watches the whole users map
-        let whole = dynpath::resolve(&s, None, &[Nav::Field("users".into())]).unwrap().prefix;
-        assert_eq!(watch, whole);
-        // a new banned user wakes her
-        let navs = dynpath::navs_for(&s, &[t("users"), t("carol"), t("banned")]).unwrap();
-        let ws = dynpath::put(&s, None, &navs, &Value::Bool(true)).unwrap();
-        assert!(watch_hit(&watch, &ws));
-    }
-
-    #[test]
-    fn sum_merge_hits_point_watch_not_sibling() {
-        let s = shape();
-        let navs = dynpath::navs_for(&s, &[t("count")]).unwrap();
-        let watch = watch_prefix(&s, None, &navs);
-        let w = dynpath::add(&s, None, &navs, &ciborium::Value::Integer(1.into())).unwrap();
-        assert!(watch_hit(&watch, std::slice::from_ref(&w)));
-        let other = dynpath::navs_for(&s, &[t("title")]).unwrap();
-        let other_watch = watch_prefix(&s, None, &other);
-        assert!(!watch_hit(&other_watch, std::slice::from_ref(&w)));
-    }
-
-    #[test]
-    fn root_watches_everything() {
-        let s = shape();
-        let navs = dynpath::navs_for(&s, &[t("title")]).unwrap();
-        let ws = dynpath::put(&s, None, &navs, &t("hi")).unwrap();
-        assert!(watch_hit(&[], &ws));
-        assert!(prefix_overlap(&[], &[0x01]));
+    fn namespace_and_all_overlap() {
+        let ns = WatchRange::namespace("tenant_a");
+        let a_users = WatchRange::point("tenant_a/users", b"alice\0\0");
+        let b_users = WatchRange::point("tenant_b/users", b"alice\0\0");
+        assert!(ns.overlaps(&a_users));
+        assert!(!ns.overlaps(&b_users));
+        assert!(WatchRange::all().overlaps(&b_users));
     }
 }

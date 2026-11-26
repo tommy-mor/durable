@@ -112,8 +112,7 @@ fn reopen_continuity_across_batches() {
         note: String,
     }
     fn reduce(tx: &mut durable::Tx, e: &Ev) -> durable::Result<()> {
-        tx.write(Store::root().seen().key(&e.note).set(&e.note));
-        Ok(())
+        Store::root().seen().set(tx, &e.note, &e.note)
     }
     let dir = TempDir::new().unwrap();
     let log = dir.path().join("log.jsonl");
@@ -121,7 +120,7 @@ fn reopen_continuity_across_batches() {
     // Three multi-event batches, reopening between each.
     for round in 0..3 {
         {
-            let rt = Runtime::open_described::<Store>(&proj, &log, None, reduce).unwrap();
+            let rt = Runtime::open::<Store>(&proj, &log, reduce).unwrap();
             let evs: Vec<Ev> = (0..3).map(|i| Ev { note: format!("r{round}i{i}") }).collect();
             rt.append_batch(evs).unwrap();
         }
@@ -131,7 +130,7 @@ fn reopen_continuity_across_batches() {
         bytes.extend_from_slice(b"{\"seq\":999,\"ts_ms\":1");
         std::fs::write(&log, &bytes).unwrap();
     }
-    let rt = Runtime::open_described::<Store>(&proj, &log, None, reduce).unwrap();
+    let rt = Runtime::open::<Store>(&proj, &log, reduce).unwrap();
     assert_eq!(rt.applied().unwrap(), 9);
     rt.verify().unwrap();
 }

@@ -1,26 +1,32 @@
-//! Key encoding for durable paths.
+//! Low-level key framing and order-preserving byte primitives.
 //!
-//! Every durable location lowers to a deterministic RocksDB key built from
-//! *length-prefixed segments*. A segment is `uvarint(len) ++ bytes`, which makes
-//! segment sequences self-delimiting: no segment can be a prefix of a *different*
-//! segment, so sibling subtrees never overlap and a parent prefix only ever
-//! prefixes its own descendants.
+//! Every key in a `durable` table is built from prefix-disjoint,
+//! order-preserving encodings (`crate::key::Key`). Within a non-empty parent
+//! prefix `P`, a one-byte discriminator separates child data from metadata:
 //!
-//! Within a location prefix `P` we reserve a one-byte discriminator:
+//! - `P` (exact)          → a [`crate::Leaf`] or [`crate::Sum`] scalar value.
+//! - `P ++ [DATA] ++ seg` → a child (map entry, set member, struct field,
+//!                          list/deque element).
+//! - `P ++ [META] ++ seg` → reserved for collection metadata.
 //!
-//! - `P` (exact)            → a [`crate::Leaf`] scalar value lives here.
-//! - `P ++ [DATA] ++ seg`   → a child (map entry, struct field, list element).
-//! - `P ++ [META] ++ seg`   → collection metadata (e.g. a list length).
-//!
-//! Because children and metadata live *under* `P`, deleting a whole subtree is a
-//! single RocksDB range delete over `[P, prefix_upper_bound(P))`.
+//! At a table's root (`P` empty), child keys sit directly at `seg` with no
+//! leading discriminator, so top-level flat collections map 1:1 onto `redb`
+//! table entries and inherit O(1) `table.len()` and O(1) `delete_table()`.
 
-/// Discriminator for child data living under a location.
+/// On-disk projection format version. Bumped whenever key/value framing
+/// changes so [`crate::ProjectionStamp`] triggers an automatic rebuild.
+pub const FORMAT_VERSION: u32 = 2;
+
+/// Discriminator for child data living under a non-empty parent prefix.
 pub const DATA: u8 = 0x01;
-/// Discriminator for collection metadata living under a location.
+
+/// Reserved discriminator for metadata living under a non-empty parent prefix.
 pub const META: u8 = 0x00;
 
 /// Append an unsigned LEB128 varint to `out`.
+///
+/// Self-delimiting and prefix-disjoint: the terminating byte has bit 7 clear,
+/// while every preceding byte has bit 7 set.
 pub fn put_uvarint(out: &mut Vec<u8>, mut value: u64) {
     loop {
         let mut byte = (value & 0x7f) as u8;
@@ -37,8 +43,7 @@ pub fn put_uvarint(out: &mut Vec<u8>, mut value: u64) {
 
 /// Decode an unsigned LEB128 varint from the front of `bytes`.
 ///
-/// Returns the value and the number of bytes consumed, or `None` if the input is
-/// truncated or overlong.
+/// Returns `(value, bytes_consumed)`, or `None` if truncated or overlong.
 pub fn read_uvarint(bytes: &[u8]) -> Option<(u64, usize)> {
     let mut result: u64 = 0;
     let mut shift = 0;
@@ -55,37 +60,33 @@ pub fn read_uvarint(bytes: &[u8]) -> Option<(u64, usize)> {
     None
 }
 
-/// Append a length-prefixed segment to `out`.
-pub fn put_segment(out: &mut Vec<u8>, bytes: &[u8]) {
-    put_uvarint(out, bytes.len() as u64);
-    out.extend_from_slice(bytes);
-}
-
-/// Read one length-prefixed segment from the front of `bytes`.
-///
-/// Returns the segment payload and the total number of bytes consumed
-/// (including the length prefix).
-pub fn read_segment(bytes: &[u8]) -> Option<(&[u8], usize)> {
-    let (len, header) = read_uvarint(bytes)?;
-    let len = len as usize;
-    let end = header.checked_add(len)?;
-    if end > bytes.len() {
-        return None;
-    }
-    Some((&bytes[header..end], header + len))
+/// Encode a `#[derive(Durable)]` struct field id as a self-delimiting segment.
+pub fn field_segment(field_id: u32) -> Vec<u8> {
+    let mut seg = Vec::with_capacity(5);
+    put_uvarint(&mut seg, field_id as u64);
+    seg
 }
 
 /// Build the key for child `seg` under location prefix `parent`.
+///
+/// When `parent` is empty (root of a dedicated table), `seg` is the entire key;
+/// otherwise `[DATA]` separates `parent` from `seg`.
 pub fn child_key(parent: &[u8], seg: &[u8]) -> Vec<u8> {
-    let mut key = Vec::with_capacity(parent.len() + 2 + seg.len());
+    if parent.is_empty() {
+        return seg.to_vec();
+    }
+    let mut key = Vec::with_capacity(parent.len() + 1 + seg.len());
     key.extend_from_slice(parent);
     key.push(DATA);
-    put_segment(&mut key, seg);
+    key.extend_from_slice(seg);
     key
 }
 
 /// The prefix under which all of `parent`'s child data lives.
 pub fn child_scan_prefix(parent: &[u8]) -> Vec<u8> {
+    if parent.is_empty() {
+        return Vec::new();
+    }
     let mut key = Vec::with_capacity(parent.len() + 1);
     key.extend_from_slice(parent);
     key.push(DATA);
@@ -94,17 +95,17 @@ pub fn child_scan_prefix(parent: &[u8]) -> Vec<u8> {
 
 /// Build a metadata key `name` under location prefix `parent`.
 pub fn meta_key(parent: &[u8], name: &[u8]) -> Vec<u8> {
-    let mut key = Vec::with_capacity(parent.len() + 2 + name.len());
+    let mut key = Vec::with_capacity(parent.len() + 1 + name.len() + 2);
     key.extend_from_slice(parent);
     key.push(META);
-    put_segment(&mut key, name);
+    encode_escaped_bytes(name, &mut key);
     key
 }
 
 /// Smallest key strictly greater than every key prefixed by `prefix`.
 ///
-/// Returns `None` when `prefix` is empty or all `0xff` (i.e. the range extends to
-/// the end of the keyspace), in which case callers must fall back to a scan.
+/// Returns `None` when `prefix` is empty or all `0xff` (the range runs to the
+/// end of the keyspace).
 pub fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
     let mut end = prefix.to_vec();
     while let Some(last) = end.last_mut() {
@@ -117,52 +118,90 @@ pub fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
-/// Order-preserving encoding of an `i64` index (used by [`crate::Deque`]).
-///
-/// Flipping the sign bit makes the unsigned big-endian byte order match signed
-/// numeric order, so negative front indices sort before positive ones.
+/// Order-preserving encoding of an `i64` (sign bit flipped, big-endian).
+#[inline]
 pub fn order_i64(index: i64) -> [u8; 8] {
     ((index as u64) ^ (1u64 << 63)).to_be_bytes()
 }
 
-/// Order-preserving encoding of a `u64` index (used by [`crate::List`]).
+/// Inverse of [`order_i64`].
+#[inline]
+pub fn decode_order_i64(bytes: [u8; 8]) -> i64 {
+    (u64::from_be_bytes(bytes) ^ (1u64 << 63)) as i64
+}
+
+/// Order-preserving encoding of a `u64` (big-endian).
+#[inline]
 pub fn order_u64(index: u64) -> [u8; 8] {
     index.to_be_bytes()
 }
 
-// ---------------------------------------------------------------------------
-// Self-describing child segments
-// ---------------------------------------------------------------------------
-//
-// A child segment is `[TAG] ++ payload`, so a scanned key reveals its own
-// addressing scheme — list-index vs map-key — with no schema in hand. Order is
-// preserved because the tag is a constant one-byte prefix and the payload keeps
-// its order-preserving encoding (big-endian index / CBOR key).
-
-/// Child addressing: an order-preserving list index (`order_u64` follows).
-pub const TAG_INDEX: u8 = 0x00;
-/// Child addressing: a CBOR-encoded map key follows.
-pub const TAG_KEY: u8 = 0x01;
-
-/// A self-describing list-index child segment: `[TAG_INDEX] ++ order_u64(i)`.
-pub fn index_segment(index: u64) -> Vec<u8> {
-    let mut s = Vec::with_capacity(9);
-    s.push(TAG_INDEX);
-    s.extend_from_slice(&order_u64(index));
-    s
+/// Inverse of [`order_u64`].
+#[inline]
+pub fn decode_order_u64(bytes: [u8; 8]) -> u64 {
+    u64::from_be_bytes(bytes)
 }
 
-/// A self-describing map-key child segment: `[TAG_KEY] ++ key`.
-pub fn key_segment(key: &[u8]) -> Vec<u8> {
-    let mut s = Vec::with_capacity(1 + key.len());
-    s.push(TAG_KEY);
-    s.extend_from_slice(key);
-    s
+/// Append a byte slice in lexicographically ordered, prefix-disjoint form:
+/// every embedded `0x00` becomes `0x00 0xFF`, and the slice is terminated by
+/// `0x00 0x00`.
+///
+/// Using a two-byte terminator `0x00 0x00` (rather than single `0x00`) ensures
+/// that `"a"` (`61 00 00`) is never a byte-prefix of `"a\0"` (`61 00 ff 00 00`),
+/// so subtree operations (`DeletePrefix`, `contains`, `watch`) stay sound even
+/// when keys contain NUL bytes, while preserving exact byte order:
+/// `"a" < "a"/child < "a\0" < "a\x01" < "ab"`.
+pub fn encode_escaped_bytes(bytes: &[u8], out: &mut Vec<u8>) {
+    out.reserve(bytes.len() + 2);
+    for &b in bytes {
+        if b == 0x00 {
+            out.push(0x00);
+            out.push(0xff);
+        } else {
+            out.push(b);
+        }
+    }
+    out.push(0x00);
+    out.push(0x00);
 }
 
-/// Read the addressing tag off a child segment payload (`None` if empty).
-pub fn segment_tag(seg: &[u8]) -> Option<u8> {
-    seg.first().copied()
+/// Append a byte prefix in escaped form WITHOUT the terminating `0x00 0x00`,
+/// suitable for prefix range scans (`"tom"` matches `"tom"`, `"tommy"`, `"tom\0"`).
+pub fn encode_escaped_prefix(bytes: &[u8], out: &mut Vec<u8>) {
+    out.reserve(bytes.len());
+    for &b in bytes {
+        if b == 0x00 {
+            out.push(0x00);
+            out.push(0xff);
+        } else {
+            out.push(b);
+        }
+    }
+}
+
+/// Decode one escaped, `0x00 0x00`-terminated byte slice from the front of
+/// `bytes`. Returns `(decoded_bytes, bytes_consumed)`.
+pub fn decode_escaped_bytes(bytes: &[u8]) -> Option<(Vec<u8>, usize)> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == 0x00 {
+            let next = *bytes.get(i + 1)?;
+            match next {
+                0x00 => return Some((out, i + 2)),
+                0xff => {
+                    out.push(0x00);
+                    i += 2;
+                }
+                _ => return None,
+            }
+        } else {
+            out.push(b);
+            i += 1;
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -187,28 +226,46 @@ mod tests {
     }
 
     #[test]
-    fn segment_roundtrip_and_self_delimiting() {
-        let mut buf = Vec::new();
-        put_segment(&mut buf, b"alpha");
-        put_segment(&mut buf, b"");
-        put_segment(&mut buf, &[0x00, 0xff, 0x01]);
-
-        let (a, n1) = read_segment(&buf).unwrap();
-        assert_eq!(a, b"alpha");
-        let (b, n2) = read_segment(&buf[n1..]).unwrap();
-        assert_eq!(b, b"");
-        let (c, _) = read_segment(&buf[n1 + n2..]).unwrap();
-        assert_eq!(c, &[0x00, 0xff, 0x01]);
-    }
-
-    #[test]
-    fn segment_no_false_prefix() {
-        // seg("a") must not be a byte-prefix of seg("ab"): length-prefixing guards this.
-        let mut a = Vec::new();
-        put_segment(&mut a, b"a");
-        let mut ab = Vec::new();
-        put_segment(&mut ab, b"ab");
-        assert!(!ab.starts_with(&a));
+    fn escaped_bytes_order_and_prefix_disjoint_with_nuls() {
+        let samples: &[&[u8]] = &[
+            b"",
+            b"\x00",
+            b"\x00\x00",
+            b"\x00a",
+            b"\x01",
+            b"a",
+            b"a\x00",
+            b"a\x00b",
+            b"a\x01",
+            b"ab",
+            b"zz",
+        ];
+        let mut encoded: Vec<Vec<u8>> = Vec::new();
+        for s in samples {
+            let mut buf = Vec::new();
+            encode_escaped_bytes(s, &mut buf);
+            let (dec, used) = decode_escaped_bytes(&buf).unwrap();
+            assert_eq!(dec, *s);
+            assert_eq!(used, buf.len());
+            encoded.push(buf);
+        }
+        // Exact lexicographic order
+        for pair in encoded.windows(2) {
+            assert!(pair[0] < pair[1], "{:?} not < {:?}", pair[0], pair[1]);
+        }
+        // Strict prefix disjointness (even "a" vs "a\0")
+        for (i, a) in encoded.iter().enumerate() {
+            for (j, b) in encoded.iter().enumerate() {
+                if i != j {
+                    assert!(
+                        !b.starts_with(a),
+                        "sample {i} ({:?}) is a prefix of sample {j} ({:?})",
+                        samples[i],
+                        samples[j]
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -220,40 +277,14 @@ mod tests {
     }
 
     #[test]
-    fn order_i64_is_monotonic() {
+    fn order_i64_is_monotonic_and_roundtrips() {
         let mut values = [-5i64, -1, 0, 1, 5, i64::MIN, i64::MAX];
         values.sort();
-        // Encoded byte order must match signed numeric order.
+        for &v in &values {
+            assert_eq!(decode_order_i64(order_i64(v)), v);
+        }
         for pair in values.windows(2) {
             assert!(order_i64(pair[0]) < order_i64(pair[1]));
         }
-    }
-
-    #[test]
-    fn tagged_segments_self_describe_and_keep_index_order() {
-        // List indices must sort numerically even though each child segment now
-        // opens with a TAG_INDEX byte: the tag is a constant prefix and the u64
-        // payload is big-endian, so byte order still equals numeric order.
-        let mut keys: Vec<(u64, Vec<u8>)> = [100u64, 2, 11, 0, 10, 1]
-            .iter()
-            .map(|i| (*i, child_key(b"", &index_segment(*i))))
-            .collect();
-        keys.sort_by(|a, b| a.1.cmp(&b.1));
-
-        let mut got = Vec::new();
-        for (_, key) in &keys {
-            let (seg, _) = read_segment(&key[1..]).expect("index child segment"); // skip DATA
-            assert_eq!(segment_tag(seg), Some(TAG_INDEX), "index child not tagged");
-            assert_eq!(seg.len(), 9, "tag byte + 8 index bytes");
-            let idx = u64::from_be_bytes(seg[1..].try_into().expect("8 bytes"));
-            got.push(idx);
-        }
-        assert_eq!(got, vec![0u64, 1, 2, 10, 11, 100], "tag disturbed index order");
-
-        // A map key reveals its own tag: one scan, no schema, tells index from key.
-        let k = child_key(b"", &key_segment(b"username"));
-        let (seg, _) = read_segment(&k[1..]).expect("key child segment");
-        assert_eq!(segment_tag(seg), Some(TAG_KEY));
-        assert_eq!(&seg[1..], b"username");
     }
 }

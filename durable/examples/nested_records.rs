@@ -1,15 +1,8 @@
 //! Nested maps ending in a durable record: `Map<String, Map<String, User>>`.
 //!
 //! Run with: `cargo run -p durable --example nested_records`
-//!
-//! The record-layout twin of `nested_maps.rs`. `User` is a `#[derive(Durable)]`
-//! struct, so each field gets its own RocksDB key under
-//! `orgs/<org>/<username>/<field_id>`. Fields are typed paths: a single field can
-//! be read or blind-written without touching the others, but reading a whole
-//! user is one point get per field.
 
-use ciborium::Value;
-use durable::{query, Db, Describe, Durability, Durable, Leaf, Map, Nav, Query, Write};
+use durable::{Db, Durability, Durable, Leaf, Map, Path, Tx};
 
 #[derive(Durable)]
 #[allow(dead_code)]
@@ -22,89 +15,73 @@ struct User {
 #[derive(Durable)]
 #[allow(dead_code)]
 struct Directory {
-    /// org -> username -> user record
     orgs: Map<String, Map<String, User>>,
 }
 
-/// A record has no single value to `set`; writing one is a write per field.
-fn put_user(u: &durable::Path<User>, name: &str, admin: bool) -> Vec<Write> {
-    vec![
-        u.name().set(&name.to_string()),
-        u.email().set(&format!("{}@example.com", name.to_lowercase())),
-        u.admin().set(&admin),
-    ]
+fn put_user(tx: &mut Tx, u: &Path<User>, name: &str, admin: bool) -> durable::Result<()> {
+    u.name().set(tx, &name.to_string())?;
+    u.email()
+        .set(tx, &format!("{}@example.com", name.to_lowercase()))?;
+    u.admin().set(tx, &admin)?;
+    Ok(())
 }
 
 fn main() -> durable::Result<()> {
     let dir = tempfile::tempdir().unwrap();
     let db = Db::open(dir.path())?;
-
     let orgs = Directory::root().orgs();
-    let member = |org: &str, user: &str| orgs.key(&org.to_string()).key(&user.to_string());
 
-    let mut writes = Vec::new();
-    for (org, user, name, admin) in [
-        ("acme", "alice", "Alice", true),
-        ("acme", "bob", "Bob", false),
-        ("globex", "carol", "Carol", true),
-        ("globex", "dave", "Dave", false),
-        ("initech", "erin", "Erin", false),
-    ] {
-        writes.extend(put_user(&member(org, user), name, admin));
-    }
-    db.apply(&writes, Durability::SyncWal)?;
+    db.txn(Durability::SyncWal, |tx| {
+        for (org, user, name, admin) in [
+            ("acme", "alice", "Alice", true),
+            ("acme", "bob", "Bob", false),
+            ("globex", "carol", "Carol", true),
+            ("globex", "dave", "Dave", false),
+            ("initech", "erin", "Erin", false),
+        ] {
+            put_user(tx, &orgs.key(org).key(user), name, admin)?;
+        }
+        Ok(())
+    })?;
 
-    // Field-level point read: one key, no decode of the rest of the user.
-    println!("acme/alice email = {:?}", member("acme", "alice").email().get(&db)?);
+    let r = db.read()?;
+    println!(
+        "acme/alice email = {:?}",
+        orgs.key("acme").key("alice").email().get(&r)?
+    );
 
-    // Both map levels now hold non-leaf values, so both offer `keys`/`entries`
-    // (no `iter`); each user is reassembled from its field paths.
-    println!("\norgs: {:?}", orgs.keys(&db)?);
-    for (org, members) in orgs.entries(&db)? {
+    println!("\norgs: {:?}", orgs.keys(&r)?);
+    for (org, members) in orgs.entries(&r)? {
         println!("  {org}:");
-        for (username, u) in members.entries(&db)? {
+        for (username, u) in members.entries(&r)? {
             println!(
                 "    {username:<6} {:<20} admin={}",
-                u.email().get(&db)?.unwrap_or_default(),
-                u.admin().get(&db)?.unwrap_or_default(),
+                u.email().get(&r)?.unwrap_or_default(),
+                u.admin().get(&r)?.unwrap_or_default(),
             );
         }
     }
 
-    // Blind single-field write: no read, the other fields are untouched.
-    db.run(member("globex", "dave").admin().set(&true), Durability::SyncWal)?;
-    println!("\nglobex/dave admin after blind set: {:?}", member("globex", "dave").admin().get(&db)?);
-
-    // Derived records have no `clear`, so deleting a user means deleting each
-    // field. A whole org is still one range delete.
-    let bob = member("acme", "bob");
-    db.apply(
-        &[
-            bob.name().delete(),
-            bob.email().delete(),
-            bob.admin().delete(),
-            orgs.key(&"initech".to_string()).clear(),
-        ],
-        Durability::SyncWal,
-    )?;
-    println!("after removing acme/bob and clearing initech: {:?}", orgs.keys(&db)?);
-
-    // In the query engine, `email` is now a storage step (a PointGet), not a
-    // leaf-interior step. `subtree` reassembles the record in one prefix scan.
-    let shape = Directory::shape();
-    let carol = vec![
-        Nav::Field("orgs".into()),
-        Nav::Key(Value::Text("globex".into())),
-        Nav::Key(Value::Text("carol".into())),
-    ];
-    let mut email = carol.clone();
-    email.push(Nav::Field("email".into()));
-    println!("\nquery plan for orgs[globex][carol].email:");
-    for step in query::explain(&shape, &Query::new(email.clone()))?.steps {
-        println!("  {step}");
-    }
-    println!("result: {:?}", query::one(&db, &shape, &Query::new(email))?);
-    println!("subtree orgs[globex][carol]: {:?}", query::subtree(&db, &shape, &Query::new(carol))?);
+    // Single-field write, typed record deletion (`remove`), and org clear in one txn.
+    db.txn(Durability::SyncWal, |tx| {
+        orgs.key("globex").key("dave").admin().set(tx, &true)?;
+        orgs.key("acme").remove(tx, "bob")?;
+        orgs.remove(tx, "initech")?;
+        Ok(())
+    })?;
+    let r2 = db.read()?;
+    println!(
+        "\nglobex/dave admin: {:?}",
+        orgs.key("globex").key("dave").admin().get(&r2)?
+    );
+    println!(
+        "after removing acme/bob and initech, orgs: {:?}",
+        orgs.keys(&r2)?
+    );
+    println!(
+        "acme contains bob? {}",
+        orgs.key("acme").contains(&r2, "bob")?
+    );
 
     Ok(())
 }

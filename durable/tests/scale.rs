@@ -76,7 +76,7 @@ fn bounded_rewrite(n: u64, label: &str) -> (u64, u64, f64) {
     let src = dir.join("big.jsonl");
     let tape_bytes = write_big_tape(&src, n);
     let dst = dir.join("out.jsonl");
-    let reset = {
+    let _reset = {
         #[cfg(target_os = "linux")]
         {
             reset_peak()
@@ -88,7 +88,7 @@ fn bounded_rewrite(n: u64, label: &str) -> (u64, u64, f64) {
     };
     let start = Instant::now();
     let report =
-        rewrite::<Int, Int>(&src, &dst, schema(), reduce_int, Mode::SameSeq, keep_all).unwrap();
+        rewrite::<Totals, Int, Int>(&src, &dst, reduce_int, Mode::SameSeq, keep_all).unwrap();
     let secs = start.elapsed().as_secs_f64();
     assert_eq!(report.written, n);
     let _ = census::verify(&dst).unwrap();
@@ -120,7 +120,7 @@ fn twenty_thousand_records_rewrite_without_holding_the_tape() {
     };
     let dst = dir.join("out.jsonl");
     let report =
-        rewrite::<Int, Int>(&src, &dst, schema(), reduce_int, Mode::SameSeq, keep_all).unwrap();
+        rewrite::<Totals, Int, Int>(&src, &dst, reduce_int, Mode::SameSeq, keep_all).unwrap();
     assert_eq!(report.written, 20_000);
     assert_eq!(report.dst_bytes, tape_bytes);
     #[cfg(target_os = "linux")]

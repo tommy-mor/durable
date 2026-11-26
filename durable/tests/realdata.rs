@@ -66,10 +66,9 @@ fn prod_shaped_tapes_census_verify_and_identity_rewrite() {
 
         // identity rewrite: byte-identical, and the same projection digest
         let dst = work.join(format!("{name}.rewritten.jsonl"));
-        let report = rewrite::<serde_json::Value, serde_json::Value>(
+        let report = rewrite::<Totals, serde_json::Value, serde_json::Value>(
             &src,
             &dst,
-            schema(),
             reduce_value,
             Mode::SameSeq,
             keep,
@@ -83,25 +82,27 @@ fn prod_shaped_tapes_census_verify_and_identity_rewrite() {
             "{name}: identity rewrite must be byte-identical"
         );
         assert_eq!(read_bytes(&src), before, "{name}: source untouched");
-        let d_src =
-            digest_pairs(&fold_dump::<serde_json::Value>(&src, schema(), reduce_value).unwrap());
-        let d_dst =
-            digest_pairs(&fold_dump::<serde_json::Value>(&dst, schema(), reduce_value).unwrap());
+        let d_src = digest_pairs(
+            &fold_dump::<Totals, serde_json::Value>(&src, reduce_value).unwrap(),
+        );
+        let d_dst = digest_pairs(
+            &fold_dump::<Totals, serde_json::Value>(&dst, reduce_value).unwrap(),
+        );
         assert_eq!(d_src, d_dst, "{name}: fold digests must match");
 
         // The live runtime on a copy agrees with the offline fold.
         let proj = work.join(format!("{name}-proj"));
-        let rt = Runtime::open(&proj, &dst, schema(), None, reduce_value).unwrap();
+        let rt = Runtime::open::<Totals>(&proj, &dst, reduce_value).unwrap();
         rt.verify().unwrap();
         let live = rt.dump().unwrap();
-        let folded = fold_dump::<serde_json::Value>(&dst, schema(), reduce_value).unwrap();
+        let folded = fold_dump::<Totals, serde_json::Value>(&dst, reduce_value).unwrap();
         assert_eq!(
             live.into_iter()
-                .filter(|(k, _)| durable::testing::app_keys_only(k))
+                .filter(|(t, k, _)| durable::testing::app_keys_only(t, k))
                 .collect::<Vec<_>>(),
             folded
                 .into_iter()
-                .filter(|(k, _)| durable::testing::app_keys_only(k))
+                .filter(|(t, k, _)| durable::testing::app_keys_only(t, k))
                 .collect::<Vec<_>>(),
         );
         println!(

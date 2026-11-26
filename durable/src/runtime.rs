@@ -1,26 +1,25 @@
-//! Event-sourced application-state runtime.
-//!
-//! The log is the source of truth. The RocksDB projection is rebuildable.
-//! Python (or any other client) may append a recognized event and issue a
-//! serializable query. It cannot write the projection directly.
-//!
-//! Ingest is owned by this process. Callers supply an event body; the runtime
-//! stamps a sequence number and a monotonic timestamp onto a [`Record`] before
-//! the line hits the tape. Replay uses those stamped fields, never the clock.
+//! Event-sourced application-state runtime: self-sealing JSONL tape + typed
+//! `redb` projection.
 //!
 //! ```text
-//! append(Event) → Record{seq, ts_ms, event} → log (fsync) → reducer(&mut Tx) → projection + offset
-//! query(Path)   → query engine → Value
-//! rebuild()     → destroy projection → reducer(event 0..n)
-//! verify()      → incremental == replay from zero
+//! WRITE:  Event(s) → reduce into redb WriteTx (validated, uncommitted)
+//!                  → render + fsync sealed JSONL tape
+//!                  → commit WriteTx atomically (+ applied offset + idempotency key)
+//!                  → notify typed watch subscribers
+//! READ:   rt.read()? → MVCC ReadTx snapshot → Path::get / range / prefix / page / len
 //! ```
 //!
-//! Writes take an internal mutex. Queries read RocksDB without it, so an
-//! fsync does not block `one` / `select`. [`Runtime::append_batch`] fsyncs
-//! once per batch (group commit).
+//! - A reducer rejection (`Err`) aborts the `WriteTx` **before** anything hits
+//!   the tape — poison events never land on the tape.
+//! - Multi-event batches (`append_batch`) run in one `WriteTx` with full
+//!   read-your-writes across events and become visible to readers atomically.
+//! - All tape scanning and catch-up stream line-by-line (O(1) RAM) and seek
+//!   from `applied_byte_offset` (O(delta) catch-up).
+//! - Replay commits in chunks of [`REPLAY_CHUNK_SIZE`] events per `redb`
+//!   transaction for fast rebuilds.
 
-use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Seek, SeekFrom, Write as IoWrite};
+use std::fs::{self, File, OpenOptions as FsOpenOptions};
+use std::io::{BufRead, BufReader, Read as IoRead, Seek, SeekFrom, Write as IoWrite};
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -29,35 +28,28 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 
-use crate::dynpath;
-use crate::query::{self, Nav, Plan, Query};
-use crate::shape::field_segment;
-use crate::{
-    codec, Batch, Db, Describe, Durability, Error, Leaf, Path as DPath, Result, Shape, Write,
-};
-use ciborium::Value;
+use crate::projection::{read_stamp, reset, OnMismatch, OpenOptions, ProjectionId, ProjectionStamp};
+use crate::store::{Db, Read, ReadTx, Tx, BOOKKEEPING_TABLE};
+use crate::watch::WatchRange;
+use crate::{Durability, Error, Result, Schema};
 
-pub(crate) const META_NS: &str = "__durable";
+pub(crate) const KEY_APPLIED: &[u8] = b"applied";
+pub(crate) const KEY_APPLIED_OFFSET: &[u8] = b"applied_byte_offset";
+pub(crate) const KEY_IDS_PREFIX: &[u8] = b"ids/";
+
+/// Number of events folded per `redb` write transaction during `catch_up` / `rebuild`.
+const REPLAY_CHUNK_SIZE: usize = 4096;
 
 /// Authoritative ingest metadata. Assigned by [`Runtime`] at append time.
-///
-/// `seq` is the 0-based index on the tape. `ts_ms` is a monotonic millisecond
-/// timestamp (wall clock, but never steps backwards within this process).
-/// A reducer that needs an id or a time reads this — it does not trust the
-/// event body to have minted either.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Meta {
     pub seq: u64,
     pub ts_ms: u64,
 }
 
 /// One fsynced log line: ingest metadata plus the event body.
-///
-/// The body is nested (not flattened) so an event field named `seq` or
-/// `ts_ms` cannot collide with the envelope. `from`/`to` name this record's
-/// batch (a lone append has `from == seq == to`); `crc` seals the line so a
-/// torn tail reads as uncommitted by rule, never by judgment.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Record<E> {
     pub seq: u64,
@@ -89,14 +81,19 @@ impl<'de, E: DeserializeOwned> Deserialize<'de> for Record<E> {
         struct Helper<E> {
             seq: u64,
             ts_ms: u64,
-            // No legacy fallback: an unsealed record has no from/to/crc and
-            // must not deserialize as if it were sealed.
             from: u64,
             to: u64,
+            #[serde(default)]
+            id: Option<String>,
+            #[serde(default)]
+            idh: Option<String>,
             event: E,
             crc: String,
         }
         let h = Helper::deserialize(d)?;
+        if h.id.is_some() != h.idh.is_some() {
+            return Err(serde::de::Error::custom("id and idh must appear together"));
+        }
         Ok(Record {
             seq: h.seq,
             ts_ms: h.ts_ms,
@@ -107,6 +104,7 @@ impl<'de, E: DeserializeOwned> Deserialize<'de> for Record<E> {
         })
     }
 }
+
 impl<E> Record<E> {
     pub fn meta(&self) -> Meta {
         Meta {
@@ -116,16 +114,40 @@ impl<E> Record<E> {
     }
 }
 
+/// Outcome of an idempotent append (`append_idempotent` / `append_batch_idempotent`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AppendOutcome<E> {
+    /// Newly appended and committed.
+    Committed(Vec<Record<E>>),
+    /// Previously committed with the same idempotency key and payload hash.
+    Duplicate(Vec<Record<E>>),
+}
+
+impl<E> AppendOutcome<E> {
+    pub fn records(&self) -> &[Record<E>] {
+        match self {
+            AppendOutcome::Committed(r) | AppendOutcome::Duplicate(r) => r,
+        }
+    }
+
+    pub fn into_records(self) -> Vec<Record<E>> {
+        match self {
+            AppendOutcome::Committed(r) | AppendOutcome::Duplicate(r) => r,
+        }
+    }
+
+    pub fn is_duplicate(&self) -> bool {
+        matches!(self, AppendOutcome::Duplicate(_))
+    }
+}
+
 /// CRC32C over line bytes as written, rendered as 8 lowercase hex digits.
-/// `crc32c` is Castagnoli, not the `crc32fast` IEEE already in the tree.
 pub fn seal_crc(prefix_bytes: &[u8]) -> String {
     format!("{:08x}", crc32c::crc32c(prefix_bytes))
 }
 
-/// Render one sealed tape line: compact JSON, `seq` first for
-/// `grep '^{"seq":…`, envelope then body, CRC suffix always exactly
-/// `,"crc":"xxxxxxxx"}` (18 bytes) so checking is slicing, never
-/// canonical-JSON. The only raw `\n` is added by the writer.
+/// Render one sealed tape line: compact JSON, `seq` first, CRC suffix always
+/// exactly `,"crc":"xxxxxxxx"}` (18 bytes).
 pub fn render_sealed<E: Serialize>(
     seq: u64,
     ts_ms: u64,
@@ -133,9 +155,34 @@ pub fn render_sealed<E: Serialize>(
     to: u64,
     event: &E,
 ) -> Result<String> {
+    render_sealed_with_id(seq, ts_ms, from, to, None, event)
+}
+
+/// Render one sealed tape line, optionally carrying an idempotency `(id, idh)`
+/// pair (only valid on the closing line `seq == to`).
+pub fn render_sealed_with_id<E: Serialize>(
+    seq: u64,
+    ts_ms: u64,
+    from: u64,
+    to: u64,
+    idempotency: Option<(&str, &str)>,
+    event: &E,
+) -> Result<String> {
     let body = serde_json::to_string(event).map_err(|e| Error::Serialize(e.to_string()))?;
-    let mut prefix =
-        format!("{{\"seq\":{seq},\"ts_ms\":{ts_ms},\"from\":{from},\"to\":{to},\"event\":{body}");
+    let mut prefix = match idempotency {
+        Some((id, idh)) => {
+            let id_json =
+                serde_json::to_string(id).map_err(|e| Error::Serialize(e.to_string()))?;
+            let idh_json =
+                serde_json::to_string(idh).map_err(|e| Error::Serialize(e.to_string()))?;
+            format!(
+                "{{\"seq\":{seq},\"ts_ms\":{ts_ms},\"from\":{from},\"to\":{to},\"id\":{id_json},\"idh\":{idh_json},\"event\":{body}"
+            )
+        }
+        None => {
+            format!("{{\"seq\":{seq},\"ts_ms\":{ts_ms},\"from\":{from},\"to\":{to},\"event\":{body}")
+        }
+    };
     let crc = seal_crc(prefix.as_bytes());
     prefix.push_str(",\"crc\":\"");
     prefix.push_str(&crc);
@@ -143,28 +190,45 @@ pub fn render_sealed<E: Serialize>(
     Ok(prefix)
 }
 
-/// A checked sealed line: envelope fields plus the raw event bytes, so the
-/// caller can decode `E` itself. Rejects overlong lines, bad CRC, and bad
-/// envelope shapes without ever hunting JSON fragments inside damage.
-#[derive(Debug, Clone, Copy)]
+/// Compute a 32-byte payload hash (rendered as 64 lowercase hex digits) over a
+/// batch of serialized event JSON bodies.
+fn batch_payload_hash(serialized_events: &[String]) -> String {
+    let mut h = Sha256::new();
+    h.update(b"durable.idh.v1\0");
+    h.update((serialized_events.len() as u64).to_be_bytes());
+    for body in serialized_events {
+        h.update((body.len() as u64).to_be_bytes());
+        h.update(body.as_bytes());
+    }
+    let digest = h.finalize();
+    let mut hex = String::with_capacity(64);
+    for b in digest {
+        use std::fmt::Write as _;
+        let _ = write!(&mut hex, "{b:02x}");
+    }
+    hex
+}
+
+/// A checked sealed line envelope.
+#[derive(Debug, Clone)]
 pub struct SealedEnvelope {
     pub seq: u64,
     pub ts_ms: u64,
     pub from: u64,
     pub to: u64,
+    pub id: Option<String>,
+    pub idh: Option<String>,
 }
 
-/// Maximum sealed line: 16 MiB per the spec; anything longer is not a
-/// candidate line, no matter how it parses.
+/// Maximum sealed line: 16 MiB.
 pub const MAX_SEALED_LINE: usize = 16 * 1024 * 1024;
 /// Largest batch the scan will call complete: bounds `to - from`.
 pub const MAX_SEALED_BATCH: u64 = 1024;
 /// CRC suffix length: `,"crc":"xxxxxxxx"}` is always exactly 18 bytes.
 pub const CRC_SUFFIX_LEN: usize = 18;
 
-/// What the scan found: the committed prefix ends at byte `end`, holds
-/// `len` records, and the highest ingest timestamp among them is `last_ts`.
-/// Everything past `end` is in-flight residue, never committed.
+/// Result of scanning a sealed tape: committed prefix ends at byte `end`,
+/// holds `len` records, with highest ingest timestamp `last_ts`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Committed {
     pub end: usize,
@@ -172,46 +236,26 @@ pub struct Committed {
     pub last_ts: u64,
 }
 
-/// Where the scan stopped believing: byte `offset` and why.
+/// Where the scan detected corruption: byte `offset` and reason.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Corruption {
     pub offset: usize,
     pub reason: String,
 }
 
-/// One pure function decides where the tape ends. Used by the writer at
-/// open, by in-process readers, by `verify` and by the CLI — nothing else
-/// may judge the bytes. A torn tail drops by rule (incomplete batch past
-/// the committed prefix); a valid line past it with a foreign `from`
-/// proves acknowledged bytes were damaged and is fatal.
+/// Pure commit-rule scanner over an in-memory byte slice.
 pub fn scan(bytes: &[u8]) -> std::result::Result<Committed, Corruption> {
     scan_reader(bytes)
 }
 
-/// Streaming form of [`scan`]: the same rules, one line of memory. Lines
-/// are read through a bounded reader, so an overlong or newline-free
-/// garbage run never grows the buffer past 16 MiB.
-///
-/// Classification of each physical line (see `classify`):
-///
-/// * a candidate line follows the batch rules;
-/// * a damaged line (bad CRC, bad suffix, overlong, batch-incoherent) ends
-///   the committed prefix, and the tail check decides whether it is
-///   in-flight residue or damage to acknowledged bytes;
-/// * a line whose CRC is VALID but whose envelope this build does not read
-///   (an unknown key, a missing or mistyped field) was written by a writer
-///   this build does not understand. A torn write can never produce a valid
-///   CRC, so this is never residue: it is fatal wherever it appears, and the
-///   file is left untouched. This is the strict-envelope rule.
+/// Streaming commit-rule scanner: O(1) memory (bounded by [`MAX_SEALED_LINE`]).
 pub fn scan_reader<R: BufRead>(mut reader: R) -> std::result::Result<Committed, Corruption> {
     let mut committed = Committed {
         end: 0,
         len: 0,
         last_ts: 0,
     };
-    // Outside: between batches. Inside: mid-batch, expecting `next`.
     let mut inside: Option<(u64, u64, u64)> = None;
-    // Set at the first damaged line; every later line is tail-checked.
     let mut bad: Option<(usize, String)> = None;
     let mut offset = 0usize;
     let mut buf = Vec::new();
@@ -225,12 +269,9 @@ pub fn scan_reader<R: BufRead>(mut reader: R) -> std::result::Result<Committed, 
         let start = offset;
         offset += read.consumed;
         if !read.terminated {
-            // Trailing bytes with no newline: a torn write. Never committed,
-            // never judged further (no later line can follow it).
             break;
         }
         let chunk: &[u8] = if read.overlong {
-            // Only ever "not a candidate": recorded as damage, never parsed.
             &[]
         } else {
             &buf[..buf.len() - 1]
@@ -244,11 +285,10 @@ pub fn scan_reader<R: BufRead>(mut reader: R) -> std::result::Result<Committed, 
             }
             continue;
         }
-        // Blank lines are skipped, legacy compatibility.
         if chunk.iter().all(|b| b.is_ascii_whitespace()) {
             continue;
         }
-        if let Some((_, _)) = bad {
+        if bad.is_some() {
             tail_check(chunk, start, committed.len, &bad)?;
             continue;
         }
@@ -264,7 +304,6 @@ pub fn scan_reader<R: BufRead>(mut reader: R) -> std::result::Result<Committed, 
                 tail_check(chunk, start, committed.len, &bad)?;
             }
             Classified::Candidate(env, _event) => {
-                // Batch coherence against the scan state.
                 let coherent = match inside {
                     None => {
                         if env.from == committed.len && env.seq == env.from {
@@ -312,15 +351,9 @@ pub fn scan_reader<R: BufRead>(mut reader: R) -> std::result::Result<Committed, 
             }
         }
     }
-    // Residue only: the committed prefix stands. (Any tail damage that
-    // proved acknowledged bytes were hit already returned Err above.)
     Ok(committed)
 }
 
-/// Tail rule for lines after the first damaged one. A candidate line with
-/// `from == committed.len` is in-flight residue; any other `from` proves a
-/// later batch was written, so the first bad line is damage to acknowledged
-/// data. Unsealed JSON and foreign envelopes are never residue.
 fn tail_check(
     chunk: &[u8],
     line_offset: usize,
@@ -347,11 +380,6 @@ fn tail_check(
         }),
         Classified::Damaged(_) => {
             if is_unsealed_json(chunk) {
-                // A complete line that is valid JSON but carries no crc
-                // suffix can't come from the sealed writer: a torn write
-                // never ends in `}\n`, and zero-filled pages are not valid
-                // JSON. It is someone else's history (an unmigrated tape, a
-                // hand edit), never residue. Refuse; never truncate it away.
                 return Err(Corruption {
                     offset: line_offset,
                     reason: "unsealed line: not written by the sealed writer \
@@ -364,10 +392,6 @@ fn tail_check(
     }
 }
 
-/// Valid JSON without the sealed `,"crc":"xxxxxxxx"}` suffix shape. A sealed
-/// line whose CRC no longer matches still has the suffix shape and stays
-/// ordinary damage; only lines the sealed writer could never have produced
-/// match here.
 fn is_unsealed_json(line: &[u8]) -> bool {
     let has_crc_suffix = line.len() >= CRC_SUFFIX_LEN
         && line[line.len() - CRC_SUFFIX_LEN..].starts_with(b",\"crc\":\"")
@@ -375,13 +399,9 @@ fn is_unsealed_json(line: &[u8]) -> bool {
     !has_crc_suffix && serde_json::from_slice::<serde::de::IgnoredAny>(line).is_ok()
 }
 
-/// One line, classified without ever searching inside damaged bytes.
 pub(crate) enum Classified<'a> {
-    /// Passes every candidate rule. Carries the envelope and the raw event.
     Candidate(SealedEnvelope, &'a [u8]),
-    /// Not a candidate, for a reason a torn or damaged write can produce.
     Damaged(String),
-    /// CRC-valid, but the envelope is not one this build reads.
     Foreign(String),
 }
 
@@ -406,8 +426,6 @@ pub(crate) fn classify(line: &[u8]) -> Classified<'_> {
     if got != seal_crc(prefix) {
         return Classified::Damaged("sealed crc mismatch".into());
     }
-    // The CRC is valid: the sealed writer wrote exactly these bytes. From
-    // here an unreadable envelope is not damage a torn write could make.
     let env: SealedEnvelopeWire = match serde_json::from_slice(line) {
         Ok(env) => env,
         Err(e) => {
@@ -416,6 +434,16 @@ pub(crate) fn classify(line: &[u8]) -> Classified<'_> {
             ))
         }
     };
+    if env.id.is_some() != env.idh.is_some() {
+        return Classified::Foreign(
+            "crc-valid sealed line with mismatched id/idh envelope fields".into(),
+        );
+    }
+    if env.id.is_some() && env.seq != env.to {
+        return Classified::Foreign(
+            "crc-valid sealed line carrying id/idh before batch closing line".into(),
+        );
+    }
     if env.from > env.to || env.seq < env.from || env.seq > env.to {
         return Classified::Damaged("sealed envelope seq outside batch".into());
     }
@@ -428,13 +456,14 @@ pub(crate) fn classify(line: &[u8]) -> Classified<'_> {
             ts_ms: env.ts_ms,
             from: env.from,
             to: env.to,
+            id: env.id,
+            idh: env.idh,
         },
         env.event.get().as_bytes(),
     )
 }
 
-/// Parse one sealed line into its envelope and raw event bytes. Strict:
-/// unknown envelope keys are refused (see [`scan_reader`]).
+/// Parse one sealed line into its envelope and raw event bytes.
 pub fn parse_sealed(line: &[u8]) -> Result<(SealedEnvelope, Vec<u8>)> {
     match classify(line) {
         Classified::Candidate(env, event) => Ok((env, event.to_vec())),
@@ -444,10 +473,6 @@ pub fn parse_sealed(line: &[u8]) -> Result<(SealedEnvelope, Vec<u8>)> {
     }
 }
 
-/// The sealed envelope as this build reads it. `crc` is declared (it is
-/// checked by slicing, not here) so that `deny_unknown_fields` refuses any
-/// other key. Adding an envelope key is a format change: a binary built
-/// before it must refuse the tape loudly, which this rule guarantees.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SealedEnvelopeWire<'a> {
@@ -455,22 +480,22 @@ struct SealedEnvelopeWire<'a> {
     ts_ms: u64,
     from: u64,
     to: u64,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    idh: Option<String>,
     #[serde(borrow)]
     event: &'a serde_json::value::RawValue,
     #[allow(dead_code)]
     crc: serde::de::IgnoredAny,
 }
 
-/// Result of one bounded line read.
 struct LineRead {
-    /// Bytes consumed from the reader, including the newline if present.
     consumed: usize,
     terminated: bool,
     overlong: bool,
 }
 
-/// Read one physical line into `buf` (newline included when present),
-/// refusing to hold more than the maximum line. Returns `None` at EOF.
 fn read_line_bounded<R: BufRead>(
     reader: &mut R,
     buf: &mut Vec<u8>,
@@ -512,23 +537,7 @@ fn read_line_bounded<R: BufRead>(
     }))
 }
 
-/// Fold one record into `db` exactly as the runtime does: the reducer's
-/// writes and the applied offset in one commit, with the log as truth.
-pub(crate) fn fold_one<E>(
-    db: &Db,
-    reducer: &impl Fn(&mut Tx, &E) -> Result<()>,
-    meta: Meta,
-    event: &E,
-) -> Result<()> {
-    let mut tx = Tx::new(db, meta);
-    reducer(&mut tx, event)?;
-    tx.write(applied_leaf().set(&(meta.seq + 1)));
-    tx.commit(Durability::DisableWal)?;
-    Ok(())
-}
-
-/// Render a sealed line whose event is already-valid JSON bytes, copied
-/// verbatim. Same envelope bytes as [`render_sealed`] for the same inputs.
+/// Render a sealed line whose event is already-valid JSON bytes, copied verbatim.
 pub(crate) fn render_sealed_raw(
     seq: u64,
     ts_ms: u64,
@@ -546,127 +555,109 @@ pub(crate) fn render_sealed_raw(
     prefix
 }
 
-/// A reducer transaction: reified writes plus committed-state reads.
-///
-/// Writes in this transaction are not visible to [`Tx::db`] until commit.
-/// Put the event's writes and the projection offset in the same batch so a
-/// crash before commit simply replays the event against the previous state.
-pub struct Tx {
-    batch: Batch,
+/// Fold one record into `db` in its own transaction (used by `equiv` / `rewrite`).
+pub(crate) fn fold_one<E>(
+    db: &Db,
+    reducer: &impl Fn(&mut Tx, &E) -> Result<()>,
     meta: Meta,
-    /// Every reified write recorded, kept alongside the batch so the
-    /// commit can report what it touched without re-reading anything.
-    writes: Vec<Write>,
+    event: &E,
+) -> Result<()> {
+    let mut tx = db.write_with(Durability::DisableWal)?;
+    tx.set_meta(meta);
+    reducer(&mut tx, event)?;
+    write_applied(&mut tx, meta.seq + 1, None)?;
+    tx.commit()?;
+    Ok(())
 }
 
-impl Tx {
-    pub(crate) fn new(db: &Db, meta: Meta) -> Self {
-        Self {
-            batch: db.batch(),
-            meta,
-            writes: Vec::new(),
+// ---------------------------------------------------------------------------
+// Bookkeeping helpers inside `__durable`
+// ---------------------------------------------------------------------------
+
+pub(crate) fn read_applied(r: &impl Read) -> Result<u64> {
+    match r.raw_get(BOOKKEEPING_TABLE, KEY_APPLIED)? {
+        Some(bytes) => {
+            if bytes.len() != 8 {
+                return Err(Error::Corruption("malformed applied offset".into()));
+            }
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(&bytes);
+            Ok(u64::from_le_bytes(buf))
         }
-    }
-
-    /// Sequence number and timestamp stamped at ingest (or recovered from the tape).
-    pub fn meta(&self) -> Meta {
-        self.meta
-    }
-
-    /// Log index of the event being reduced. Stable across replay: it is
-    /// the line number in the JSONL tape. Use this for server-assigned
-    /// ids — never take ids from the browser.
-    pub fn seq(&self) -> u64 {
-        self.meta.seq
-    }
-
-    /// Dynamic put: a path-as-data write against `schema`.
-    pub fn put(&mut self, schema: &Shape, navs: &[Nav], value: &Value) -> Result<()> {
-        self.extend(dynpath::put(schema, None, navs, value)?);
-        Ok(())
-    }
-
-    /// Dynamic delete / subtree delete.
-    pub fn delete(&mut self, schema: &Shape, navs: &[Nav]) -> Result<()> {
-        self.write(dynpath::delete(schema, None, navs)?);
-        Ok(())
-    }
-
-    /// Dynamic Sum add (blind merge).
-    pub fn add(&mut self, schema: &Shape, navs: &[Nav], delta: &Value) -> Result<()> {
-        self.write(dynpath::add(schema, None, navs, delta)?);
-        Ok(())
-    }
-
-    /// Dynamic list/deque append.
-    pub fn push(&mut self, schema: &Shape, navs: &[Nav], value: &Value) -> Result<()> {
-        self.write(dynpath::push(schema, None, navs, value)?);
-        Ok(())
-    }
-
-    /// Dynamic collection clear.
-    pub fn clear(&mut self, schema: &Shape, navs: &[Nav]) -> Result<()> {
-        self.write(dynpath::clear(schema, None, navs)?);
-        Ok(())
-    }
-
-    /// Read committed state (not in-flight writes of this event) at `navs`.
-    pub fn peek(&self, schema: &Shape, navs: &[Nav]) -> Result<Value> {
-        dynpath::peek(self.db(), schema, None, navs)
-    }
-
-    /// Record a reified write. This is how a reducer mutates state.
-    pub fn write(&mut self, write: Write) {
-        self.batch.write(write.clone());
-        self.writes.push(write);
-    }
-
-    /// Record several reified writes.
-    pub fn extend<I: IntoIterator<Item = Write>>(&mut self, writes: I) {
-        for w in writes {
-            self.write(w);
-        }
-    }
-
-    /// Every write this transaction recorded — the commit's waking set.
-    pub fn writes(&self) -> &[Write] {
-        &self.writes
-    }
-
-    /// Committed projection, not including in-flight writes of this event.
-    pub fn db(&self) -> &Db {
-        self.batch.db()
-    }
-
-    pub(crate) fn commit(self, durability: Durability) -> Result<Vec<Write>> {
-        let writes = self.writes.clone();
-        self.batch.commit_with(durability)?;
-        Ok(writes)
+        None => Ok(0),
     }
 }
 
-/// Append-only JSONL event log. One object per line; the file is canonical.
-///
-/// Length is counted once at open and maintained by `JsonlLog::append_all`.
-/// This process is the writer; do not append to the same file from elsewhere
-/// and expect `len` to notice.
+pub(crate) fn read_applied_offset(r: &impl Read) -> Result<Option<u64>> {
+    match r.raw_get(BOOKKEEPING_TABLE, KEY_APPLIED_OFFSET)? {
+        Some(bytes) => {
+            if bytes.len() != 8 {
+                return Err(Error::Corruption("malformed applied_byte_offset".into()));
+            }
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(&bytes);
+            Ok(Some(u64::from_le_bytes(buf)))
+        }
+        None => Ok(None),
+    }
+}
+
+pub(crate) fn write_applied(tx: &mut Tx, applied: u64, byte_offset: Option<u64>) -> Result<()> {
+    tx.raw_put(BOOKKEEPING_TABLE, KEY_APPLIED, &applied.to_le_bytes())?;
+    if let Some(off) = byte_offset {
+        tx.raw_put(BOOKKEEPING_TABLE, KEY_APPLIED_OFFSET, &off.to_le_bytes())?;
+    }
+    Ok(())
+}
+
+fn idempotency_key(id: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(KEY_IDS_PREFIX.len() + id.len());
+    key.extend_from_slice(KEY_IDS_PREFIX);
+    key.extend_from_slice(id.as_bytes());
+    key
+}
+
+/// Stored idempotency entry: `(from, to, idh)`.
+#[derive(Serialize, Deserialize)]
+struct IdRecord {
+    from: u64,
+    to: u64,
+    idh: String,
+}
+
+fn read_idempotency(r: &impl Read, id: &str) -> Result<Option<IdRecord>> {
+    match r.raw_get(BOOKKEEPING_TABLE, &idempotency_key(id))? {
+        Some(bytes) => Ok(Some(crate::decode_value(&bytes)?)),
+        None => Ok(None),
+    }
+}
+
+fn write_idempotency(tx: &mut Tx, id: &str, from: u64, to: u64, idh: &str) -> Result<()> {
+    let rec = IdRecord {
+        from,
+        to,
+        idh: idh.to_string(),
+    };
+    let bytes = crate::encode_value(&rec)?;
+    tx.raw_put(BOOKKEEPING_TABLE, &idempotency_key(id), &bytes)
+}
+
+// ---------------------------------------------------------------------------
+// JsonlLog + TapeFile (fault-injection seam)
+// ---------------------------------------------------------------------------
+
+/// Append-only self-sealing JSONL event log.
 pub struct JsonlLog<E> {
     path: PathBuf,
     file: Box<dyn TapeFile>,
     len: u64,
-    /// Byte offset of the committed end. Everything past it on disk is
-    /// residue of a batch that never committed.
     end: u64,
-    /// Set when an I/O failure left the tape in a state this process can't
-    /// vouch for. Every later append refuses until the tape is reopened,
-    /// which re-derives the truth from the bytes.
     poisoned: bool,
     _event: PhantomData<E>,
 }
 
-/// Handle indirection for the tape file. Production wraps a real [`File`];
-/// tests wrap a failing double. The writer only touches the tape through
-/// this trait, so every outcome-table row is reachable without real ENOSPC.
+/// Handle indirection for the tape file (real [`File`] in production, failing
+/// double in tests).
 pub trait TapeFile: Send {
     fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()>;
     fn sync_data(&self) -> std::io::Result<()>;
@@ -689,56 +680,34 @@ impl TapeFile for File {
     }
 }
 
-/// A tape file that fails on command. Test double for the writer outcome
-/// table: the poison, rollback, and shrink-guard branches are otherwise
-/// unreachable without real ENOSPC or EIO. Only built with the
-/// `fault-injection` feature, which the crate's own tests turn on.
 #[cfg(feature = "fault-injection")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailMode {
-    /// Every write returns ENOSPC having landed nothing.
     WriteEnospc,
-    /// Every write lands its first `n` bytes, then returns ENOSPC: what a
-    /// full disk does mid-batch.
     WritePartialEnospc(usize),
-    /// Partial write as above AND truncate returns EPERM: the partial
-    /// bytes can't be rolled back.
     WritePartialEnospcAndTruncateEperm(usize),
-    /// Every sync returns EIO (Linux may mark pages clean).
     SyncEio,
-    /// The next sync returns EIO, later syncs succeed: batch sync fails
-    /// but rollback's sync lands — the NotCommitted-poisoned row.
     SyncEioOnce,
-    /// Truncate returns EPERM: rollback cannot be confirmed.
     TruncateEperm,
-    /// Sync returns EIO AND truncate returns EPERM: rollback
-    /// unconfirmable after a failed commit — the Unknown row.
     SyncEioAndTruncateEperm,
-    /// Length reports a shrunken file: acknowledged bytes vanished.
     ShrunkTo(u64),
 }
 
-/// Failing test double over an in-memory disk. Writes append to the disk,
-/// `set_len` really truncates it, and the test keeps a handle to the disk
-/// so it can scan exactly what a rollback left behind.
 #[cfg(feature = "fault-injection")]
 #[derive(Debug)]
 pub struct FailingFile {
-    disk: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    disk: Arc<Mutex<Vec<u8>>>,
     mode: Option<FailMode>,
     syncs_failed: std::cell::Cell<usize>,
 }
 
-/// Shared view of a [`FailingFile`]'s disk bytes.
 #[cfg(feature = "fault-injection")]
-pub type FakeDisk = std::sync::Arc<std::sync::Mutex<Vec<u8>>>;
+pub type FakeDisk = Arc<Mutex<Vec<u8>>>;
 
 #[cfg(feature = "fault-injection")]
 impl FailingFile {
-    /// A double whose disk starts as `bytes`. Returns the double and a
-    /// handle to its disk.
     pub fn over(bytes: Vec<u8>, mode: Option<FailMode>) -> (Self, FakeDisk) {
-        let disk = std::sync::Arc::new(std::sync::Mutex::new(bytes));
+        let disk = Arc::new(Mutex::new(bytes));
         (
             Self {
                 disk: disk.clone(),
@@ -809,7 +778,7 @@ impl<E> JsonlLog<E> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|e| Error::Log(e.to_string()))?;
         }
-        let mut file = OpenOptions::new()
+        let mut file = FsOpenOptions::new()
             .create(true)
             .read(true)
             .append(true)
@@ -830,12 +799,6 @@ impl<E> JsonlLog<E> {
         })
     }
 
-    /// Seal-gated open for sealed tapes: scan read-only, truncate
-    /// in-flight residue, sync unconditionally, then count. Truncation here
-    /// is not a repair — it removes only bytes the format says were never
-    /// committed, is idempotent across interrupted opens, and is required
-    /// so the next O_APPEND batch never lands behind dead bytes.
-    /// Returns the log plus what the scan found.
     pub fn open_sealed(path: impl AsRef<Path>) -> Result<(Self, Committed)> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
@@ -852,9 +815,6 @@ impl<E> JsonlLog<E> {
                 },
             ));
         }
-        // Spec order: scan read-only FIRST, cross-check (by the caller)
-        // against the projection, and only then seal. Truncating before
-        // the check would destroy the evidence disagreement needs.
         let found = Self::scan_file(&path)?;
         Self::seal_to(&path, &found)?;
         let mut log = Self::open(&path)?;
@@ -863,25 +823,18 @@ impl<E> JsonlLog<E> {
         Ok((log, found))
     }
 
-    /// Read-only scan of the tape file: no mutation, file untouched on
-    /// both committed and corrupt outcomes. The cross-check reads this
-    /// before anything is sealed.
+    /// Streaming read-only scan of the tape file (O(1) memory, file untouched).
     pub fn scan_file(path: &Path) -> Result<Committed> {
-        let bytes = fs::read(path).map_err(|e| Error::Log(e.to_string()))?;
-        scan(&bytes).map_err(|c| {
+        let file = File::open(path).map_err(|e| Error::Log(e.to_string()))?;
+        let reader = BufReader::new(file);
+        scan_reader(reader).map_err(|c| {
             Error::Corruption(format!("tape corrupt at byte {}: {}", c.offset, c.reason))
         })
     }
-    /// Seal the tape to the scanned committed end: truncate in-flight
-    /// residue, then sync unconditionally. Truncation is not a repair —
-    /// it removes only bytes the format says were never committed, is
-    /// idempotent across interrupted opens, and keeps the next O_APPEND
-    /// batch from landing behind dead bytes.
-    /// There is no legacy path: an unsealed line makes the scan refuse, so
-    /// it never reaches here. Old tapes migrate through an offline
-    /// migration script, never through the writer.
+
+    /// Truncate uncommitted tail residue past `found.end`, then sync unconditionally.
     pub fn seal_to(path: &Path, found: &Committed) -> Result<()> {
-        let f = OpenOptions::new()
+        let f = FsOpenOptions::new()
             .write(true)
             .open(path)
             .map_err(|e| Error::Log(e.to_string()))?;
@@ -895,10 +848,6 @@ impl<E> JsonlLog<E> {
                 found.len
             );
         }
-        // Unconditional: a restarted process may be reading a complete batch
-        // a crashed writer left in the page cache, never confirmed durable.
-        // Nothing past this point may treat the prefix as committed until
-        // this sync succeeds.
         f.sync_data().map_err(|e| Error::Log(e.to_string()))?;
         Ok(())
     }
@@ -911,16 +860,14 @@ impl<E> JsonlLog<E> {
         Ok(self.len)
     }
 
-    /// Whether an I/O failure poisoned this writer. A poisoned writer
-    /// refuses every append until the tape is reopened, which re-derives
-    /// the truth from the bytes. Test hook for the outcome table.
+    pub fn committed_end(&self) -> u64 {
+        self.end
+    }
+
     pub fn is_poisoned(&self) -> bool {
         self.poisoned
     }
 
-    /// Swap the live file handle for a failing test double. The writer
-    /// keeps its committed end, so the double's disk should start as the
-    /// real tape's bytes. Test seam only (`fault-injection` feature).
     #[cfg(feature = "fault-injection")]
     pub fn inject_failing_file(&mut self, fail: FailingFile) {
         self.file = Box::new(fail);
@@ -929,11 +876,7 @@ impl<E> JsonlLog<E> {
     pub fn is_empty(&self) -> Result<bool> {
         Ok(self.len == 0)
     }
-}
 
-impl<E> JsonlLog<E> {
-    /// Cut the file back to the committed end and sync. If either step
-    /// fails the writer can no longer vouch for the file: poison it.
     fn rollback(&mut self) -> Result<()> {
         let res = self
             .file
@@ -947,34 +890,17 @@ impl<E> JsonlLog<E> {
         }
         Ok(())
     }
-}
 
-impl<E: Serialize + DeserializeOwned> JsonlLog<Record<E>> {
-    /// Append sealed records as consecutive lines and fsync once. Returns
-    /// the index of the first record (equal to `len` before the call).
-    /// Empty input is a no-op and does not fsync.
-    pub fn append_all(&mut self, events: &[Record<E>]) -> Result<u64> {
+    fn append_raw_batch(&mut self, batch_bytes: &[u8], count: u64) -> Result<u64> {
         let start = self.len;
-        if events.is_empty() {
+        if count == 0 {
             return Ok(start);
-        }
-        // Render the whole batch first, sealing every line's CRC fresh, so a
-        // serialization failure never drools half a thrust onto the tape.
-        let mut batch = String::with_capacity(events.len() * 256);
-        for rec in events {
-            let line = render_sealed(rec.seq, rec.ts_ms, rec.from, rec.to, &rec.event)?;
-            batch.push_str(&line);
-            batch.push('\n');
         }
         if self.poisoned {
             return Err(Error::Log(
                 "tape writer poisoned by an earlier I/O failure; reopen the tape".into(),
             ));
         }
-        // O(1) guard, no rescan: this process owns the committed end. Bytes
-        // past it are residue of a batch that never committed; cut them so
-        // the next batch never lands behind dead bytes. A file shorter than
-        // the committed end means acknowledged bytes vanished under us.
         let on_disk = self
             .file
             .file_len()
@@ -989,17 +915,11 @@ impl<E: Serialize + DeserializeOwned> JsonlLog<Record<E>> {
         if on_disk > self.end {
             self.rollback()?;
         }
-        if let Err(e) = self.file.write_all(batch.as_bytes()) {
-            // The closing line's newline can't have landed, so the scan
-            // drops this batch regardless; rolling back keeps O_APPEND clean.
+        if let Err(e) = self.file.write_all(batch_bytes) {
             self.rollback()?;
             return Err(Error::Log(format!("not committed: {e}")));
         }
-        // Content durability. Metadata (mtime) is not the tape.
         if let Err(e) = self.file.sync_data() {
-            // The bytes may still reach disk as a closed batch, and Linux
-            // may already have marked the dirty pages clean: never retry the
-            // fsync and trust it. Roll back, and stop writing either way.
             let rolled = self.rollback().is_ok();
             self.poisoned = true;
             return Err(Error::Log(if rolled {
@@ -1008,52 +928,111 @@ impl<E: Serialize + DeserializeOwned> JsonlLog<Record<E>> {
                 format!("commit outcome unknown (writer poisoned): {e}")
             }));
         }
-        self.end += batch.len() as u64;
-        self.len += events.len() as u64;
+        self.end += batch_bytes.len() as u64;
+        self.len += count;
         Ok(start)
     }
+}
 
-    /// Sealed records from `start` (inclusive) to the end, with their tape
-    /// indices. Every line is checked through `parse_sealed`; a torn tail
-    /// is the scan's business, never this reader's — here a bad line is a
-    /// hard error, because readers only walk the committed prefix.
-    pub fn read_from(&self, start: u64) -> Result<Vec<(u64, Record<E>)>> {
-        if !self.path.exists() {
-            return Ok(Vec::new());
+impl<E: Serialize + DeserializeOwned> JsonlLog<Record<E>> {
+    /// Append sealed records as consecutive lines and fsync once.
+    pub fn append_all(&mut self, events: &[Record<E>]) -> Result<u64> {
+        self.append_all_with_id(events, None)
+    }
+
+    fn append_all_with_id(
+        &mut self,
+        events: &[Record<E>],
+        idempotency: Option<(&str, &str)>,
+    ) -> Result<u64> {
+        if events.is_empty() {
+            return Ok(self.len);
         }
-        let bytes = fs::read(&self.path).map_err(|e| Error::Log(e.to_string()))?;
-        let mut out = Vec::new();
-        let mut idx = 0u64;
-        for chunk in bytes.split(|b| *b == b'\n') {
-            if chunk.is_empty() {
-                continue;
+        let mut batch = String::with_capacity(events.len() * 256);
+        let last = events.len() - 1;
+        for (i, rec) in events.iter().enumerate() {
+            let id_pair = if i == last { idempotency } else { None };
+            let line =
+                render_sealed_with_id(rec.seq, rec.ts_ms, rec.from, rec.to, id_pair, &rec.event)?;
+            batch.push_str(&line);
+            batch.push('\n');
+        }
+        self.append_raw_batch(batch.as_bytes(), events.len() as u64)
+    }
+
+    /// Stream committed records from `start_seq`, optionally seeking directly
+    /// to `start_offset` (when known to align with `start_seq`). Passes
+    /// `(record, env_id_pair, end_byte_offset_after_line)` to `f`.
+    pub(crate) fn for_each_from(
+        &self,
+        start_seq: u64,
+        start_offset: Option<u64>,
+        mut f: impl FnMut(Record<E>, Option<(String, String)>, u64) -> Result<()>,
+    ) -> Result<()> {
+        if !self.path.exists() || self.end == 0 {
+            return Ok(());
+        }
+        let mut file = File::open(&self.path).map_err(|e| Error::Log(e.to_string()))?;
+        let seek_to = match start_offset {
+            Some(off) if off <= self.end => off,
+            _ => 0,
+        };
+        if seek_to > 0 {
+            file.seek(SeekFrom::Start(seek_to))
+                .map_err(|e| Error::Log(e.to_string()))?;
+        }
+        let mut reader = BufReader::new(file.take(self.end - seek_to));
+        let mut offset = seek_to;
+        let mut buf = Vec::new();
+        loop {
+            buf.clear();
+            let read = read_line_bounded(&mut reader, &mut buf)
+                .map_err(|e| Error::Log(e.to_string()))?;
+            let Some(read) = read else { break };
+            offset += read.consumed as u64;
+            if !read.terminated || read.overlong {
+                return Err(Error::Deserialize("unexpected torn or overlong line in committed prefix".into()));
             }
-            // Skip whitespace-only legacy padding without paying parse.
-            if chunk.iter().all(|b| b.is_ascii_whitespace()) {
+            let chunk = &buf[..buf.len() - 1];
+            if chunk.is_empty() || chunk.iter().all(|b| b.is_ascii_whitespace()) {
                 continue;
             }
             let (env, event_bytes) = parse_sealed(chunk)?;
-            if idx >= start {
-                let event: E = serde_json::from_slice(&event_bytes)
-                    .map_err(|e| Error::Deserialize(e.to_string()))?;
-                let crc = String::from_utf8_lossy(
-                    &chunk[chunk.len() - CRC_SUFFIX_LEN + 8..chunk.len() - 2],
-                )
-                .into_owned();
-                out.push((
-                    idx,
-                    Record {
-                        seq: env.seq,
-                        ts_ms: env.ts_ms,
-                        from: env.from,
-                        to: env.to,
-                        event,
-                        crc,
-                    },
-                ));
+            if env.seq < start_seq {
+                continue;
             }
-            idx += 1;
+            let event: E = serde_json::from_slice(&event_bytes)
+                .map_err(|e| Error::Deserialize(e.to_string()))?;
+            let crc = String::from_utf8_lossy(
+                &chunk[chunk.len() - CRC_SUFFIX_LEN + 8..chunk.len() - 2],
+            )
+            .into_owned();
+            let id_pair = match (env.id, env.idh) {
+                (Some(id), Some(idh)) => Some((id, idh)),
+                _ => None,
+            };
+            let rec = Record {
+                seq: env.seq,
+                ts_ms: env.ts_ms,
+                from: env.from,
+                to: env.to,
+                event,
+                crc,
+            };
+            f(rec, id_pair, offset)?;
         }
+        Ok(())
+    }
+
+    /// Read committed records from `start` (inclusive) to the end, streaming
+    /// from disk.
+    pub fn read_from(&self, start: u64) -> Result<Vec<(u64, Record<E>)>> {
+        let mut out = Vec::new();
+        self.for_each_from(start, None, |rec, _, _| {
+            let seq = rec.seq;
+            out.push((seq, rec));
+            Ok(())
+        })?;
         Ok(out)
     }
 
@@ -1062,127 +1041,137 @@ impl<E: Serialize + DeserializeOwned> JsonlLog<Record<E>> {
     }
 }
 
-pub(crate) fn applied_leaf() -> DPath<Leaf<u64>> {
-    let mut prefix = Vec::new();
-    codec::put_segment(&mut prefix, META_NS.as_bytes());
-    DPath::from_prefix(codec::child_key(&prefix, &field_segment(0)))
+// ---------------------------------------------------------------------------
+// Free-space floor check (Unix statvfs)
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+fn check_free_space(path: &Path, min_free_bytes: u64, needed: u64) -> Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let target = if path.exists() {
+        path
+    } else {
+        path.parent().unwrap_or(Path::new("."))
+    };
+    let c_path =
+        CString::new(target.as_os_str().as_bytes()).map_err(|e| Error::Log(e.to_string()))?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) };
+    if rc != 0 {
+        return Err(Error::Log(format!(
+            "statvfs failed: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    let avail = (stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64);
+    if avail < min_free_bytes.saturating_add(needed) {
+        return Err(Error::NoSpace {
+            available: avail,
+            required: min_free_bytes.saturating_add(needed),
+        });
+    }
+    Ok(())
 }
+
+#[cfg(not(unix))]
+fn check_free_space(_path: &Path, _min_free_bytes: u64, _needed: u64) -> Result<()> {
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Runtime<E>
+// ---------------------------------------------------------------------------
 
 struct Inner<E> {
     log: JsonlLog<Record<E>>,
     applied: u64,
+    applied_offset: Option<u64>,
     last_ts_ms: u64,
+    /// Set if a replay-time reducer error occurs on an already-committed tape
+    /// event. Refuses all appends until reopened with a fixed reducer.
+    halted: Option<(u64, String)>,
 }
 
-/// Event-sourced runtime: canonical log + reducer + rebuildable projection.
-///
-/// `append` / `append_batch` serialize writers through an internal mutex.
-/// Query methods (`one`, `select`, …) only touch the RocksDB handle, which
-/// is safe to share with an in-flight fsync.
+/// Event-sourced runtime: self-sealing JSONL tape + typed `redb` projection.
 pub struct Runtime<E> {
     inner: Mutex<Inner<E>>,
     applied: AtomicU64,
     pub(crate) db: Db,
-    schema: Shape,
-    namespace: Option<String>,
-    reducer: Arc<dyn Fn(&mut Tx, &E) -> Result<()> + Send + Sync>,
-    /// Fired after every committed event with the seq and the writes it
-    /// touched. The courier hangs her waking loop here — single-threaded
-    /// runtimes call it inline on the committing thread.
-    on_commit: Mutex<Option<Arc<dyn Fn(u64, &[Write]) + Send + Sync>>>,
-    /// Writes of the most recent committed event. Stashed under the ingest
-    /// lock; the store binding pulls them right after `append` returns to
-    /// wake parked waiters — same thread, no race.
-    last_writes: Mutex<Vec<Write>>,
-    /// The projection identity this runtime was opened with.
-    pub(crate) identity: Option<crate::projection::ProjectionStamp>,
-    /// Exclusive writer lock on the tape (open_with only); released on drop.
+    reducer: crate::projection::Reducer<E>,
+    min_free_bytes: Option<u64>,
+    on_commit: Mutex<Option<Arc<dyn Fn(u64, &[WatchRange]) + Send + Sync>>>,
+    last_touched: Mutex<Vec<WatchRange>>,
+    pub(crate) identity: Option<ProjectionStamp>,
     #[allow(dead_code)]
-    tape_lock: Option<std::fs::File>,
+    tape_lock: Option<File>,
 }
 
 impl<E: Serialize + DeserializeOwned + 'static> Runtime<E> {
-    /// Open (or create) a runtime and catch the projection up to the log.
-    ///
-    /// Legacy entry point, kept byte-for-byte in behaviour: no tape lock and
-    /// no projection identity check. Any identity stamp already in the
-    /// projection must carry reducer id 0 (what `open` implies), whatever its
-    /// shape hash; otherwise the open is refused with
-    /// [`Error::ProjectionMismatch`] before anything is written. New code
-    /// should use [`Runtime::open_with`].
-    pub fn open(
+    /// Open (or create) a runtime with [`ProjectionId::new(0)`], exclusive
+    /// tape locking, schema fingerprinting, and automatic rebuild on schema change.
+    pub fn open<S: Schema>(
         db_path: impl AsRef<Path>,
         log_path: impl AsRef<Path>,
-        schema: Shape,
-        namespace: Option<String>,
+        reducer: impl Fn(&mut Tx, &E) -> Result<()> + Send + Sync + 'static,
+    ) -> Result<Self> {
+        Self::open_with(
+            db_path,
+            log_path,
+            OpenOptions::new::<S>(ProjectionId::new(0), reducer),
+        )
+    }
+
+    /// Open with explicit [`OpenOptions`] (custom [`ProjectionId`],
+    /// [`OnMismatch`], and optional free-space floor).
+    pub fn open_with(
+        db_path: impl AsRef<Path>,
+        log_path: impl AsRef<Path>,
+        options: OpenOptions<E>,
+    ) -> Result<Self> {
+        Self::open_impl(db_path.as_ref(), log_path.as_ref(), options, true)
+    }
+
+    /// Open without locking the tape or checking/stamping projection identity.
+    /// Useful only for read-only replays or legacy migration tooling.
+    pub fn open_unmanaged(
+        db_path: impl AsRef<Path>,
+        log_path: impl AsRef<Path>,
         reducer: impl Fn(&mut Tx, &E) -> Result<()> + Send + Sync + 'static,
     ) -> Result<Self> {
         Self::open_impl(
             db_path.as_ref(),
             log_path.as_ref(),
-            schema,
-            namespace,
-            Arc::new(reducer),
-            None,
-        )
-    }
-
-    /// Open with a projection identity (see [`crate::ProjectionId`]).
-    ///
-    /// Takes an exclusive advisory lock on the tape for the lifetime of the
-    /// returned runtime; a second `open_with` on the same tape fails with
-    /// [`Error::Log`] instead of racing the writer. The identity check runs
-    /// BEFORE any reducer call: on mismatch with `OnMismatch::Rebuild` the
-    /// projection is wiped and re-stamped first, then catch-up starts from 0.
-    pub fn open_with(
-        db_path: impl AsRef<Path>,
-        log_path: impl AsRef<Path>,
-        options: crate::projection::OpenOptions<E>,
-    ) -> Result<Self> {
-        let crate::projection::OpenOptions {
-            schema,
-            namespace,
-            projection,
-            on_mismatch,
-            reducer,
-        } = options;
-        Self::open_impl(
-            db_path.as_ref(),
-            log_path.as_ref(),
-            schema,
-            namespace,
-            reducer,
-            Some((projection, on_mismatch)),
+            OpenOptions {
+                schema_hash: 0,
+                projection: ProjectionId::new(0),
+                on_mismatch: OnMismatch::Refuse,
+                min_free_bytes: None,
+                reducer: Arc::new(reducer),
+            },
+            false,
         )
     }
 
     fn open_impl(
         db_path: &Path,
         log_path: &Path,
-        schema: Shape,
-        namespace: Option<String>,
-        reducer: crate::projection::Reducer<E>,
-        managed: Option<(
-            crate::projection::ProjectionId,
-            crate::projection::OnMismatch,
-        )>,
+        options: OpenOptions<E>,
+        managed: bool,
     ) -> Result<Self> {
-        use crate::projection::{read_stamp, reset, OnMismatch, ProjectionStamp};
         if let Some(parent) = db_path.parent() {
             fs::create_dir_all(parent).map_err(|e| Error::Log(e.to_string()))?;
         }
         if let Some(parent) = log_path.parent() {
             fs::create_dir_all(parent).map_err(|e| Error::Log(e.to_string()))?;
         }
-        // Lock first, so nothing below races another writer's seal or batch.
-        let tape_lock = match managed {
-            Some(_) => Some(crate::projection::lock_tape(log_path)?),
-            None => None,
+        let tape_lock = if managed {
+            Some(crate::projection::lock_tape(log_path)?)
+        } else {
+            None
         };
-        // Spec Opening order: scan read-only, open the projection, then
-        // cross-check BEFORE sealing. Sealing first would destroy the
-        // evidence disagreement needs — the file must stay byte-identical
-        // on every fatal path.
+        // Scan read-only BEFORE opening/sealing so disagreement leaves tape untouched.
         let found = if log_path.exists() {
             JsonlLog::<Record<E>>::scan_file(log_path)?
         } else {
@@ -1192,55 +1181,44 @@ impl<E: Serialize + DeserializeOwned + 'static> Runtime<E> {
                 last_ts: 0,
             }
         };
-        // No legacy path, ever: an unsealed line is refused by the scan
-        // with the file untouched, never dropped as residue. Old tapes
-        // migrate through the offline migration script, never the writer.
         let db = Db::open(db_path)?;
-        let stored = read_stamp(&db)?;
-        let applied = applied_leaf().get(&db)?.unwrap_or(0);
-        let (identity, rebuild) = match managed {
-            None => {
-                if let Some(s) = stored {
-                    if s.reducer != 0 {
-                        return Err(Error::ProjectionMismatch {
-                            stored: Some(s),
-                            wanted: ProjectionStamp::new(0, &schema),
-                        });
-                    }
+        let (stored, applied, applied_offset) = {
+            let r = db.read()?;
+            (read_stamp(&r)?, read_applied(&r)?, read_applied_offset(&r)?)
+        };
+        let (identity, rebuild) = if !managed {
+            if let Some(s) = stored {
+                if s.reducer != 0 {
+                    return Err(Error::ProjectionMismatch {
+                        stored: Some(s),
+                        wanted: ProjectionStamp::from_parts(0, options.schema_hash),
+                    });
                 }
-                (stored, false)
             }
-            Some((projection, mode)) => {
-                let wanted = ProjectionStamp::new(projection.reducer, &schema);
-                if stored == Some(wanted) {
-                    (Some(wanted), false)
-                } else {
-                    // Nothing applied and nothing stamped is a fresh store:
-                    // there is no state to protect, so adopt it under Refuse
-                    // too. Everything else that disagrees is a mismatch.
-                    let fresh = stored.is_none() && applied == 0;
-                    if mode == OnMismatch::Refuse && !fresh {
-                        return Err(Error::ProjectionMismatch { stored, wanted });
-                    }
-                    (Some(wanted), true)
+            (stored, false)
+        } else {
+            let wanted = ProjectionStamp::from_parts(options.projection.reducer, options.schema_hash);
+            if stored == Some(wanted) {
+                (Some(wanted), false)
+            } else {
+                let fresh = stored.is_none() && applied == 0;
+                if options.on_mismatch == OnMismatch::Refuse && !fresh {
+                    return Err(Error::ProjectionMismatch { stored, wanted });
                 }
+                (Some(wanted), true)
             }
         };
-        let applied = if rebuild {
-            // Wipe and stamp are two commits, in this order, BEFORE any
-            // catch-up. See `projection::reset` for the crash analysis.
+        let (applied, applied_offset) = if rebuild {
             reset(&db, identity)?;
-            0
+            (0, Some(0))
         } else {
-            // Cross-check BEFORE sealing: a projection ahead of the tape is
-            // evidence that must survive untouched.
             if applied > found.len {
                 return Err(Error::Corruption(format!(
                     "projection and tape disagree (applied={applied}, tape has {})",
                     found.len
                 )));
             }
-            applied
+            (applied, applied_offset)
         };
         if log_path.exists() {
             JsonlLog::<Record<E>>::seal_to(log_path, &found)?;
@@ -1253,15 +1231,16 @@ impl<E: Serialize + DeserializeOwned + 'static> Runtime<E> {
             inner: Mutex::new(Inner {
                 log,
                 applied,
+                applied_offset,
                 last_ts_ms,
+                halted: None,
             }),
             applied: AtomicU64::new(applied),
             db,
-            schema,
-            namespace,
-            reducer,
+            reducer: options.reducer,
+            min_free_bytes: options.min_free_bytes,
             on_commit: Mutex::new(None),
-            last_writes: Mutex::new(Vec::new()),
+            last_touched: Mutex::new(Vec::new()),
             identity,
             tape_lock,
         };
@@ -1269,39 +1248,33 @@ impl<E: Serialize + DeserializeOwned + 'static> Runtime<E> {
         Ok(rt)
     }
 
-    /// Convenience: schema from a [`Describe`] type.
-    pub fn open_described<S: Describe>(
-        db_path: impl AsRef<Path>,
-        log_path: impl AsRef<Path>,
-        namespace: Option<String>,
-        reducer: impl Fn(&mut Tx, &E) -> Result<()> + Send + Sync + 'static,
-    ) -> Result<Self> {
-        Self::open(db_path, log_path, S::shape(), namespace, reducer)
+    /// Open a snapshot-consistent [`ReadTx`] over the projection.
+    ///
+    /// Never blocks on an in-flight append/fsync and never observes partial
+    /// batches.
+    pub fn read(&self) -> Result<ReadTx> {
+        self.db.read()
     }
 
+    /// Direct handle to the underlying `redb` [`Db`].
     pub fn db(&self) -> &Db {
         &self.db
     }
 
-    pub fn schema(&self) -> &Shape {
-        &self.schema
-    }
-
-    /// Hang the courier here: called after every committed event with its
-    /// seq and the writes it touched. Replaces any previous listener.
-    pub fn on_commit(&self, f: impl Fn(u64, &[Write]) + Send + Sync + 'static) {
+    /// Register a commit listener fired after every committed batch with the
+    /// closing `seq` and the touched [`WatchRange`]s.
+    pub fn on_commit(&self, f: impl Fn(u64, &[WatchRange]) + Send + Sync + 'static) {
         *self.on_commit.lock().expect("on_commit lock") = Some(Arc::new(f));
     }
 
-    /// Drop the commit listener.
+    /// Remove the commit listener.
     pub fn clear_on_commit(&self) {
         *self.on_commit.lock().expect("on_commit lock") = None;
     }
 
-    /// Writes of the most recent committed event — the waking set the
-    /// courier checks parked watches against.
-    pub fn last_writes(&self) -> Vec<Write> {
-        self.last_writes.lock().expect("last_writes lock").clone()
+    /// Touched ranges of the most recent committed batch.
+    pub fn last_touched(&self) -> Vec<WatchRange> {
+        self.last_touched.lock().expect("last_touched lock").clone()
     }
 
     /// Path of the canonical JSONL tape.
@@ -1313,7 +1286,7 @@ impl<E: Serialize + DeserializeOwned + 'static> Runtime<E> {
         Ok(inner.log.path().to_path_buf())
     }
 
-    /// How many lines are on the tape.
+    /// Number of committed records on the tape.
     pub fn log_len(&self) -> Result<u64> {
         let inner = self
             .inner
@@ -1322,12 +1295,68 @@ impl<E: Serialize + DeserializeOwned + 'static> Runtime<E> {
         inner.log.len()
     }
 
-    /// How many events the projection has applied.
+    /// Published committed byte offset of the tape (safe cutoff for live backups).
+    pub fn committed_end(&self) -> Result<u64> {
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| Error::Log("runtime lock poisoned".into()))?;
+        Ok(inner.log.committed_end())
+    }
+
+    /// Copy the committed prefix `[0..committed_end]` of the live tape to `dst`
+    /// atomically (temp file beside `dst`, fsynced, then renamed). Returns the
+    /// number of bytes copied.
+    pub fn backup_tape(&self, dst: impl AsRef<Path>) -> Result<u64> {
+        let dst = dst.as_ref();
+        let (src_path, end) = {
+            let inner = self
+                .inner
+                .lock()
+                .map_err(|_| Error::Log("runtime lock poisoned".into()))?;
+            (inner.log.path().to_path_buf(), inner.log.committed_end())
+        };
+        if let Some(parent) = dst.parent() {
+            fs::create_dir_all(parent).map_err(|e| Error::Log(e.to_string()))?;
+        }
+        let tmp = dst.with_extension(format!("backup-tmp-{}", crate::equiv::unique_suffix()));
+        let copy_res = (|| -> Result<u64> {
+            let mut out = FsOpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&tmp)
+                .map_err(|e| Error::Log(e.to_string()))?;
+            if src_path.exists() && end > 0 {
+                let src = File::open(&src_path).map_err(|e| Error::Log(e.to_string()))?;
+                let mut limited = src.take(end);
+                std::io::copy(&mut limited, &mut out).map_err(|e| Error::Log(e.to_string()))?;
+            }
+            out.sync_data().map_err(|e| Error::Log(e.to_string()))?;
+            drop(out);
+            fs::rename(&tmp, dst).map_err(|e| Error::Log(e.to_string()))?;
+            Ok(end)
+        })();
+        if copy_res.is_err() {
+            let _ = fs::remove_file(&tmp);
+        }
+        copy_res
+    }
+
+    /// Number of events applied to the projection.
     pub fn applied(&self) -> Result<u64> {
         Ok(self.applied.load(Ordering::Acquire))
     }
 
-    /// Records on the tape from `start` (inclusive) to the end.
+    /// If replay halted on a reducer error, returns `Some((seq, reason))`.
+    pub fn halted(&self) -> Result<Option<(u64, String)>> {
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| Error::Log("runtime lock poisoned".into()))?;
+        Ok(inner.halted.clone())
+    }
+
+    /// Committed records on the tape from `start` (inclusive) to the end.
     pub fn records_from(&self, start: u64) -> Result<Vec<Record<E>>> {
         let inner = self
             .inner
@@ -1341,25 +1370,51 @@ impl<E: Serialize + DeserializeOwned + 'static> Runtime<E> {
             .collect())
     }
 
-    /// Append an event to the log, then reduce it into the projection.
-    ///
-    /// The runtime stamps [`Meta`] (seq, monotonic ts_ms). The log is fsynced
-    /// first. Projection writes and the applied offset commit in one RocksDB
-    /// batch, so a crash before that commit replays cleanly against the
-    /// previous projection.
+    /// Append a single event: validate via reducer first (rejections leave the
+    /// tape untouched), fsync the tape, then commit the projection atomically.
     pub fn append(&self, event: E) -> Result<Record<E>> {
         let mut recs = self.append_batch(vec![event])?;
         recs.pop()
             .ok_or_else(|| Error::Log("append_batch returned empty".into()))
     }
 
-    /// Append `events` as one group commit: one fsync, then reduce each.
-    ///
-    /// Empty input is a no-op. Seq numbers are contiguous. Timestamps are
-    /// monotonic across the batch and with previous ingest.
+    /// Append a batch of events as one group commit:
+    /// 1. Reduce all events sequentially inside one `redb::WriteTransaction`
+    ///    (read-your-writes across the batch). If any event fails, the
+    ///    transaction aborts and the tape is untouched.
+    /// 2. Render + check free-space floor + write + single `sync_data` to tape.
+    /// 3. Commit the `WriteTransaction` atomically (whole batch visible together).
     pub fn append_batch(&self, events: Vec<E>) -> Result<Vec<Record<E>>> {
+        Ok(self.append_batch_impl(events, None)?.into_records())
+    }
+
+    /// Idempotent single-event append keyed by `id`.
+    ///
+    /// - First call commits and returns [`AppendOutcome::Committed`].
+    /// - Retry with the same `id` and equal serialized event returns
+    ///   [`AppendOutcome::Duplicate`] without appending a second copy.
+    /// - Retry with the same `id` and a different payload returns
+    ///   [`Error::Conflict`].
+    pub fn append_idempotent(&self, id: &str, event: E) -> Result<AppendOutcome<E>> {
+        self.append_batch_impl(vec![event], Some(id))
+    }
+
+    /// Idempotent batch append keyed by `id`.
+    pub fn append_batch_idempotent(
+        &self,
+        id: &str,
+        events: Vec<E>,
+    ) -> Result<AppendOutcome<E>> {
+        self.append_batch_impl(events, Some(id))
+    }
+
+    fn append_batch_impl(
+        &self,
+        events: Vec<E>,
+        idempotency_id: Option<&str>,
+    ) -> Result<AppendOutcome<E>> {
         if events.is_empty() {
-            return Ok(Vec::new());
+            return Ok(AppendOutcome::Committed(Vec::new()));
         }
         if events.len() as u64 > MAX_SEALED_BATCH {
             return Err(Error::Log(format!(
@@ -1371,12 +1426,52 @@ impl<E: Serialize + DeserializeOwned + 'static> Runtime<E> {
             .inner
             .lock()
             .map_err(|_| Error::Log("runtime lock poisoned".into()))?;
+        if let Some((seq, ref reason)) = inner.halted {
+            return Err(Error::Halted {
+                seq,
+                reason: reason.clone(),
+            });
+        }
+        if inner.log.is_poisoned() {
+            return Err(Error::Log(
+                "tape writer poisoned by an earlier I/O failure; reopen the tape".into(),
+            ));
+        }
+        // Catch up before answering idempotency lookups or reducing.
         self.catch_up_locked(&mut inner)?;
-        let mut records = Vec::with_capacity(events.len());
+
+        // Pre-serialize bodies once so idh and tape lines see identical bytes.
+        let serialized_bodies: Vec<String> = events
+            .iter()
+            .map(|e| serde_json::to_string(e).map_err(|err| Error::Serialize(err.to_string())))
+            .collect::<Result<_>>()?;
+
+        let idh_opt: Option<String> = idempotency_id.map(|_| batch_payload_hash(&serialized_bodies));
+
+        if let (Some(id), Some(ref idh)) = (idempotency_id, &idh_opt) {
+            let r = self.db.read()?;
+            if let Some(existing) = read_idempotency(&r, id)? {
+                if &existing.idh != idh {
+                    return Err(Error::Conflict {
+                        id: id.to_string(),
+                    });
+                }
+                let mut dup = Vec::new();
+                inner.log.for_each_from(existing.from, None, |rec, _, _| {
+                    if rec.seq >= existing.from && rec.seq <= existing.to {
+                        dup.push(rec);
+                    }
+                    Ok(())
+                })?;
+                return Ok(AppendOutcome::Duplicate(dup));
+            }
+        }
+
         let from = inner.log.len()?;
         let to = from + events.len() as u64 - 1;
         let mut seq = from;
         let mut ts_ms = inner.last_ts_ms;
+        let mut records = Vec::with_capacity(events.len());
         for event in events {
             ts_ms = next_ts(ts_ms);
             records.push(Record {
@@ -1389,15 +1484,87 @@ impl<E: Serialize + DeserializeOwned + 'static> Runtime<E> {
             });
             seq += 1;
         }
-        inner.log.append_all(&records)?;
-        inner.last_ts_ms = ts_ms;
+
+        // Step 1: Reduce into an uncommitted `redb::WriteTransaction` FIRST.
+        // Any validation failure aborts `tx` cleanly — tape never touched!
+        let mut tx = self.db.write_with(Durability::DisableWal)?;
         for rec in &records {
-            self.apply_record(&mut inner, rec)?;
+            tx.set_meta(rec.meta());
+            if let Err(e) = (self.reducer)(&mut tx, &rec.event) {
+                let _ = tx.abort();
+                return Err(e);
+            }
         }
-        Ok(records)
+
+        // Step 2: Render sealed lines in memory.
+        let mut rendered = String::with_capacity(records.len() * 256);
+        let last_idx = records.len() - 1;
+        for (i, (rec, body)) in records.iter_mut().zip(serialized_bodies.iter()).enumerate() {
+            let mut prefix = match (i == last_idx, idempotency_id, &idh_opt) {
+                (true, Some(id), Some(idh)) => {
+                    let id_json =
+                        serde_json::to_string(id).map_err(|e| Error::Serialize(e.to_string()))?;
+                    let idh_json =
+                        serde_json::to_string(idh).map_err(|e| Error::Serialize(e.to_string()))?;
+                    format!(
+                        "{{\"seq\":{},\"ts_ms\":{},\"from\":{},\"to\":{},\"id\":{id_json},\"idh\":{idh_json},\"event\":{body}",
+                        rec.seq, rec.ts_ms, rec.from, rec.to
+                    )
+                }
+                _ => format!(
+                    "{{\"seq\":{},\"ts_ms\":{},\"from\":{},\"to\":{},\"event\":{body}",
+                    rec.seq, rec.ts_ms, rec.from, rec.to
+                ),
+            };
+            let crc = seal_crc(prefix.as_bytes());
+            prefix.push_str(",\"crc\":\"");
+            prefix.push_str(&crc);
+            prefix.push_str("\"}");
+            rec.crc = crc;
+            rendered.push_str(&prefix);
+            rendered.push('\n');
+        }
+
+        // Step 3: Free-space floor check before touching disk.
+        if let Some(floor) = self.min_free_bytes {
+            if let Err(e) = check_free_space(inner.log.path(), floor, rendered.len() as u64) {
+                let _ = tx.abort();
+                return Err(e);
+            }
+        }
+
+        // Step 4: Write + fsync to tape.
+        if let Err(e) = inner
+            .log
+            .append_raw_batch(rendered.as_bytes(), records.len() as u64)
+        {
+            let _ = tx.abort();
+            return Err(e);
+        }
+        inner.last_ts_ms = ts_ms;
+        let new_end = inner.log.committed_end();
+
+        // Step 5: Stamp applied offset + idempotency entry and commit atomically.
+        crate::fault::hit("projection.apply")?;
+        write_applied(&mut tx, to + 1, Some(new_end))?;
+        if let (Some(id), Some(idh)) = (idempotency_id, &idh_opt) {
+            write_idempotency(&mut tx, id, from, to, idh)?;
+        }
+        let touched = tx.commit()?;
+        *self.last_touched.lock().expect("last_touched lock") = touched.clone();
+        inner.applied = to + 1;
+        inner.applied_offset = Some(new_end);
+        self.applied.store(inner.applied, Ordering::Release);
+
+        // Step 6: Notify watch listeners while still holding the ingest lock.
+        let listener = self.on_commit.lock().expect("on_commit lock").clone();
+        if let Some(f) = listener {
+            f(to, &touched);
+        }
+        Ok(AppendOutcome::Committed(records))
     }
 
-    /// Replay any log events the projection has not yet applied.
+    /// Replay any committed tape events the projection has not yet applied.
     pub fn catch_up(&self) -> Result<u64> {
         let mut inner = self
             .inner
@@ -1407,132 +1574,195 @@ impl<E: Serialize + DeserializeOwned + 'static> Runtime<E> {
     }
 
     fn catch_up_locked(&self, inner: &mut Inner<E>) -> Result<u64> {
+        if let Some((seq, ref reason)) = inner.halted {
+            return Err(Error::Halted {
+                seq,
+                reason: reason.clone(),
+            });
+        }
         let log_len = inner.log.len()?;
         if inner.applied >= log_len {
             return Ok(0);
         }
-        let pending = inner.log.read_from(inner.applied)?;
-        let n = pending.len() as u64;
-        for (_, rec) in pending {
-            inner.last_ts_ms = inner.last_ts_ms.max(rec.ts_ms);
-            self.apply_record(inner, &rec)?;
-        }
-        Ok(n)
+        let start_seq = inner.applied;
+        let start_offset = if start_seq == 0 {
+            Some(0)
+        } else {
+            inner.applied_offset
+        };
+
+        let mut chunk: Vec<(Record<E>, Option<(String, String)>, u64)> =
+            Vec::with_capacity(REPLAY_CHUNK_SIZE);
+        let mut total_applied = 0u64;
+
+        let mut flush_chunk =
+            |chunk: &mut Vec<(Record<E>, Option<(String, String)>, u64)>,
+             inner_applied: &mut u64,
+             inner_offset: &mut Option<u64>,
+             inner_last_ts: &mut u64,
+             inner_halted: &mut Option<(u64, String)>|
+             -> Result<()> {
+                if chunk.is_empty() {
+                    return Ok(());
+                }
+                // Try applying the whole chunk in one redb WriteTransaction.
+                let mut tx = self.db.write_with(Durability::DisableWal)?;
+                let mut failed_at: Option<(usize, Error)> = None;
+                for (idx, (rec, id_pair, _off)) in chunk.iter().enumerate() {
+                    if let Err(e) = crate::fault::hit("projection.apply") {
+                        let _ = tx.abort();
+                        return Err(e);
+                    }
+                    tx.set_meta(rec.meta());
+                    if let Err(e) = (self.reducer)(&mut tx, &rec.event) {
+                        failed_at = Some((idx, e));
+                        break;
+                    }
+                    if let Some((id, idh)) = id_pair {
+                        write_idempotency(&mut tx, id, rec.from, rec.to, idh)?;
+                    }
+                }
+                if let Some((bad_idx, err)) = failed_at {
+                    let _ = tx.abort();
+                    // Commit the prefix before `bad_idx` so `applied` stops right at the failing seq.
+                    if bad_idx > 0 {
+                        let mut prefix_tx = self.db.write_with(Durability::DisableWal)?;
+                        for (rec, id_pair, _) in &chunk[..bad_idx] {
+                            prefix_tx.set_meta(rec.meta());
+                            (self.reducer)(&mut prefix_tx, &rec.event)?;
+                            if let Some((id, idh)) = id_pair {
+                                write_idempotency(&mut prefix_tx, id, rec.from, rec.to, idh)?;
+                            }
+                            *inner_last_ts = (*inner_last_ts).max(rec.ts_ms);
+                        }
+                        let (last_ok, _, last_off) = &chunk[bad_idx - 1];
+                        write_applied(&mut prefix_tx, last_ok.seq + 1, Some(*last_off))?;
+                        let touched = prefix_tx.commit()?;
+                        *self.last_touched.lock().expect("last_touched lock") = touched;
+                        *inner_applied = last_ok.seq + 1;
+                        *inner_offset = Some(*last_off);
+                        self.applied.store(*inner_applied, Ordering::Release);
+                    }
+                    let bad_seq = chunk[bad_idx].0.seq;
+                    let reason = err.to_string();
+                    *inner_halted = Some((bad_seq, reason.clone()));
+                    return Err(Error::Halted {
+                        seq: bad_seq,
+                        reason,
+                    });
+                }
+                for (rec, _, _) in chunk.iter() {
+                    *inner_last_ts = (*inner_last_ts).max(rec.ts_ms);
+                }
+                let (last_rec, _, last_off) = chunk.last().unwrap();
+                let new_applied = last_rec.seq + 1;
+                let last_seq = last_rec.seq;
+                let new_off = *last_off;
+                write_applied(&mut tx, new_applied, Some(new_off))?;
+                let touched = tx.commit()?;
+                *self.last_touched.lock().expect("last_touched lock") = touched.clone();
+                *inner_applied = new_applied;
+                *inner_offset = Some(new_off);
+                self.applied.store(new_applied, Ordering::Release);
+                total_applied += chunk.len() as u64;
+                let listener = self.on_commit.lock().expect("on_commit lock").clone();
+                if let Some(f) = listener {
+                    f(last_seq, &touched);
+                }
+                chunk.clear();
+                Ok(())
+            };
+
+        let mut cur_applied = inner.applied;
+        let mut cur_offset = inner.applied_offset;
+        let mut cur_last_ts = inner.last_ts_ms;
+        let mut cur_halted = inner.halted.clone();
+
+        let stream_res = inner
+            .log
+            .for_each_from(start_seq, start_offset, |rec, id_pair, end_off| {
+                chunk.push((rec, id_pair, end_off));
+                if chunk.len() >= REPLAY_CHUNK_SIZE {
+                    flush_chunk(
+                        &mut chunk,
+                        &mut cur_applied,
+                        &mut cur_offset,
+                        &mut cur_last_ts,
+                        &mut cur_halted,
+                    )?;
+                }
+                Ok(())
+            });
+        let final_res = match stream_res {
+            Ok(()) => flush_chunk(
+                &mut chunk,
+                &mut cur_applied,
+                &mut cur_offset,
+                &mut cur_last_ts,
+                &mut cur_halted,
+            ),
+            Err(e) => Err(e),
+        };
+        inner.applied = cur_applied;
+        inner.applied_offset = cur_offset;
+        inner.last_ts_ms = cur_last_ts;
+        inner.halted = cur_halted;
+        final_res?;
+        Ok(total_applied)
     }
 
-    fn apply_record(&self, inner: &mut Inner<E>, rec: &Record<E>) -> Result<()> {
-        crate::fault::hit("projection.apply")?;
-        let mut tx = Tx::new(&self.db, rec.meta());
-        (self.reducer)(&mut tx, &rec.event)?;
-        tx.write(applied_leaf().set(&(rec.seq + 1)));
-        // The log is the durable source of truth; the projection is rebuildable.
-        let writes = tx.commit(Durability::DisableWal)?;
-        *self.last_writes.lock().expect("last_writes lock") = writes.clone();
-        inner.applied = rec.seq + 1;
-        self.applied.store(inner.applied, Ordering::Release);
-        // Wake whoever waits: report the commit's waking set AFTER it is
-        // durable, while still holding the ingest lock so no waiter can
-        // register between the commit and this fire.
-        let listener = self.on_commit.lock().expect("on_commit lock").clone();
-        if let Some(f) = listener {
-            f(rec.seq, &writes);
-        }
-        Ok(())
-    }
-
-    /// Drop the projection and rebuild it from event 0. A runtime opened with
-    /// an identity is re-stamped with it after the wipe and before replay.
+    /// Wipe the projection (O(tables)) and rebuild it from event 0 in chunks.
     pub fn rebuild(&self) -> Result<()> {
         let mut inner = self
             .inner
             .lock()
             .map_err(|_| Error::Log("runtime lock poisoned".into()))?;
-        crate::projection::reset(&self.db, self.identity)?;
+        reset(&self.db, self.identity)?;
         inner.applied = 0;
+        inner.applied_offset = Some(0);
+        inner.halted = None;
         self.applied.store(0, Ordering::Release);
         self.catch_up_locked(&mut inner)?;
         Ok(())
     }
 
-    /// Property: the live projection equals a fresh replay from zero.
+    /// Property check: the live projection equals a fresh in-memory replay from
+    /// zero. Uses `Db::open_memory()` (in-memory `redb`), touching no disk.
     pub fn verify(&self) -> Result<()> {
         let inner = self
             .inner
             .lock()
             .map_err(|_| Error::Log("runtime lock poisoned".into()))?;
-        let log_path = inner.log.path().to_path_buf();
-        // Hold the ingest lock for the whole replay. The replay opens the
-        // same tape, and its open may truncate residue past the committed
-        // end — which, during a live append, would be the batch being
-        // written. With the lock held no batch is in flight.
-        let _ingest = inner;
-        let tmp = tempfile_dir()?;
-        let db_path = tmp.join("proj");
-        let reducer = self.reducer.clone();
-        let other = Runtime::open(
-            &db_path,
-            &log_path,
-            self.schema.clone(),
-            self.namespace.clone(),
-            move |tx, ev| reducer(tx, ev),
-        )?;
-        other.rebuild()?;
-        // The replay is an unidentified runtime, so the identity stamp keys
-        // (which only an identified runtime writes) are compared by the
-        // identity tests, not here. Everything else must match exactly.
-        let left = crate::projection::without_stamp(dump(&self.db)?);
-        let right = crate::projection::without_stamp(dump(&other.db)?);
-        drop(other);
-        let _ = fs::remove_dir_all(&tmp);
+        let mem_db = Db::open_memory()?;
+        let mut tx = mem_db.write_with(Durability::DisableWal)?;
+        let mut last_seq = None;
+        let mut last_off = 0u64;
+        inner.log.for_each_from(0, Some(0), |rec, id_pair, off| {
+            tx.set_meta(rec.meta());
+            (self.reducer)(&mut tx, &rec.event)?;
+            if let Some((id, idh)) = id_pair {
+                write_idempotency(&mut tx, &id, rec.from, rec.to, &idh)?;
+            }
+            last_seq = Some(rec.seq);
+            last_off = off;
+            Ok(())
+        })?;
+        if let Some(seq) = last_seq {
+            write_applied(&mut tx, seq + 1, Some(last_off))?;
+        }
+        tx.commit()?;
+
+        let left = crate::projection::without_stamp(self.db.dump()?);
+        let right = crate::projection::without_stamp(mem_db.dump()?);
+        drop(inner);
         if left != right {
-            return Err(Error::Query(format!(
+            return Err(Error::Corruption(format!(
                 "verify failed: incremental ({} keys) != replay ({} keys)",
                 left.len(),
                 right.len()
             )));
         }
         Ok(())
-    }
-
-    pub fn one(&self, query: &Query) -> Result<Option<Value>> {
-        query::one(&self.db, &self.schema, &self.scoped(query))
-    }
-
-    pub fn select(&self, query: &Query) -> Result<Vec<Value>> {
-        query::select(&self.db, &self.schema, &self.scoped(query))
-    }
-
-    pub fn subtree(&self, query: &Query) -> Result<Value> {
-        query::subtree(&self.db, &self.schema, &self.scoped(query))
-    }
-
-    pub fn entries(&self, query: &Query) -> Result<Vec<(Value, Value)>> {
-        query::entries(&self.db, &self.schema, &self.scoped(query))
-    }
-
-    /// Whether any non-null value exists at or under the path.
-    pub fn has(&self, query: &Query) -> Result<bool> {
-        query::has(&self.db, &self.schema, &self.scoped(query))
-    }
-
-    pub fn project(&self, spec: &[(String, Query)]) -> Result<Value> {
-        let scoped: Vec<(String, Query)> = spec
-            .iter()
-            .map(|(k, q)| (k.clone(), self.scoped(q)))
-            .collect();
-        query::project(&self.db, &self.schema, &scoped)
-    }
-
-    pub fn explain(&self, query: &Query) -> Result<Plan> {
-        query::explain(&self.schema, &self.scoped(query))
-    }
-
-    fn scoped(&self, query: &Query) -> Query {
-        let mut q = query.clone();
-        if q.namespace.is_none() {
-            q.namespace = self.namespace.clone();
-        }
-        q
     }
 }
 
@@ -1542,16 +1772,6 @@ fn next_ts(last: u64) -> u64 {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
     now.max(last.saturating_add(1))
-}
-
-fn dump(db: &Db) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-    let iter = db.iter_start()?;
-    let mut out = Vec::new();
-    for item in iter {
-        out.push(item?);
-    }
-    out.sort_by(|a, b| a.0.cmp(&b.0));
-    Ok(out)
 }
 
 fn count_jsonl_lines(file: &mut File) -> Result<u64> {
@@ -1564,16 +1784,4 @@ fn count_jsonl_lines(file: &mut File) -> Result<u64> {
     file.seek(SeekFrom::End(0))
         .map_err(|e| Error::Log(e.to_string()))?;
     Ok(count)
-}
-
-fn tempfile_dir() -> Result<PathBuf> {
-    let base = std::env::temp_dir().join(format!(
-        "durable-verify-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ));
-    fs::create_dir_all(&base).map_err(|e| Error::Log(e.to_string()))?;
-    Ok(base)
 }

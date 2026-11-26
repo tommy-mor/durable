@@ -147,15 +147,13 @@ fn runtime_opens_through_torn_tail_and_keeps_prefix() {
         note: String,
     }
     fn reduce(tx: &mut durable::Tx, event: &Ev) -> durable::Result<()> {
-        let root = Store::root();
-        tx.write(root.seen().key(&event.note).set(&event.note));
-        Ok(())
+        Store::root().seen().set(tx, &event.note, &event.note)
     }
     let dir = TempDir::new().unwrap();
     let log = dir.path().join("log.jsonl");
     let proj = dir.path().join("proj");
     {
-        let rt = Runtime::open_described::<Store>(&proj, &log, None, reduce).unwrap();
+        let rt = Runtime::open::<Store>(&proj, &log, reduce).unwrap();
         rt.append(Ev { note: "a".into() }).unwrap();
         rt.append(Ev { note: "b".into() }).unwrap();
         assert_eq!(rt.applied().unwrap(), 2);
@@ -167,16 +165,13 @@ fn runtime_opens_through_torn_tail_and_keeps_prefix() {
     bytes.extend_from_slice(&stub);
     std::fs::write(&log, &bytes).unwrap();
     // She rises anyway, holding the committed prefix, and takes new seed.
-    let rt = Runtime::open_described::<Store>(&proj, &log, None, reduce).unwrap();
+    let rt = Runtime::open::<Store>(&proj, &log, reduce).unwrap();
     assert_eq!(rt.applied().unwrap(), 2);
     rt.append(Ev { note: "c".into() }).unwrap();
     assert_eq!(rt.applied().unwrap(), 3);
     rt.verify().unwrap();
 }
 
-/// Requires a persisted projection to disagree with (applied=2 > tape=1);
-/// the ephemeral backend holds no such overlap across reopens.
-#[cfg(not(feature = "backend-memory"))]
 #[test]
 fn cutting_acknowledged_history_is_fatal_not_silent() {
     use durable::{Durable, Leaf, Map, Runtime};
@@ -193,15 +188,13 @@ fn cutting_acknowledged_history_is_fatal_not_silent() {
         note: String,
     }
     fn reduce2(tx: &mut durable::Tx, event: &Ev2) -> durable::Result<()> {
-        let root = Store2::root();
-        tx.write(root.seen().key(&event.note).set(&event.note));
-        Ok(())
+        Store2::root().seen().set(tx, &event.note, &event.note)
     }
     let dir = TempDir::new().unwrap();
     let log = dir.path().join("log.jsonl");
     let proj = dir.path().join("proj");
     {
-        let rt = Runtime::open_described::<Store2>(&proj, &log, None, reduce2).unwrap();
+        let rt = Runtime::open::<Store2>(&proj, &log, reduce2).unwrap();
         rt.append(Ev2 { note: "a".into() }).unwrap();
         rt.append(Ev2 { note: "b".into() }).unwrap();
     }
@@ -210,7 +203,7 @@ fn cutting_acknowledged_history_is_fatal_not_silent() {
     let bytes = std::fs::read(&log).unwrap();
     let cut = bytes.iter().position(|b| *b == b'\n').unwrap() + 1;
     std::fs::write(&log, &bytes[..cut]).unwrap();
-    let err = match Runtime::open_described::<Store2>(&proj, &log, None, reduce2) {
+    let err = match Runtime::open::<Store2>(&proj, &log, reduce2) {
         Ok(_) => panic!("amputated tape opened without disagree"),
         Err(e) => e.to_string(),
     };

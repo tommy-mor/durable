@@ -18,8 +18,7 @@
 use std::path::{Path, PathBuf};
 
 use durable::testing::{app_keys_only, check_rewrite_equivalent};
-use durable::Describe;
-use durable::{dry_run, rewrite, Durable, Emit, Leaf, Mode, Result, Runtime, Shape, Step, Tx};
+use durable::{dry_run, rewrite, Durable, Emit, Leaf, Mode, Result, Runtime, Step, Tx};
 use serde::{Deserialize, Serialize};
 
 /// The projection both rules write.
@@ -75,20 +74,20 @@ pub fn reduce_old(tx: &mut Tx, ev: &Old) -> Result<()> {
     let root = Ladder::root();
     match ev {
         Old::Joined { player } => {
-            let mut waiting = root.waiting().get(tx.db())?.unwrap_or_default();
+            let mut waiting = root.waiting().get(tx)?.unwrap_or_default();
             waiting.push(player.clone());
-            tx.write(root.waiting().set(&waiting));
+            root.waiting().set(tx, &waiting)?;
         }
         Old::RoundBegan { .. } => {
-            let waiting = root.waiting().get(tx.db())?.unwrap_or_default();
+            let waiting = root.waiting().get(tx)?.unwrap_or_default();
             let (arenas, flushed) = legacy_pairing(&waiting);
             let rest: Vec<String> = waiting
                 .into_iter()
                 .filter(|p| !flushed.contains(p))
                 .collect();
-            tx.write(root.waiting().set(&rest));
-            tx.write(root.last_arenas().set(&arenas));
-            tx.write(root.last_flushed().set(&flushed));
+            root.waiting().set(tx, &rest)?;
+            root.last_arenas().set(tx, &arenas)?;
+            root.last_flushed().set(tx, &flushed)?;
         }
     }
     Ok(())
@@ -98,35 +97,30 @@ pub fn reduce_new(tx: &mut Tx, ev: &New) -> Result<()> {
     let root = Ladder::root();
     match ev {
         New::Joined { player } => {
-            let mut waiting = root.waiting().get(tx.db())?.unwrap_or_default();
+            let mut waiting = root.waiting().get(tx)?.unwrap_or_default();
             waiting.push(player.clone());
-            tx.write(root.waiting().set(&waiting));
+            root.waiting().set(tx, &waiting)?;
         }
         New::RoundPaired {
             flushed, arenas, ..
         } => {
-            // No pairing here: the writer recorded it.
-            let waiting = root.waiting().get(tx.db())?.unwrap_or_default();
+            let waiting = root.waiting().get(tx)?.unwrap_or_default();
             let rest: Vec<String> = waiting
                 .into_iter()
                 .filter(|p| !flushed.contains(p))
                 .collect();
-            tx.write(root.waiting().set(&rest));
-            tx.write(root.last_arenas().set(arenas));
-            tx.write(root.last_flushed().set(flushed));
+            root.waiting().set(tx, &rest)?;
+            root.last_arenas().set(tx, arenas)?;
+            root.last_flushed().set(tx, flushed)?;
         }
     }
     Ok(())
 }
 
-pub fn schema() -> Shape {
-    <Ladder as Describe>::shape()
-}
-
 /// Write the old tape the way the old writer did (via the runtime).
 pub fn write_old_tape(dir: &Path) -> Result<PathBuf> {
     let log = dir.join("ladder.jsonl");
-    let rt = Runtime::open(dir.join("proj-old"), &log, schema(), None, reduce_old)?;
+    let rt = Runtime::open::<Ladder>(dir.join("proj-old"), &log, reduce_old)?;
     for p in ["ann", "bo", "cy", "di", "ed"] {
         rt.append(Old::Joined { player: p.into() })?;
     }
@@ -169,21 +163,13 @@ pub fn map_old_to_new(step: Step<'_, Old>) -> Result<Emit<New>> {
 /// Run the whole procedure in `dir`. Returns the new tape's path.
 pub fn run(dir: &Path) -> Result<PathBuf> {
     let src = write_old_tape(dir)?;
-    let dry = dry_run::<Old, New>(&src, schema(), reduce_old, Mode::SameSeq, map_old_to_new)?;
+    let dry = dry_run::<Ladder, Old, New>(&src, reduce_old, Mode::SameSeq, map_old_to_new)?;
     print!("{}", dry.to_text());
     let dst = dir.join("ladder.round-paired.jsonl");
-    rewrite::<Old, New>(
+    rewrite::<Ladder, Old, New>(&src, &dst, reduce_old, Mode::SameSeq, map_old_to_new)?;
+    check_rewrite_equivalent::<Ladder, Old, New>(
         &src,
         &dst,
-        schema(),
-        reduce_old,
-        Mode::SameSeq,
-        map_old_to_new,
-    )?;
-    check_rewrite_equivalent::<Old, New>(
-        &src,
-        &dst,
-        schema(),
         reduce_old,
         reduce_new,
         app_keys_only,

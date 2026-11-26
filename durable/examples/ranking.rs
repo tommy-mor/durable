@@ -1,10 +1,6 @@
 //! A pairwise-ranking scope stored with precise, point-addressable updates.
 //!
 //! Run with: `cargo run -p durable --example ranking`
-//!
-//! This mirrors the motivating use case: a "scope" holds an edge-weight graph, a
-//! capped window of recent votes, and a counter. A vote updates a handful of
-//! keys in one atomic batch — it never reads or rewrites the whole scope.
 
 use durable::{Db, Deque, Durability, Durable, Leaf, Map, Sum};
 use serde::{Deserialize, Serialize};
@@ -19,11 +15,8 @@ struct Vote {
 #[derive(Durable)]
 #[allow(dead_code)]
 struct Scope {
-    /// Directed edge weights: (from, to) -> accumulated weight.
     edges: Map<(u32, u32), Sum<f64>>,
-    /// Most recent votes, newest at the back.
     recent: Deque<Leaf<Vote>>,
-    /// Total votes recorded in this scope.
     votes: Sum<i64>,
 }
 
@@ -36,20 +29,16 @@ struct Store {
 const RECENT_CAP: u64 = 5;
 
 fn record_vote(db: &Db, scope: &str, vote: Vote) -> durable::Result<()> {
-    let s = Store::root().scopes().key(&scope.to_string());
+    let s = Store::root().scopes().key(scope);
 
-    // One atomic batch: bump the winning edge, flag the count, push the vote.
-    let mut batch = db.batch();
-    batch.write(s.edges().key(&(vote.winner, vote.loser)).add(vote.weight));
-    batch.write(s.votes().add(1));
-    batch.push_back(&s.recent(), &vote)?;
-    batch.commit_with(Durability::SyncWal)?;
-
-    // Keep only the most recent N votes (O(1) per eviction).
-    while s.recent().len(db)? > RECENT_CAP {
-        s.recent().pop_front(db)?;
-    }
-    Ok(())
+    // One atomic transaction: bump edge, bump count, push vote, and cap recent window!
+    db.txn(Durability::SyncWal, |tx| {
+        s.edges().add(tx, (vote.winner, vote.loser), vote.weight)?;
+        s.votes().add(tx, 1)?;
+        s.recent().push_back(tx, &vote)?;
+        s.recent().truncate_front(tx, RECENT_CAP)?;
+        Ok(())
+    })
 }
 
 fn main() -> durable::Result<()> {
@@ -69,26 +58,25 @@ fn main() -> durable::Result<()> {
         )?;
     }
 
-    let s = Store::root().scopes().key(&"rust".to_string());
+    let s = Store::root().scopes().key("rust");
+    let r = db.read()?;
+    println!("total votes: {}", s.votes().get(&r)?);
+    println!("recent window (cap {RECENT_CAP}): {}", s.recent().len(&r)?);
 
-    println!("total votes: {}", s.votes().get(&db)?);
-    println!("recent window (cap {RECENT_CAP}): {}", s.recent().len(&db)?);
-
-    let mut edges = s.edges().iter(&db)?;
+    let mut edges = s.edges().iter(&r)?;
     edges.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
     println!("edges by weight:");
     for ((from, to), weight) in edges {
         println!("  {from} -> {to}: {weight:.1}");
     }
 
-    // Decay every edge by 10% in a single scan + atomic batch.
-    let decay = s
-        .edges()
-        .transform_values(&db, |_e, w| Some(w * 0.9))?;
-    db.apply(&decay, Durability::SyncWal)?;
+    // Decay every edge by 10% in one atomic transaction.
+    db.txn(Durability::SyncWal, |tx| {
+        s.edges().transform_values(tx, |_e, w| Some(w * 0.9))
+    })?;
     println!(
         "edge (0->1) after decay: {:.3}",
-        s.edges().key(&(0, 1)).get(&db)?
+        s.edges().get(&db, (0, 1))?
     );
 
     Ok(())

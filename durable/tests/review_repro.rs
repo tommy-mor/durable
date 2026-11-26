@@ -16,11 +16,10 @@ struct Ev {
     note: String,
 }
 fn reduce(tx: &mut durable::Tx, e: &Ev) -> durable::Result<()> {
-    tx.write(Store::root().seen().key(&e.note).set(&e.note));
-    Ok(())
+    Store::root().seen().set(tx, &e.note, &e.note)
 }
 fn open(dir: &Path) -> durable::Result<Runtime<Ev>> {
-    Runtime::open_described::<Store>(dir.join("proj"), dir.join("log.jsonl"), None, reduce)
+    Runtime::open::<Store>(dir.join("proj"), dir.join("log.jsonl"), reduce)
 }
 fn ev(s: &str) -> Ev {
     Ev { note: s.into() }
@@ -47,7 +46,6 @@ fn a_unsealed_tape_is_refused_untouched() {
 /// The in-memory backend holds no projection across reopens, so there is
 /// no persisted `applied` to disagree with — the test only applies to
 /// on-disk backends.
-#[cfg(not(feature = "backend-memory"))]
 #[test]
 fn c_disagree_leaves_file_untouched() {
     let dir = TempDir::new().unwrap();

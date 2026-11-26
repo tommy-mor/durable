@@ -1,131 +1,67 @@
 # durable — design notes
 
-This document describes how `durable` actually works, so the layout and cost
-model are auditable rather than mysterious.
+`durable` is a pure-Rust, `redb`-native event-sourced state runtime.
 
-## Goals
+## Architecture
 
-1. **Precise updates.** A mutation touches only the keys it names. No
-   read-deserialize-mutate-reserialize-write of a whole struct.
-2. **Deep nesting.** Maps, lists, deques, and structs compose to arbitrary
-   depth, all in one RocksDB column family.
-3. **Type safety.** Illegal navigation and illegal operations fail to compile.
-4. **Paths and mutations as data.** Addresses and edits are values you can
-   build, reuse, inspect, and apply in atomic batches.
+1. **Source of truth**: a single self-sealing JSONL event tape (`src/runtime.rs`,
+   specified in `docs/tape.md`). Every line carries `{seq, ts_ms, from, to,
+   [id, idh], event, crc}`. A single pure `scan_reader` function decides the
+   committed prefix; torn tails past the committed prefix drop by rule.
+2. **Derived projection**: a rebuildable `redb` database (`src/store.rs`),
+   written with `Durability::None` during normal appends/replays and
+   `Durability::Immediate` on schema wipe/stamp.
+3. **Typed schema & ordered keys**: `#[derive(Durable)]` (`durable-derive`),
+   `Schema` (`src/schema.rs`), `Key` (`src/key.rs`), and `Path<S>` (`src/path.rs`).
 
-Non-goals: multi-process concurrency, distribution, SQL, ad-hoc range queries
-over logical key order.
+## Table & key layout
 
-## Key encoding
+At the database root (`Store::root()`), `#[derive(Durable)]` maps:
+- each collection or nested-record field to its own `redb` table named after
+  the field (or `"{ns}/{field}"` under `Store::namespaced(ns)`),
+- top-level scalar fields (`Leaf<T>`, `Sum<N>`) to `"__scalars"`,
+- runtime bookkeeping (`applied`, `applied_byte_offset`, `stamp_reducer`,
+  `stamp_schema`, `ids/<id>`) to `"__durable"`.
 
-A location is a sequence of **segments**. Each segment is length-prefixed:
-`uvarint(len) ++ bytes`. The full RocksDB key is the concatenation of a parent
-prefix and a one-byte discriminator plus a segment per step.
+Within a table:
+- At the table root (`prefix` empty), child keys sit directly at `encode_key(k)`.
+  Flat root collections (`Map<K, Leaf<T>>`, `Map<K, Sum<N>>`, `Set<K>`,
+  `List<Leaf<T>>`, `Deque<Leaf<T>>`) have 1 physical row per logical entry, so
+  `len()` is an O(1) B-tree header read and `clear()` is an O(1) `delete_table`.
+- Under any non-empty parent prefix `P`, children live at `P ++ [0x01] ++ seg`.
+  Deleting a nested subtree runs in-place via `redb`'s `Table::retain_in`.
 
-Length-prefixing makes segment sequences *self-delimiting*: no segment can be a
-byte-prefix of a different segment, so a parent prefix only ever prefixes its own
-descendants. Sibling subtrees never overlap.
+### Ordered `Key` encoding (`src/key.rs`, `src/codec.rs`)
 
-Within a location prefix `P`:
+Every `Key` is order-preserving, self-delimiting, and strictly prefix-disjoint:
+- Fixed-width big-endian integers (`u8..u128`), sign-bit-flipped big-endian
+  signed integers (`i8..i128`), IEEE 754 total-order `OrderedF64`.
+- Strings & byte slices escape `0x00 → 0x00 0xFF` and terminate with
+  `0x00 0x00`. The two-byte terminator prevents `"a"` (`61 00 00`) from being
+  a prefix of sibling `"a\0"` (`61 00 ff 00 00`), keeping subtree deletion,
+  `contains`, and `watch` overlap exact even with embedded NUL bytes.
+- `Reverse<K>` bitwise-inverts the encoded bytes of `K`.
+- Tuples `(A, B)`, `(A, B, C)`, `(A, B, C, D)` concatenate their element
+  encodings directly, making leading-element prefixes contiguous ranges.
 
-| Key | Holds |
-|-----|-------|
-| `P` (exact) | a `Leaf` / `Sum` scalar value |
-| `P ++ [0x01] ++ seg` | child data: map entry, struct field, list/deque element |
-| `P ++ [0x00] ++ seg` | collection metadata: list `len`, deque `head`/`tail` |
+## Transaction & snapshot model
 
-- **Map** entry under key `k`: segment is `cbor(k)`. Iteration is a range scan
-  over `P ++ [0x01]`; logical keys are deduplicated by their first segment
-  (nested values contribute several physical keys sharing that segment).
-- **List** element `i`: segment is `i` as 8 big-endian bytes; `len` lives in
-  metadata.
-- **Deque** element `i` (an `i64`, possibly negative): segment is an
-  order-preserving encoding (`(i as u64) ^ (1<<63)` big-endian) so the byte order
-  matches signed numeric order. `head`/`tail` cursors live in metadata; both ends
-  are O(1) and never renumber.
-- **Struct** field: segment is the field's declaration-order id as a uvarint.
-
-Deleting a subtree is one RocksDB range delete over `[P, prefix_upper_bound(P))`
-(falling back to a scan only when the prefix is empty or all `0xff`).
-
-## Types and navigation
-
-`Path<S>` carries the lowered prefix bytes and a phantom schema `S`. Navigation
-methods are implemented per concrete schema, so `Path<Map<K, V>>` has `key`,
-`Path<List<V>>` has `at`, a derived struct's `Path` has its field navigators, and
-so on. Each step appends a segment and returns a `Path` of the child schema.
-
-`#[derive(Durable)]` generates, for a struct, the `Schema` impl, a `{Name}Fields`
-extension trait of navigators implemented for `Path<Name>`, and `Name::root()` /
-`Name::namespaced(name)` constructors.
-
-## Mutations and the cost model
-
-Terminal mutating operations return reified `Write`s wrapping a plain-data `Op`
-(`Put` / `Delete` / `DeletePrefix` / `Merge`). They are applied via `Db::apply`
-or pushed onto a `Batch`, which commits as a single RocksDB write with an
-explicit `Durability`.
-
-- **Blind** ops carry fully-determined keys and never read: `Leaf::set`/`delete`,
-  `Sum::add`/`set`/`delete`, collection `clear`.
-- **Read-modify-write** ops read a length or cursor: list/deque pushes and pops.
-  In a `Batch`, appends are deferred and resolved at commit so contiguous appends
-  get contiguous indices and the whole batch is one atomic write.
-- **Scans**: `keys`/`iter`/`len`/`contains`/`transform_values`.
-
-### Sum and the merge operator
-
-`Sum<N>` is backed by a RocksDB associative merge operator registered at
-`Db::open`. Accumulator values are stored tagged (`[type_tag, 8 LE bytes]`) so a
-single operator folds `f64`, `i64`, and `u64` correctly. `add(delta)` is a blind
-`Merge` write: O(1), no read, folded lazily during compaction. This is the right
-primitive for counters and graph edge weights.
-
-## Durability and recovery
-
-`SyncWal` fsyncs the WAL before returning; `WalOnly` writes the WAL without an
-fsync; `DisableWal` skips it. `DisableWal` is intended for projections that can
-be rebuilt from another durable source of truth — its writes may be lost on an
-unclean crash.
-
-`durable` is deliberately not a recovery plan on its own. Pair it with a
-canonical log if you need crash recovery, and prefer "drop and replay" over
-in-place migration when a schema changes.
-
-## Runtime
-
-[`Runtime<E>`](../src/runtime.rs) is that pairing. The JSONL log is the source
-of truth. Callers supply an event body; the runtime stamps a [`Record`] with a
-sequence number and a monotonic millisecond timestamp, then fsyncs that line
-(or a whole [`append_batch`] group) before reducing. The reducer receives a
-[`Tx`] whose [`Tx::meta`] is that stamp — ids and times are not minted by the
-client. The applied offset is committed in the same RocksDB batch as the
-event's projection writes, so a crash before commit replays the event against
-the previous projection. `DisableWal` is the right durability for the
-projection: it is rebuildable.
-
-Writes take an internal mutex. Query methods only read RocksDB, which already
-supports concurrent snapshots, so an in-flight fsync does not block `one` /
-`select`. `append_batch` is the group-commit primitive: N events, one
-`sync_data`.
-
-`rebuild()` range-deletes the projection and reduces from event 0.
-`verify()` checks the live projection against a fresh replay. The property
-that matters is incremental execution == replay from zero.
-
-[`dynpath`](../src/dynpath.rs) is the untyped write algebra (a `Shape` plus a list of `Nav`s) for clients and reducers that have no Rust `Path<S>` at compile time.
-
-## Query language
-
-Reads are a closed algebra ([`query`](../src/query.rs)): `Field`, `Key`,
-`Index`, `All`, `Where`, `First`/`Last`/`Slice`, and a predicate language of
-comparisons, `And`/`Or`/`Not`, and `Exists`. No callables. The wire form is a
-tagged-array CBOR encoding shared with the Python frontend.
-
-A path does not imply how to collect. Terminals are explicit: `one`, `select`,
-`subtree`, `entries`, `project`. `explain` reports `POINT` / `BOUNDED` /
-`SCAN` so a prefix scan cannot pretend to be a point get.
-
-Once navigation enters a `Leaf`, remaining field/key steps run against the
-decoded CBOR value. That is how `ROOT.evidence_by_id[id].payload` works when
-the stored value is a dict.
+- **`ReadTx`** (`rt.read()` / `db.read()`): wraps `redb::ReadTransaction`.
+  All point lookups and range scans share one MVCC snapshot. Range iterators
+  use `ReadOnlyTable::range` (`Range<'static, &[u8], &[u8]>`) backed by
+  `Arc<TransactionGuard>` — lazy, streaming, and `DoubleEndedIterator`.
+- **`Tx`** (`db.write()` / reducer `&mut Tx`): wraps `redb::WriteTransaction`
+  directly. Every write is immediately visible to subsequent reads on the same
+  `Tx` in arrival order, and `Tx` records touched `WatchRange`s for reactive
+  listeners.
+- **Append lifecycle**:
+  1. Open `WriteTransaction` (`Durability::None`), reduce all events in the
+     batch sequentially. Any reducer error aborts the transaction — the tape
+     is untouched.
+  2. Render sealed lines, check optional `min_free_bytes` via `statvfs`, write
+     and `sync_data` the tape.
+  3. Write `applied`, `applied_byte_offset`, and optional idempotency record
+     into the `WriteTransaction`, commit atomically, and notify `on_commit`.
+- **Replay / rebuild**: streams lines with `BufReader`, seeks from
+  `applied_byte_offset`, and commits in 4,096-event chunks. `verify()` replays
+  into `Db::open_memory()` (`redb::backends::InMemoryBackend`).

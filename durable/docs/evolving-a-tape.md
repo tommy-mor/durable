@@ -24,19 +24,20 @@ kept alive in reducers is what this machinery exists to delete.
 let rt = Runtime::open_with(
     db_dir,
     tape,
-    OpenOptions::new(Ladder::shape(), ProjectionId::new(7), reduce),
+    OpenOptions::new::<Ladder>(ProjectionId::new(7), reduce),
 )?;
 ```
 
-On open, the stored identity `{reducer, shape_hash}` is compared with the wanted
+On open, the stored identity `{reducer, schema_hash}` is compared with the wanted
 one **before any reducer call**. A mismatch with the default `OnMismatch::Rebuild`
 wipes the projection and replays from zero. `OnMismatch::Refuse` returns
 `Error::ProjectionMismatch` and touches nothing.
 
 - Bump `reducer` when a fold rule changes. Nothing in code can detect that, so
   a human does it.
-- The shape hash changes by itself when the projection layout changes. You do
-  not need to bump for layout changes, but a bump costs nothing.
+- The schema hash changes by itself when the projection layout, key types, or
+  format version changes. You do not need to bump for layout changes, but a bump
+  costs nothing.
 - A projection is derived. A rebuild is always safe, only slower. Rebuild is the
   default for that reason.
 
@@ -50,16 +51,15 @@ without rewriting the tape, and the history stays exact.
 ## Rewrite the tape once, offline
 
 Use `durable::rewrite` when old records must change meaning. The rewrite folds the
-**old** tape with the **old** reducer into a scratch projection. For each record,
+**old** tape with the **old** reducer into an in-memory `redb` scratch projection. For each record,
 `map` receives `Step { rec, before }`, where `before` is the state **before** that
 record is reduced. Decisions that depend on old state are computed from exactly
 the state the old rule saw.
 
 ```rust
-let report = durable::rewrite::<Old, New>(
+let report = durable::rewrite::<Ladder, Old, New>(
     &src,            // never written
     &dst,            // must not exist; published atomically at the end
-    Ladder::shape(),
     reduce_old,      // the rule that built the history
     Mode::SameSeq,   // or Mode::Renumber to drop records
     |step| match &step.rec.event {
@@ -102,17 +102,17 @@ lines.
 ### Prove it
 
 ```rust
-durable::testing::assert_rewrite_equivalent::<Old, New>(
-    &src, &dst, Ladder::shape(), reduce_old, reduce_new, durable::testing::app_keys_only,
+durable::testing::assert_rewrite_equivalent::<Ladder, Old, New>(
+    &src, &dst, reduce_old, reduce_new, durable::testing::app_keys_only,
 );
 ```
 
 It folds both tapes and compares every application key. On mismatch it panics
-with the first differing key and both values decoded to JSON. `app_keys_only`
-ignores the `__durable` bookkeeping keys (applied offset and identity stamp),
+with the first differing key and both values decoded. `app_keys_only`
+ignores the `__durable` bookkeeping table (applied offset and identity stamp),
 which a rewrite that drops records legitimately changes.
 
-For a digest instead of a diff: `durable::fold_dump(&tape, shape, reducer)` and
+For a digest instead of a diff: `durable::fold_dump::<Ladder, _>(&tape, reducer)` and
 `durable::digest_pairs(&dump)` (SHA-256, length-prefixed, stable across platforms).
 
 ## Deploy and rollback checklist

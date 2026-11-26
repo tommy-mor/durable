@@ -1,6 +1,6 @@
-//! End-to-end tests for the durable paths-as-data API.
+//! End-to-end tests for the typed `redb`-native durable API.
 
-use durable::{Db, Durability, Durable, Deque, Leaf, List, Map, Op, Sum};
+use durable::{Db, Deque, Durability, Durable, Leaf, List, Map, Set, Sum};
 use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 
@@ -11,13 +11,11 @@ struct Vote {
     ratio: i32,
 }
 
-/// A scope's local ranking state — the kind of thing that used to be one CBOR
-/// blob, now addressable field-by-field and key-by-key.
 #[derive(Durable)]
 #[allow(dead_code)]
 struct GroupState {
     edges: Map<(u32, u32), Sum<f64>>,
-    voted_pairs: Map<(u32, u32), Leaf<bool>>,
+    voted_pairs: Set<(u32, u32)>,
     recent_votes: Deque<Leaf<Vote>>,
     item_count: Sum<i64>,
 }
@@ -27,7 +25,10 @@ struct GroupState {
 struct Store {
     scopes: Map<String, GroupState>,
     nodes: Map<String, Leaf<String>>,
+    tags: Set<String>,
     log: List<Leaf<u64>>,
+    title: Leaf<String>,
+    counter: Sum<i64>,
 }
 
 fn open() -> (TempDir, Db) {
@@ -37,221 +38,275 @@ fn open() -> (TempDir, Db) {
 }
 
 #[test]
-fn leaf_set_get_delete() {
+fn leaf_set_get_update_delete() {
     let (_dir, db) = open();
     let root = Store::root();
-    let k = "reddit.com/r/rust".to_string();
 
-    assert_eq!(root.nodes().key(&k).get(&db).unwrap(), None);
-    db.run(root.nodes().key(&k).set(&"Rust".to_string()), Durability::SyncWal)
-        .unwrap();
-    assert_eq!(root.nodes().key(&k).get(&db).unwrap(), Some("Rust".to_string()));
-
-    db.run(root.nodes().key(&k).delete(), Durability::SyncWal).unwrap();
-    assert_eq!(root.nodes().key(&k).get(&db).unwrap(), None);
-}
-
-#[test]
-fn sum_accumulates_with_blind_merges() {
-    let (_dir, db) = open();
-    let edges = Store::root().scopes().key(&"s".to_string()).edges();
-    let e = (3u32, 7u32);
-
-    // Several blind merges in one atomic batch — no reads involved.
-    db.apply(
-        &[
-            edges.key(&e).add(2.0),
-            edges.key(&e).add(1.0),
-            edges.key(&e).add(0.5),
-        ],
-        Durability::SyncWal,
-    )
+    assert_eq!(root.nodes().get(&db, "reddit.com/r/rust").unwrap(), None);
+    db.txn(Durability::SyncWal, |tx| {
+        root.nodes()
+            .set(tx, "reddit.com/r/rust", &"Rust".to_string())?;
+        root.title().set(tx, &"home".to_string())?;
+        Ok(())
+    })
     .unwrap();
-    assert_eq!(edges.key(&e).get(&db).unwrap(), 3.5);
 
-    // Negative delta decrements; absent key reads as zero.
-    db.run(edges.key(&e).add(-1.5), Durability::SyncWal).unwrap();
-    assert_eq!(edges.key(&e).get(&db).unwrap(), 2.0);
-    assert_eq!(edges.key(&(9, 9)).get(&db).unwrap(), 0.0);
+    let r = db.read().unwrap();
+    assert_eq!(
+        root.nodes().get(&r, "reddit.com/r/rust").unwrap(),
+        Some("Rust".to_string())
+    );
+    assert_eq!(root.title().get(&r).unwrap(), Some("home".to_string()));
+
+    db.txn(Durability::SyncWal, |tx| {
+        root.nodes().key("reddit.com/r/rust").update(tx, |cur| {
+            assert_eq!(cur, Some("Rust".to_string()));
+            Some("Rust 2026".to_string())
+        })?;
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(
+        root.nodes().get(&db, "reddit.com/r/rust").unwrap(),
+        Some("Rust 2026".to_string())
+    );
+
+    db.txn(Durability::SyncWal, |tx| {
+        assert!(root.nodes().key("reddit.com/r/rust").delete(tx)?);
+        assert!(!root.nodes().key("reddit.com/r/rust").delete(tx)?);
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(root.nodes().get(&db, "reddit.com/r/rust").unwrap(), None);
 }
 
 #[test]
-fn sum_set_then_merge() {
+fn sum_accumulates_and_reads_own_writes_in_tx() {
     let (_dir, db) = open();
-    let count = Store::root().scopes().key(&"s".to_string()).item_count();
-    db.run(count.set(10), Durability::SyncWal).unwrap();
-    db.run(count.add(5), Durability::SyncWal).unwrap();
-    assert_eq!(count.get(&db).unwrap(), 15);
+    let edges = Store::root().scopes().key("s").edges();
+
+    db.txn(Durability::SyncWal, |tx| {
+        assert_eq!(edges.add(tx, (3, 7), 2.0)?, 2.0);
+        assert_eq!(edges.add(tx, (3, 7), 1.0)?, 3.0);
+        assert_eq!(edges.add(tx, (3, 7), 0.5)?, 3.5);
+        assert_eq!(edges.get(tx, (3, 7))?, 3.5);
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(edges.get(&db, (3, 7)).unwrap(), 3.5);
+
+    db.txn(Durability::SyncWal, |tx| {
+        edges.add(tx, (3, 7), -1.5)?;
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(edges.get(&db, (3, 7)).unwrap(), 2.0);
+    assert_eq!(edges.get(&db, (9, 9)).unwrap(), 0.0);
 }
 
 #[test]
-fn reified_writes_are_inspectable_data() {
-    let edges = Store::root().scopes().key(&"s".to_string()).edges();
-    let merge = edges.key(&(1u32, 2u32)).add(1.0);
-    assert!(matches!(merge.op(), Op::Merge { .. }));
-
-    let put = Store::root().nodes().key(&"x".to_string()).set(&"y".to_string());
-    assert!(matches!(put.op(), Op::Put { .. }));
-
-    let clear = Store::root().scopes().clear();
-    assert!(matches!(clear.op(), Op::DeletePrefix { .. }));
+fn sum_set_then_add() {
+    let (_dir, db) = open();
+    let count = Store::root().scopes().key("s").item_count();
+    db.txn(Durability::SyncWal, |tx| {
+        count.set(tx, 10)?;
+        assert_eq!(count.add(tx, 5)?, 15);
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(count.get(&db).unwrap(), 15);
 }
 
 #[test]
 fn point_update_touches_only_its_own_key() {
     let (_dir, db) = open();
     let root = Store::root();
-    let rust = root.scopes().key(&"rust".to_string());
-    let python = root.scopes().key(&"python".to_string());
+    let rust = root.scopes().key("rust");
+    let python = root.scopes().key("python");
 
-    // Populate two scopes with several edges and some recent votes.
-    let mut batch = db.batch();
+    db.txn(Durability::SyncWal, |tx| {
+        for j in 0..5u32 {
+            rust.edges().add(tx, (0, j), j as f64 + 1.0)?;
+            python.edges().add(tx, (0, j), 100.0)?;
+        }
+        rust.recent_votes().push_back(
+            tx,
+            &Vote {
+                a: "a".into(),
+                b: "b".into(),
+                ratio: 2,
+            },
+        )?;
+        Ok(())
+    })
+    .unwrap();
+
+    db.txn(Durability::SyncWal, |tx| {
+        rust.edges().add(tx, (0, 2), 10.0)?;
+        Ok(())
+    })
+    .unwrap();
+
+    let r = db.read().unwrap();
+    assert_eq!(rust.edges().get(&r, (0, 2)).unwrap(), 13.0);
+    assert_eq!(rust.edges().get(&r, (0, 0)).unwrap(), 1.0);
+    assert_eq!(rust.edges().get(&r, (0, 4)).unwrap(), 5.0);
     for j in 0..5u32 {
-        batch.write(rust.edges().key(&(0, j)).add(j as f64 + 1.0));
-        batch.write(python.edges().key(&(0, j)).add(100.0));
+        assert_eq!(python.edges().get(&r, (0, j)).unwrap(), 100.0);
     }
-    batch
-        .push_back(
-            &rust.recent_votes(),
-            &Vote { a: "a".into(), b: "b".into(), ratio: 2 },
-        )
-        .unwrap();
-    batch.commit().unwrap();
-
-    // A single precise update to one edge in `rust`.
-    db.run(rust.edges().key(&(0, 2)).add(10.0), Durability::SyncWal)
-        .unwrap();
-
-    // Only that edge changed.
-    assert_eq!(rust.edges().key(&(0, 2)).get(&db).unwrap(), 13.0);
-    assert_eq!(rust.edges().key(&(0, 0)).get(&db).unwrap(), 1.0);
-    assert_eq!(rust.edges().key(&(0, 4)).get(&db).unwrap(), 5.0);
-    // The other scope is entirely untouched.
-    for j in 0..5u32 {
-        assert_eq!(python.edges().key(&(0, j)).get(&db).unwrap(), 100.0);
-    }
-    // And the unrelated recent_votes deque is intact.
-    assert_eq!(rust.recent_votes().len(&db).unwrap(), 1);
+    assert_eq!(rust.recent_votes().len(&r).unwrap(), 1);
 }
 
 #[test]
-fn map_keys_len_contains_entries() {
+fn map_keys_len_contains_entries_in_lexicographic_order() {
     let (_dir, db) = open();
     let nodes = Store::root().nodes();
-    db.apply(
-        &[
-            nodes.key(&"a".to_string()).set(&"1".to_string()),
-            nodes.key(&"b".to_string()).set(&"2".to_string()),
-            nodes.key(&"c".to_string()).set(&"3".to_string()),
-        ],
-        Durability::SyncWal,
-    )
+    db.txn(Durability::SyncWal, |tx| {
+        nodes.set(tx, "zz", &"4".to_string())?;
+        nodes.set(tx, "aaa", &"1".to_string())?;
+        nodes.set(tx, "b", &"2".to_string())?;
+        nodes.set(tx, "c", &"3".to_string())?;
+        Ok(())
+    })
     .unwrap();
 
-    let mut keys = nodes.keys(&db).unwrap();
-    keys.sort();
-    assert_eq!(keys, vec!["a".to_string(), "b".to_string(), "c".to_string()]);
-    assert_eq!(nodes.len(&db).unwrap(), 3);
-    assert!(nodes.contains(&db, &"b".to_string()).unwrap());
-    assert!(!nodes.contains(&db, &"z".to_string()).unwrap());
-
-    let mut pairs = nodes.iter(&db).unwrap();
-    pairs.sort();
+    let r = db.read().unwrap();
+    // Lexicographic order — NOT length-first!
     assert_eq!(
-        pairs,
+        nodes.keys(&r).unwrap(),
+        vec!["aaa", "b", "c", "zz"]
+    );
+    assert_eq!(nodes.len(&r).unwrap(), 4);
+    assert!(nodes.contains(&r, "b").unwrap());
+    assert!(!nodes.contains(&r, "z").unwrap());
+    assert_eq!(
+        nodes.iter(&r).unwrap(),
         vec![
-            ("a".to_string(), "1".to_string()),
-            ("b".to_string(), "2".to_string()),
-            ("c".to_string(), "3".to_string()),
+            ("aaa".into(), "1".into()),
+            ("b".into(), "2".into()),
+            ("c".into(), "3".into()),
+            ("zz".into(), "4".into()),
         ]
     );
 }
 
 #[test]
-fn map_keys_dedup_across_nested_subkeys() {
-    // A map whose values are nested structs has many physical keys per logical
-    // key; `keys()`/`len()` must dedup to distinct logical keys.
+fn map_keys_dedup_and_remove_nested_struct() {
     let (_dir, db) = open();
     let scopes = Store::root().scopes();
-    let rust = scopes.key(&"rust".to_string());
+    let rust = scopes.key("rust");
 
-    let mut batch = db.batch();
-    batch.write(rust.edges().key(&(0, 1)).add(1.0));
-    batch.write(rust.edges().key(&(0, 2)).add(1.0));
-    batch.write(rust.item_count().add(3));
-    batch
-        .push_back(&rust.recent_votes(), &Vote { a: "a".into(), b: "b".into(), ratio: 1 })
+    db.txn(Durability::SyncWal, |tx| {
+        rust.edges().add(tx, (0, 1), 1.0)?;
+        rust.edges().add(tx, (0, 2), 1.0)?;
+        rust.item_count().add(tx, 3)?;
+        rust.recent_votes().push_back(
+            tx,
+            &Vote {
+                a: "a".into(),
+                b: "b".into(),
+                ratio: 1,
+            },
+        )?;
+        scopes.key("python").item_count().add(tx, 1)?;
+        Ok(())
+    })
+    .unwrap();
+
+    let r = db.read().unwrap();
+    assert_eq!(scopes.keys(&r).unwrap(), vec!["python", "rust"]);
+    assert_eq!(scopes.len(&r).unwrap(), 2);
+
+    // Typed `Map::remove` deletes the entire nested struct subtree!
+    db.txn(Durability::SyncWal, |tx| scopes.remove(tx, "rust"))
         .unwrap();
-    batch.write(scopes.key(&"python".to_string()).item_count().add(1));
-    batch.commit().unwrap();
-
-    let mut keys = scopes.keys(&db).unwrap();
-    keys.sort();
-    assert_eq!(keys, vec!["python".to_string(), "rust".to_string()]);
-    assert_eq!(scopes.len(&db).unwrap(), 2);
+    let r2 = db.read().unwrap();
+    assert_eq!(scopes.keys(&r2).unwrap(), vec!["python"]);
+    assert_eq!(rust.edges().len(&r2).unwrap(), 0);
+    assert_eq!(rust.item_count().get(&r2).unwrap(), 0);
+    assert!(rust.recent_votes().is_empty(&r2).unwrap());
+    // Original snapshot `r` STILL sees "rust" (MVCC isolation)!
+    assert_eq!(scopes.keys(&r).unwrap(), vec!["python", "rust"]);
 }
 
 #[test]
-fn map_clear_deletes_subtree_only() {
+fn clear_then_write_in_same_tx_preserves_arrival_order() {
     let (_dir, db) = open();
-    let rust = Store::root().scopes().key(&"rust".to_string());
+    let root = Store::root();
 
-    let mut batch = db.batch();
-    batch.write(rust.edges().key(&(0, 1)).add(1.0));
-    batch.write(rust.edges().key(&(0, 2)).add(2.0));
-    batch.write(rust.item_count().add(5));
-    batch.commit().unwrap();
+    db.txn(Durability::SyncWal, |tx| {
+        root.nodes().set(tx, "old", &"1".to_string())?;
+        root.log().push(tx, &10)?;
+        root.log().push(tx, &20)?;
+        Ok(())
+    })
+    .unwrap();
 
-    // Clear only the edges sub-map.
-    db.run(rust.edges().clear(), Durability::SyncWal).unwrap();
+    // Clear THEN set / push in the SAME transaction — arrival order is honored!
+    db.txn(Durability::SyncWal, |tx| {
+        root.nodes().clear(tx)?;
+        root.nodes().set(tx, "new", &"2".to_string())?;
 
-    assert_eq!(rust.edges().len(&db).unwrap(), 0);
-    assert_eq!(rust.edges().key(&(0, 1)).get(&db).unwrap(), 0.0);
-    // Sibling field under the same scope is untouched.
-    assert_eq!(rust.item_count().get(&db).unwrap(), 5);
+        root.log().clear(tx)?;
+        assert_eq!(root.log().push(tx, &99)?, 0);
+        Ok(())
+    })
+    .unwrap();
+
+    let r = db.read().unwrap();
+    assert_eq!(
+        root.nodes().iter(&r).unwrap(),
+        vec![("new".to_string(), "2".to_string())]
+    );
+    assert_eq!(root.log().len(&r).unwrap(), 1);
+    assert_eq!(root.log().iter(&r).unwrap(), vec![99]);
 }
 
 #[test]
-fn map_clear_in_same_batch_as_puts_covers_staged_writes() {
-    // Batch commit order is three-phase (point writes, then prefix
-    // deletes, then resolved appends), so a DeletePrefix in the batch
-    // removes keys put in the same batch no matter where it sits.
-    // Every backend must agree on this — it is long-standing behavior,
-    // not a backend quirk.
+fn set_operations_and_o1_len() {
     let (_dir, db) = open();
-    let nodes = Store::root().nodes();
+    let tags = Store::root().tags();
 
-    // Puts staged BEFORE the clear are removed.
-    let mut batch = db.batch();
-    batch.write(nodes.key(&"a".to_string()).set(&"A".to_string()));
-    batch.write(nodes.key(&"b".to_string()).set(&"B".to_string()));
-    batch.write(nodes.clear());
-    batch.commit().unwrap();
-    assert!(nodes.is_empty(&db).unwrap());
+    db.txn(Durability::SyncWal, |tx| {
+        tags.insert(tx, "rust")?;
+        tags.insert(tx, "redb")?;
+        tags.insert(tx, "durable")?;
+        tags.insert(tx, "rust")?; // idempotent
+        Ok(())
+    })
+    .unwrap();
 
-    // Puts staged AFTER the clear are removed too.
-    let mut batch = db.batch();
-    batch.write(nodes.clear());
-    batch.write(nodes.key(&"c".to_string()).set(&"C".to_string()));
-    batch.commit().unwrap();
-    assert!(nodes.is_empty(&db).unwrap());
+    let r = db.read().unwrap();
+    assert_eq!(tags.len(&r).unwrap(), 3);
+    assert!(tags.contains(&r, "rust").unwrap());
+    assert_eq!(tags.first(&r).unwrap(), Some("durable".to_string()));
+    assert_eq!(tags.last(&r).unwrap(), Some("rust".to_string()));
+    assert_eq!(tags.iter(&r).unwrap(), vec!["durable", "redb", "rust"]);
+
+    db.txn(Durability::SyncWal, |tx| {
+        assert!(tags.remove(tx, "redb")?);
+        assert!(!tags.remove(tx, "missing")?);
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(tags.len(&db).unwrap(), 2);
 }
 
 #[test]
-fn transform_values_decays_all_edges_in_one_batch() {
+fn transform_values_decays_all_edges_in_one_tx() {
     let (_dir, db) = open();
-    let edges = Store::root().scopes().key(&"rust".to_string()).edges();
+    let edges = Store::root().scopes().key("rust").edges();
 
-    let mut batch = db.batch();
-    for j in 1..=4u32 {
-        batch.write(edges.key(&(0, j)).add(j as f64 * 10.0));
-    }
-    batch.commit().unwrap();
+    db.txn(Durability::SyncWal, |tx| {
+        for j in 1..=4u32 {
+            edges.add(tx, (0, j), j as f64 * 10.0)?;
+        }
+        Ok(())
+    })
+    .unwrap();
 
-    // Decay every edge by half, dropping any that fall to/under 5.0 — built as
-    // reified writes from one scan, applied atomically.
-    let writes = edges
-        .transform_values(&db, |_k, w| {
+    db.txn(Durability::SyncWal, |tx| {
+        edges.transform_values(tx, |_k, w| {
             let decayed = w * 0.5;
             if decayed <= 5.0 {
                 None
@@ -259,229 +314,167 @@ fn transform_values_decays_all_edges_in_one_batch() {
                 Some(decayed)
             }
         })
-        .unwrap();
-    db.apply(&writes, Durability::SyncWal).unwrap();
+    })
+    .unwrap();
 
-    assert_eq!(edges.key(&(0, 1)).get(&db).unwrap(), 0.0); // 10*0.5=5.0 -> dropped
-    assert_eq!(edges.key(&(0, 2)).get(&db).unwrap(), 10.0);
-    assert_eq!(edges.key(&(0, 3)).get(&db).unwrap(), 15.0);
-    assert_eq!(edges.key(&(0, 4)).get(&db).unwrap(), 20.0);
-    assert_eq!(edges.len(&db).unwrap(), 3);
+    let r = db.read().unwrap();
+    assert_eq!(edges.get(&r, (0, 1)).unwrap(), 0.0);
+    assert_eq!(edges.get(&r, (0, 2)).unwrap(), 10.0);
+    assert_eq!(edges.get(&r, (0, 3)).unwrap(), 15.0);
+    assert_eq!(edges.get(&r, (0, 4)).unwrap(), 20.0);
+    assert_eq!(edges.len(&r).unwrap(), 3);
 }
 
 #[test]
-fn list_push_pop_iter() {
+fn list_push_pop_range_iter() {
     let (_dir, db) = open();
     let log = Store::root().log();
 
     assert!(log.is_empty(&db).unwrap());
-    assert_eq!(log.push(&db, &10).unwrap(), 0);
-    assert_eq!(log.push(&db, &20).unwrap(), 1);
-    assert_eq!(log.push(&db, &30).unwrap(), 2);
+    db.txn(Durability::SyncWal, |tx| {
+        assert_eq!(log.push(tx, &10)?, 0);
+        assert_eq!(log.push(tx, &20)?, 1);
+        assert_eq!(log.push(tx, &30)?, 2);
+        assert_eq!(log.push(tx, &40)?, 3);
+        Ok(())
+    })
+    .unwrap();
 
+    let r = db.read().unwrap();
+    assert_eq!(log.len(&r).unwrap(), 4);
+    assert_eq!(log.get(&r, 1).unwrap(), Some(20));
+    assert_eq!(log.get(&r, 4).unwrap(), None);
+    assert_eq!(log.first(&r).unwrap(), Some(10));
+    assert_eq!(log.last(&r).unwrap(), Some(40));
+    assert_eq!(log.iter(&r).unwrap(), vec![10, 20, 30, 40]);
+    let slice: Vec<u64> = log.range(&r, 1..3).unwrap().collect::<Result<_, _>>().unwrap();
+    assert_eq!(slice, vec![20, 30]);
+    let rev: Vec<u64> = log.range(&r, ..).unwrap().rev().take(2).collect::<Result<_, _>>().unwrap();
+    assert_eq!(rev, vec![40, 30]);
+
+    let popped = db
+        .txn(Durability::SyncWal, |tx| log.pop(tx))
+        .unwrap();
+    assert_eq!(popped, Some(40));
     assert_eq!(log.len(&db).unwrap(), 3);
-    assert_eq!(log.get(&db, 1).unwrap(), Some(20));
-    assert_eq!(log.get(&db, 3).unwrap(), None);
-    assert_eq!(log.iter(&db).unwrap(), vec![10, 20, 30]);
-
-    assert_eq!(log.pop(&db).unwrap(), Some(30));
-    assert_eq!(log.len(&db).unwrap(), 2);
-    assert_eq!(log.iter(&db).unwrap(), vec![10, 20]);
 }
 
 #[test]
-fn batched_list_pushes_get_contiguous_indices() {
+fn deque_transactional_ends_and_truncate() {
     let (_dir, db) = open();
-    let log = Store::root().log();
+    let dq = Store::root().scopes().key("s").recent_votes();
+    let v = |n: i32| Vote {
+        a: format!("a{n}"),
+        b: format!("b{n}"),
+        ratio: n,
+    };
 
-    let mut batch = db.batch();
-    batch.push(&log, &1).unwrap();
-    batch.push(&log, &2).unwrap();
-    batch.push(&log, &3).unwrap();
-    batch.commit().unwrap();
-    assert_eq!(log.iter(&db).unwrap(), vec![1, 2, 3]);
+    // Mixed front & back pushes in one transaction
+    db.txn(Durability::SyncWal, |tx| {
+        dq.push_back(tx, &v(1))?;
+        dq.push_front(tx, &v(0))?;
+        dq.push_back(tx, &v(2))?;
+        dq.push_front(tx, &v(-1))?;
+        Ok(())
+    })
+    .unwrap();
 
-    // A second batch continues from the persisted length.
-    let mut batch = db.batch();
-    batch.push(&log, &4).unwrap();
-    batch.push(&log, &5).unwrap();
-    batch.commit().unwrap();
-    assert_eq!(log.iter(&db).unwrap(), vec![1, 2, 3, 4, 5]);
-    assert_eq!(log.len(&db).unwrap(), 5);
-}
+    let r = db.read().unwrap();
+    assert_eq!(dq.len(&r).unwrap(), 4);
+    assert_eq!(dq.front(&r).unwrap(), Some(v(-1)));
+    assert_eq!(dq.back(&r).unwrap(), Some(v(2)));
+    assert_eq!(dq.iter(&r).unwrap(), vec![v(-1), v(0), v(1), v(2)]);
 
-#[test]
-fn deque_behaves_like_a_double_ended_queue() {
-    let (_dir, db) = open();
-    let dq = Store::root().scopes().key(&"s".to_string()).recent_votes();
-    let v = |n: i32| Vote { a: format!("a{n}"), b: format!("b{n}"), ratio: n };
-
-    dq.push_back(&db, &v(1)).unwrap();
-    dq.push_back(&db, &v(2)).unwrap();
-    dq.push_front(&db, &v(0)).unwrap();
-
-    assert_eq!(dq.len(&db).unwrap(), 3);
-    assert_eq!(dq.iter(&db).unwrap(), vec![v(0), v(1), v(2)]);
-    assert_eq!(dq.front(&db).unwrap(), Some(v(0)));
-    assert_eq!(dq.back(&db).unwrap(), Some(v(2)));
-
-    assert_eq!(dq.pop_front(&db).unwrap(), Some(v(0)));
-    assert_eq!(dq.pop_back(&db).unwrap(), Some(v(2)));
-    assert_eq!(dq.iter(&db).unwrap(), vec![v(1)]);
-    assert_eq!(dq.pop_front(&db).unwrap(), Some(v(1)));
-    assert_eq!(dq.pop_front(&db).unwrap(), None);
-    assert!(dq.is_empty(&db).unwrap());
-}
-
-#[test]
-fn deque_mixed_back_and_front_appends_share_one_batch() {
-    // Regression: back and front pushes to the same deque in ONE batch used
-    // to resolve against separate head/tail reads, so the second group
-    // clobbered the first's counter update with a stale value (len 3 here
-    // came back as 2 or 1 depending on order).
-    let (_dir, db) = open();
-    let dq = Store::root().scopes().key(&"s".to_string()).recent_votes();
-    let v = |n: i32| Vote { a: format!("a{n}"), b: format!("b{n}"), ratio: n };
-
-    let mut batch = db.batch();
-    batch.write(dq.push_back_op(&v(1)));
-    batch.write(dq.push_front_op(&v(0)));
-    batch.write(dq.push_back_op(&v(2)));
-    batch.write(dq.push_front_op(&v(-1)));
-    batch.commit().unwrap();
-
-    assert_eq!(dq.len(&db).unwrap(), 4);
-    assert_eq!(
-        dq.iter(&db).unwrap(),
-        vec![v(-1), v(0), v(1), v(2)]
-    );
-}
-
-#[test]
-fn deque_supports_capped_recent_window() {
-    // The motivating use case: keep only the most recent N votes, O(1) per insert.
-    let (_dir, db) = open();
-    let dq = Store::root().scopes().key(&"s".to_string()).recent_votes();
-    const CAP: u64 = 3;
-
-    for n in 0..10 {
-        dq.push_back(&db, &Vote { a: format!("{n}"), b: "x".into(), ratio: n })
-            .unwrap();
-        while dq.len(&db).unwrap() > CAP {
-            dq.pop_front(&db).unwrap();
+    // Capped window inside one transaction via truncate_front
+    db.txn(Durability::SyncWal, |tx| {
+        for n in 3..10 {
+            dq.push_back(tx, &v(n))?;
         }
-    }
+        dq.truncate_front(tx, 3)?;
+        Ok(())
+    })
+    .unwrap();
+    let kept: Vec<i32> = dq.iter(&db).unwrap().into_iter().map(|x| x.ratio).collect();
+    assert_eq!(kept, vec![7, 8, 9]);
 
-    let kept = dq.iter(&db).unwrap();
-    assert_eq!(kept.len(), 3);
-    assert_eq!(kept.iter().map(|v| v.ratio).collect::<Vec<_>>(), vec![7, 8, 9]);
+    db.txn(Durability::SyncWal, |tx| dq.truncate_back(tx, 1))
+        .unwrap();
+    assert_eq!(dq.iter(&db).unwrap(), vec![v(7)]);
 }
 
 #[test]
-fn deque_truncate_back_caps_length_keeping_front() {
-    let (_dir, db) = open();
-    let dq = Store::root().scopes().key(&"s".to_string()).recent_votes();
-    for n in 0..10 {
-        dq.push_back(&db, &Vote { a: format!("{n}"), b: "x".into(), ratio: n })
-            .unwrap();
-    }
-    // Keep only the 3 oldest at front (drop the back/newest beyond cap).
-    dq.truncate_back(&db, 3, Durability::SyncWal).unwrap();
-    let kept = dq.iter(&db).unwrap();
-    assert_eq!(kept.iter().map(|v| v.ratio).collect::<Vec<_>>(), vec![0, 1, 2]);
-
-    // Truncating to a larger-or-equal cap is a no-op.
-    dq.truncate_back(&db, 10, Durability::SyncWal).unwrap();
-    assert_eq!(dq.len(&db).unwrap(), 3);
-}
-
-#[cfg(not(feature = "backend-memory"))]
-#[test]
-fn one_batch_commits_all_or_nothing_and_persists() {
-    let dir = TempDir::new().unwrap();
-    let rust_key = "rust".to_string();
-    {
-        let db = Db::open(dir.path()).unwrap();
-        let rust = Store::root().scopes().key(&rust_key);
-        // A "vote" as one atomic batch: two edge merges, a pair flag, a recent
-        // vote, and a counter — all distinct keys, one WAL flush.
-        let mut batch = db.batch();
-        batch.write(rust.edges().key(&(0, 1)).add(2.0));
-        batch.write(rust.edges().key(&(1, 0)).add(1.0));
-        batch.write(rust.voted_pairs().key(&(0, 1)).set(&true));
-        batch
-            .push_back(&rust.recent_votes(), &Vote { a: "0".into(), b: "1".into(), ratio: 2 })
-            .unwrap();
-        batch.write(rust.item_count().add(2));
-        batch.commit().unwrap();
-    }
-
-    // Reopen: SyncWal data survives.
-    let db = Db::open(dir.path()).unwrap();
-    let rust = Store::root().scopes().key(&rust_key);
-    assert_eq!(rust.edges().key(&(0, 1)).get(&db).unwrap(), 2.0);
-    assert_eq!(rust.edges().key(&(1, 0)).get(&db).unwrap(), 1.0);
-    assert_eq!(rust.voted_pairs().key(&(0, 1)).get(&db).unwrap(), Some(true));
-    assert_eq!(rust.recent_votes().len(&db).unwrap(), 1);
-    assert_eq!(rust.item_count().get(&db).unwrap(), 2);
-}
-
-#[test]
-fn disable_wal_visible_within_session() {
-    let (_dir, db) = open();
-    let count = Store::root().scopes().key(&"s".to_string()).item_count();
-    db.run(count.add(7), Durability::DisableWal).unwrap();
-    assert_eq!(count.get(&db).unwrap(), 7);
-}
-
-#[test]
-fn wal_only_durability_writes() {
-    let (_dir, db) = open();
-    let node = Store::root().nodes().key(&"k".to_string());
-    db.run(node.set(&"v".to_string()), Durability::WalOnly).unwrap();
-    assert_eq!(node.get(&db).unwrap(), Some("v".to_string()));
-}
-
-#[test]
-fn namespaced_roots_do_not_collide() {
-    let (_dir, db) = open();
+fn namespaced_roots_do_not_collide_and_clear_independently() {
+    let db = Db::open_memory().unwrap();
     let a = Store::namespaced("a");
     let b = Store::namespaced("b");
-    db.run(a.nodes().key(&"k".to_string()).set(&"av".to_string()), Durability::SyncWal)
-        .unwrap();
-    db.run(b.nodes().key(&"k".to_string()).set(&"bv".to_string()), Durability::SyncWal)
-        .unwrap();
 
-    assert_eq!(a.nodes().key(&"k".to_string()).get(&db).unwrap(), Some("av".to_string()));
-    assert_eq!(b.nodes().key(&"k".to_string()).get(&db).unwrap(), Some("bv".to_string()));
+    db.txn(Durability::SyncWal, |tx| {
+        a.nodes().set(tx, "k", &"av".to_string())?;
+        a.title().set(tx, &"title-a".to_string())?;
+        b.nodes().set(tx, "k", &"bv".to_string())?;
+        b.title().set(tx, &"title-b".to_string())?;
+        Ok(())
+    })
+    .unwrap();
+
+    let r = db.read().unwrap();
+    assert_eq!(a.nodes().get(&r, "k").unwrap(), Some("av".to_string()));
+    assert_eq!(b.nodes().get(&r, "k").unwrap(), Some("bv".to_string()));
+    assert_eq!(a.title().get(&r).unwrap(), Some("title-a".to_string()));
+    assert_eq!(b.title().get(&r).unwrap(), Some("title-b".to_string()));
+
+    db.txn(Durability::SyncWal, |tx| a.clear(tx)).unwrap();
+    let r2 = db.read().unwrap();
+    assert_eq!(a.nodes().get(&r2, "k").unwrap(), None);
+    assert_eq!(a.title().get(&r2).unwrap(), None);
+    assert_eq!(b.nodes().get(&r2, "k").unwrap(), Some("bv".to_string()));
+    assert_eq!(b.title().get(&r2).unwrap(), Some("title-b".to_string()));
 }
 
-/// The in-memory backend is ephemeral by design: reopening yields an empty
-/// store, so this persistence assertion only applies to on-disk backends.
-#[cfg(not(feature = "backend-memory"))]
 #[test]
 fn persistence_across_reopen_for_all_collection_kinds() {
     let dir = TempDir::new().unwrap();
     {
         let db = Db::open(dir.path()).unwrap();
         let root = Store::root();
-        let s = root.scopes().key(&"s".to_string());
-        db.run(root.nodes().key(&"n".to_string()).set(&"N".to_string()), Durability::SyncWal)
-            .unwrap();
-        root.log().push(&db, &42).unwrap();
-        db.run(s.edges().key(&(1, 2)).add(9.0), Durability::SyncWal).unwrap();
-        s.recent_votes()
-            .push_back(&db, &Vote { a: "a".into(), b: "b".into(), ratio: 3 })
-            .unwrap();
+        let s = root.scopes().key("s");
+        db.txn(Durability::SyncWal, |tx| {
+            root.nodes().set(tx, "n", &"N".to_string())?;
+            root.tags().insert(tx, "t1")?;
+            root.log().push(tx, &42)?;
+            root.title().set(tx, &"hello".to_string())?;
+            root.counter().add(tx, 7)?;
+            s.edges().add(tx, (1, 2), 9.0)?;
+            s.voted_pairs().insert(tx, (1, 2))?;
+            s.recent_votes().push_back(
+                tx,
+                &Vote {
+                    a: "a".into(),
+                    b: "b".into(),
+                    ratio: 3,
+                },
+            )?;
+            Ok(())
+        })
+        .unwrap();
     }
     let db = Db::open(dir.path()).unwrap();
+    let r = db.read().unwrap();
     let root = Store::root();
-    let s = root.scopes().key(&"s".to_string());
-    assert_eq!(root.nodes().key(&"n".to_string()).get(&db).unwrap(), Some("N".to_string()));
-    assert_eq!(root.log().iter(&db).unwrap(), vec![42]);
-    assert_eq!(s.edges().key(&(1, 2)).get(&db).unwrap(), 9.0);
+    let s = root.scopes().key("s");
+    assert_eq!(root.nodes().get(&r, "n").unwrap(), Some("N".to_string()));
+    assert!(root.tags().contains(&r, "t1").unwrap());
+    assert_eq!(root.log().iter(&r).unwrap(), vec![42]);
+    assert_eq!(root.title().get(&r).unwrap(), Some("hello".to_string()));
+    assert_eq!(root.counter().get(&r).unwrap(), 7);
+    assert_eq!(s.edges().get(&r, (1, 2)).unwrap(), 9.0);
+    assert!(s.voted_pairs().contains(&r, (1, 2)).unwrap());
     assert_eq!(
-        s.recent_votes().front(&db).unwrap(),
-        Some(Vote { a: "a".into(), b: "b".into(), ratio: 3 })
+        s.recent_votes().front(&r).unwrap(),
+        Some(Vote {
+            a: "a".into(),
+            b: "b".into(),
+            ratio: 3,
+        })
     );
 }

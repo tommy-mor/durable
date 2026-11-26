@@ -1,39 +1,27 @@
-//! Projection equivalence: dumps, digests, folds of a whole tape, and the
-//! `testing` helpers that prove `old tape + old fold == new tape + new fold`.
-//!
-//! Dumps include the `__durable` bookkeeping keys (applied offset and identity
-//! stamp). Equivalence between two different tapes compares application
-//! state only: the `testing` helpers filter those keys out by default, because
-//! a rewrite that drops or renumbers records legitimately changes `applied`.
+//! Projection equivalence: sorted multi-table dumps, SHA-256 digests, full-tape
+//! in-memory folds, and testing helpers proving `old tape + old fold == new tape + new fold`.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::de::DeserializeOwned;
 use sha2::{Digest as _, Sha256};
 
-use crate::projection::{stamp_writes_for, ProjectionStamp};
+use crate::projection::{write_stamp, ProjectionStamp};
 use crate::rewrite::for_each_committed;
-use crate::runtime::{fold_one, Record, Tx};
-use crate::{Db, Error, Result, Shape};
+use crate::runtime::{fold_one, Record};
+use crate::store::{Db, Tx};
+use crate::{Durability, Result, Schema};
 
-/// A full sorted dump of a database: every key and value, byte for byte.
-pub(crate) fn dump_db(db: &Db) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-    let iter = db.iter_start()?;
-    let mut out = Vec::new();
-    for item in iter {
-        out.push(item?);
-    }
-    out.sort_by(|a, b| a.0.cmp(&b.0));
-    Ok(out)
-}
+/// A sorted dump of a database: `(table_name, key_bytes, value_bytes)`.
+pub type Dump = Vec<(String, Vec<u8>, Vec<u8>)>;
 
-/// Stable 32-byte digest of a sorted dump. Framing is length-prefixed
-/// (big-endian `u64` lengths), so `("ab","c")` and `("a","bc")` differ, and
-/// the domain tag keeps it distinct from any other SHA-256 in the crate.
-pub fn digest_pairs(pairs: &[(Vec<u8>, Vec<u8>)]) -> [u8; 32] {
+/// Stable 32-byte SHA-256 digest of a sorted [`Dump`].
+pub fn digest_pairs(pairs: &[(String, Vec<u8>, Vec<u8>)]) -> [u8; 32] {
     let mut h = Sha256::new();
-    h.update(b"durable.digest.v1\0");
-    for (k, v) in pairs {
+    h.update(b"durable.digest.v2\0");
+    for (table, k, v) in pairs {
+        h.update((table.len() as u64).to_be_bytes());
+        h.update(table.as_bytes());
         h.update((k.len() as u64).to_be_bytes());
         h.update(k);
         h.update((v.len() as u64).to_be_bytes());
@@ -42,41 +30,22 @@ pub fn digest_pairs(pairs: &[(Vec<u8>, Vec<u8>)]) -> [u8; 32] {
     h.finalize().into()
 }
 
-/// Fold a whole tape (committed prefix only) with `reducer` into a scratch
-/// projection and return its sorted dump.
-///
-/// The scratch projection is stamped with `ProjectionStamp::new(0, schema)`,
-/// so two folds of the same tape with the same schema produce identical dumps
-/// and a `Runtime` opened with reducer id 0 over the same schema matches too.
-pub fn fold_dump<E: DeserializeOwned + 'static>(
+/// Fold a whole tape (committed prefix only) with `reducer` into an in-memory
+/// `redb` projection and return its sorted dump.
+pub fn fold_dump<S: Schema, E: DeserializeOwned + 'static>(
     tape: &Path,
-    schema: Shape,
     reducer: impl Fn(&mut Tx, &E) -> Result<()>,
-) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-    let scratch = scratch_dir(&std::env::temp_dir(), "fold")?;
-    let result = (|| {
-        let db = Db::open(&scratch)?;
-        db.apply(
-            &stamp_writes_for(ProjectionStamp::new(0, &schema)),
-            crate::Durability::DisableWal,
-        )?;
-        for_each_committed::<E>(tape, |rec: Record<E>| {
-            fold_one(&db, &reducer, rec.meta(), &rec.event)
-        })?;
-        dump_db(&db)
-    })();
-    let _ = std::fs::remove_dir_all(&scratch);
-    result
-}
-
-/// A unique scratch directory under the system temp dir. Backends that are
-/// ephemeral (`backend-memory`) ignore it; on-disk backends write into it.
-pub(crate) fn scratch_dir(parent: &Path, label: &str) -> Result<PathBuf> {
-    let dir = parent.join(format!("durable-{label}-{}", unique_suffix()));
-    // `create_dir`, not `create_dir_all`: a directory that already exists is a
-    // collision, and two folds sharing one database would be silent corruption.
-    std::fs::create_dir(&dir).map_err(|e| Error::Log(format!("scratch {}: {e}", dir.display())))?;
-    Ok(dir)
+) -> Result<Dump> {
+    let db = Db::open_memory()?;
+    {
+        let mut tx = db.write_with(Durability::DisableWal)?;
+        write_stamp(&mut tx, ProjectionStamp::for_schema::<S>(0))?;
+        tx.commit()?;
+    }
+    for_each_committed::<E>(tape, |rec: Record<E>| {
+        fold_one(&db, &reducer, rec.meta(), &rec.event)
+    })?;
+    db.dump()
 }
 
 /// A name suffix unique within this process (atomic counter) and across
@@ -98,42 +67,39 @@ pub mod testing {
 
     use serde::de::DeserializeOwned;
 
-    use super::{fold_dump, Result};
-    use crate::{codec, runtime::META_NS, Shape, Tx};
+    use super::fold_dump;
+    use crate::store::{Tx, BOOKKEEPING_TABLE};
+    use crate::{Result, Schema};
 
-    /// `true` for keys that are application data: everything outside the
-    /// `__durable` bookkeeping namespace (applied offset, identity stamp).
-    pub fn app_keys_only(key: &[u8]) -> bool {
-        let mut meta = Vec::new();
-        codec::put_segment(&mut meta, META_NS.as_bytes());
-        !key.starts_with(&meta)
+    /// `true` for application entries: everything outside the `__durable`
+    /// bookkeeping table.
+    pub fn app_keys_only(table: &str, _key: &[u8]) -> bool {
+        table != BOOKKEEPING_TABLE
     }
 
     /// Fold `old_tape` with `old_reducer` and `new_tape` with `new_reducer`,
-    /// and compare the application keys accepted by `keep`. `Err` carries a
-    /// readable first difference: the key (hex and UTF-8 when valid), and both
-    /// values decoded from CBOR to JSON when they decode.
-    pub fn check_rewrite_equivalent<O, N>(
+    /// and compare the application keys accepted by `keep`.
+    pub fn check_rewrite_equivalent<S, O, N>(
         old_tape: &Path,
         new_tape: &Path,
-        schema: Shape,
         old_reducer: impl Fn(&mut Tx, &O) -> Result<()>,
         new_reducer: impl Fn(&mut Tx, &N) -> Result<()>,
-        keep: impl Fn(&[u8]) -> bool,
+        keep: impl Fn(&str, &[u8]) -> bool,
     ) -> std::result::Result<(), String>
     where
+        S: Schema,
         O: DeserializeOwned + 'static,
         N: DeserializeOwned + 'static,
     {
-        let left: Vec<_> = fold_dump::<O>(old_tape, schema.clone(), old_reducer)
+        let left: Vec<_> = fold_dump::<S, O>(old_tape, old_reducer)
             .map_err(|e| format!("fold of old tape failed: {e}"))?
             .into_iter()
-            .filter(|(k, _)| keep(k))
+            .filter(|(t, k, _)| keep(t, k))
             .collect();
-        let right: Vec<_> = fold_dump::<N>(new_tape, schema, new_reducer)
+        let right: Vec<_> = fold_dump::<S, N>(new_tape, new_reducer)
             .map_err(|e| format!("fold of new tape failed: {e}"))?
             .into_iter()
-            .filter(|(k, _)| keep(k))
+            .filter(|(t, k, _)| keep(t, k))
             .collect();
         if left == right {
             return Ok(());
@@ -141,10 +107,10 @@ pub mod testing {
         let (mut i, mut j) = (0, 0);
         loop {
             match (left.get(i), right.get(j)) {
-                (Some((lk, lv)), Some((rk, rv))) if lk == rk => {
+                (Some((lt, lk, lv)), Some((rt, rk, rv))) if (lt, lk) == (rt, rk) => {
                     if lv != rv {
                         return Err(format!(
-                            "first differing key {}\n  old: {}\n  new: {}",
+                            "first differing key {lt}/{} \n  old: {}\n  new: {}",
                             show_key(lk),
                             show_value(lv),
                             show_value(rv)
@@ -153,30 +119,30 @@ pub mod testing {
                     i += 1;
                     j += 1;
                 }
-                (Some((lk, lv)), Some((rk, _))) if lk < rk => {
+                (Some((lt, lk, lv)), Some((rt, rk, _))) if (lt, lk) < (rt, rk) => {
                     return Err(format!(
-                        "key {} only in old projection\n  old: {}\n  new: <absent>",
+                        "key {lt}/{} only in old projection\n  old: {}\n  new: <absent>",
                         show_key(lk),
                         show_value(lv)
                     ));
                 }
-                (Some(_), Some((rk, rv))) => {
+                (Some(_), Some((rt, rk, rv))) => {
                     return Err(format!(
-                        "key {} only in new projection\n  old: <absent>\n  new: {}",
+                        "key {rt}/{} only in new projection\n  old: <absent>\n  new: {}",
                         show_key(rk),
                         show_value(rv)
                     ));
                 }
-                (Some((lk, lv)), None) => {
+                (Some((lt, lk, lv)), None) => {
                     return Err(format!(
-                        "key {} only in old projection\n  old: {}\n  new: <absent>",
+                        "key {lt}/{} only in old projection\n  old: {}\n  new: <absent>",
                         show_key(lk),
                         show_value(lv)
                     ));
                 }
-                (None, Some((rk, rv))) => {
+                (None, Some((rt, rk, rv))) => {
                     return Err(format!(
-                        "key {} only in new projection\n  old: <absent>\n  new: {}",
+                        "key {rt}/{} only in new projection\n  old: <absent>\n  new: {}",
                         show_key(rk),
                         show_value(rv)
                     ));
@@ -193,25 +159,20 @@ pub mod testing {
     }
 
     /// Panicking form of [`check_rewrite_equivalent`] for tests.
-    pub fn assert_rewrite_equivalent<O, N>(
+    pub fn assert_rewrite_equivalent<S, O, N>(
         old_tape: &Path,
         new_tape: &Path,
-        schema: Shape,
         old_reducer: impl Fn(&mut Tx, &O) -> Result<()>,
         new_reducer: impl Fn(&mut Tx, &N) -> Result<()>,
-        keep: impl Fn(&[u8]) -> bool,
+        keep: impl Fn(&str, &[u8]) -> bool,
     ) where
+        S: Schema,
         O: DeserializeOwned + 'static,
         N: DeserializeOwned + 'static,
     {
-        if let Err(diff) = check_rewrite_equivalent::<O, N>(
-            old_tape,
-            new_tape,
-            schema,
-            old_reducer,
-            new_reducer,
-            keep,
-        ) {
+        if let Err(diff) =
+            check_rewrite_equivalent::<S, O, N>(old_tape, new_tape, old_reducer, new_reducer, keep)
+        {
             panic!("rewrite is not equivalent: {diff}");
         }
     }
@@ -225,8 +186,8 @@ pub mod testing {
 
     fn show_value(bytes: &[u8]) -> String {
         match ciborium::de::from_reader::<ciborium::Value, _>(bytes) {
-            Ok(v) => crate::dynpath::cbor_to_json(&v).to_string(),
-            Err(_) => format!("<undecodable {} bytes: {}>", bytes.len(), hex(bytes)),
+            Ok(v) => format!("{v:?}"),
+            Err(_) => format!("<{} bytes: {}>", bytes.len(), hex(bytes)),
         }
     }
 

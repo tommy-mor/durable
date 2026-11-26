@@ -76,7 +76,7 @@ fn open_refuses_extra_key_and_leaves_the_file_byte_identical() {
     let extra = with_extra_key(1, 2, 1, 1, r#"{"type":"reset"}"#, "v", "2");
     let tape = joined(&[good, extra]);
     std::fs::write(&log, &tape).unwrap();
-    let err = match Runtime::<Ext>::open(dir.join("proj"), &log, schema(), None, reduce_ext) {
+    let err = match Runtime::<Ext>::open::<Totals>(dir.join("proj"), &log, reduce_ext) {
         Err(e) => e,
         Ok(_) => panic!("open must refuse a newer envelope"),
     };
@@ -116,7 +116,10 @@ proptest! {
         at in any::<usize>(),
         key in "[a-z_]{1,8}",
     ) {
-        prop_assume!(!matches!(key.as_str(), "seq" | "ts_ms" | "from" | "to" | "event" | "crc"));
+        prop_assume!(!matches!(
+            key.as_str(),
+            "seq" | "ts_ms" | "from" | "to" | "id" | "idh" | "event" | "crc"
+        ));
         let mut lines = Vec::new();
         for seq in 0..n as u64 {
             lines.push(sealed_raw(seq, seq, seq, seq, r#"{"type":"reset"}"#));

@@ -1,52 +1,39 @@
 [package]
 name = "durable"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 authors = ["Durable Contributors"]
-description = "Event-sourced application-state runtime with typed reducers and a serializable read language"
+description = "Event-sourced Rust application-state runtime: self-sealing JSONL tape + typed redb projection"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-rocksdb = { version = "0.25", optional = true }
-redb = { version = "4", optional = true }
-sled = { version = "0.34", optional = true }
+redb = "4"
 serde = { version = "1.0", features = ["derive"] }
 thiserror = "1.0"
 ciborium = "0.2.2"
 serde_json = { version = "1.0", features = ["raw_value"] }
-durable-derive = { path = "../durable-derive", version = "0.3.0" }
+durable-derive = { path = "../durable-derive", version = "0.4.0" }
 crc32c = "0.6.8"
-# Canonical shape hash and whole-projection digest. Already in Cargo.lock
-# (0.10.x, pulled in transitively); no new crate enters the build.
 sha2 = "0.10"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [features]
-# Storage backend selection: exactly one must be enabled. The backend is
-# picked in the depending crate's `durable` dependency, e.g.
-# `durable = { version = "0.3", default-features = false, features = ["backend-sled"] }`.
-# `backend-memory` is an ephemeral in-memory `BTreeMap` for tests: no
-# dependencies, no disk writes, no persistence across `Db` instances.
-default = ["backend-rocksdb"]
-backend-rocksdb = ["dep:rocksdb"]
-backend-redb = ["dep:redb"]
-backend-sled = ["dep:sled"]
-backend-memory = []
-# Test doubles for the tape writer's failure paths. Off in normal builds;
-# the crate's own tests enable it through the self dev-dependency below.
+default = []
+# Test doubles for the tape writer's failure paths and crash checkpoints.
 fault-injection = []
 
 [[bin]]
 name = "durable-tape-migrate"
 path = "src/bin/migrate.rs"
-[dev-dependencies]
-# default-features = false so the backend under test is selected solely by
-# the features passed on the cargo command line (otherwise this self-dep
-# would re-enable backend-rocksdb through feature unification).
-durable = { path = ".", default-features = false, features = ["fault-injection"] }
-tempfile = "3.8"
-proptest = "1.4"
-serde = { version = "1.0", features = ["derive"] }
 
 [[bin]]
 name = "durable-tape"
 path = "src/bin/durable_tape.rs"
+
+[dev-dependencies]
+durable = { path = ".", features = ["fault-injection"] }
+tempfile = "3.8"
+proptest = "1.4"
+serde = { version = "1.0", features = ["derive"] }

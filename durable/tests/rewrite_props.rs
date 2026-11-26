@@ -194,7 +194,7 @@ proptest! {
         write_tape(&src, &tape);
         let bytes = read_bytes(&src);
         let dst = dir.join("dst.jsonl");
-        rewrite::<Ext, Ext>(&src, &dst, schema(), reduce_ext, Mode::SameSeq, keep).unwrap();
+        rewrite::<Totals, Ext, Ext>(&src, &dst, reduce_ext, Mode::SameSeq, keep).unwrap();
         prop_assert_eq!(read_bytes(&dst), bytes);
         is_real_clean(&dir);
     }
@@ -207,7 +207,7 @@ proptest! {
         write_tape(&src, &tape);
         let bytes = read_bytes(&src);
         let dst = dir.join("dst.jsonl");
-        rewrite::<Int, Int>(&src, &dst, schema(), reduce_int, Mode::SameSeq, keep).unwrap();
+        rewrite::<Totals, Int, Int>(&src, &dst, reduce_int, Mode::SameSeq, keep).unwrap();
         prop_assert_eq!(read_bytes(&dst), bytes);
     }
 
@@ -219,14 +219,13 @@ proptest! {
         let src = dir.join("old.jsonl");
         write_tape(&src, &tape);
         let dst = dir.join("new.jsonl");
-        rewrite::<Ext, Int>(&src, &dst, schema(), reduce_ext, Mode::SameSeq, |s| {
+        rewrite::<Totals, Ext, Int>(&src, &dst, reduce_ext, Mode::SameSeq, |s| {
             Ok(Emit::Replace(ext_to_int(&s.rec.event)))
         })
         .unwrap();
-        assert_rewrite_equivalent::<Ext, Int>(
+        assert_rewrite_equivalent::<Totals, Ext, Int>(
             &src,
             &dst,
-            schema(),
             reduce_ext,
             reduce_int,
             app_keys_only,
@@ -243,15 +242,15 @@ proptest! {
         let src = dir.join("old.jsonl");
         write_tape(&src, &tape);
         let dst = dir.join("new.jsonl");
-        rewrite::<Ext, Ext>(&src, &dst, schema(), reduce_ext, Mode::SameSeq, |s| {
+        rewrite::<Totals, Ext, Ext>(&src, &dst, reduce_ext, Mode::SameSeq, |s| {
             Ok(match &s.rec.event {
                 Ext::Add { key, n } => Emit::Replace(Ext::Add { key: key.clone(), n: n + 1 }),
                 _ => Emit::Keep,
             })
         })
         .unwrap();
-        let diff = check_rewrite_equivalent::<Ext, Ext>(
-            &src, &dst, schema(), reduce_ext, reduce_ext, app_keys_only,
+        let diff = check_rewrite_equivalent::<Totals, Ext, Ext>(
+            &src, &dst, reduce_ext, reduce_ext, app_keys_only,
         );
         let diff = diff.expect_err("a changed amount must not compare equal");
         prop_assert!(diff.contains("first differing key"), "{diff}");
@@ -272,7 +271,7 @@ proptest! {
         let dst = dir.join("dst.jsonl");
         let mut counter = 0usize;
         // Drop by mask over the source seq; the mask is indexed by seq.
-        let report = rewrite::<Ext, Ext>(&src, &dst, schema(), reduce_ext, Mode::Renumber, |s| {
+        let report = rewrite::<Totals, Ext, Ext>(&src, &dst, reduce_ext, Mode::Renumber, |s| {
             let drop = mask[s.rec.seq as usize % mask.len()];
             counter += 1;
             Ok(if drop { Emit::Drop } else { Emit::Keep })
@@ -327,8 +326,8 @@ proptest! {
         // Equivalence with the filtered stream written fresh.
         let fresh = dir.join("fresh.jsonl");
         write_lines(&fresh, &tape_lines(&expected_batches));
-        let got = fold_dump::<Ext>(&dst, schema(), reduce_ext).unwrap();
-        let want = fold_dump::<Ext>(&fresh, schema(), reduce_ext).unwrap();
+        let got = fold_dump::<Totals, Ext>(&dst, reduce_ext).unwrap();
+        let want = fold_dump::<Totals, Ext>(&fresh, reduce_ext).unwrap();
         prop_assert_eq!(app_only(got), app_only(want));
     }
 
@@ -346,11 +345,11 @@ proptest! {
         };
         let a = dir.join("a.jsonl");
         let b = dir.join("b.jsonl");
-        rewrite::<Ext, Ext>(&src, &a, schema(), reduce_ext, Mode::Renumber, map).unwrap();
-        rewrite::<Ext, Ext>(&src, &b, schema(), reduce_ext, Mode::Renumber, map).unwrap();
+        rewrite::<Totals, Ext, Ext>(&src, &a, reduce_ext, Mode::Renumber, map).unwrap();
+        rewrite::<Totals, Ext, Ext>(&src, &b, reduce_ext, Mode::Renumber, map).unwrap();
         prop_assert_eq!(read_bytes(&a), read_bytes(&b));
-        let da = digest_pairs(&fold_dump::<Ext>(&a, schema(), reduce_ext).unwrap());
-        let db = digest_pairs(&fold_dump::<Ext>(&b, schema(), reduce_ext).unwrap());
+        let da = digest_pairs(&fold_dump::<Totals, Ext>(&a, reduce_ext).unwrap());
+        let db = digest_pairs(&fold_dump::<Totals, Ext>(&b, reduce_ext).unwrap());
         prop_assert_eq!(da, db);
     }
 
@@ -376,17 +375,17 @@ proptest! {
         let src = dir.join("src.jsonl");
         write_tape(&src, &tape);
         let mid = dir.join("mid.jsonl");
-        rewrite::<Ext, Ext>(&src, &mid, schema(), reduce_ext, Mode::SameSeq, |s| {
+        rewrite::<Totals, Ext, Ext>(&src, &mid, reduce_ext, Mode::SameSeq, |s| {
             Ok(Emit::Replace(f(&s.rec.event)))
         })
         .unwrap();
         let twice = dir.join("twice.jsonl");
-        rewrite::<Ext, Ext>(&mid, &twice, schema(), reduce_ext, Mode::SameSeq, |s| {
+        rewrite::<Totals, Ext, Ext>(&mid, &twice, reduce_ext, Mode::SameSeq, |s| {
             Ok(Emit::Replace(g(&s.rec.event)))
         })
         .unwrap();
         let once = dir.join("once.jsonl");
-        rewrite::<Ext, Ext>(&src, &once, schema(), reduce_ext, Mode::SameSeq, |s| {
+        rewrite::<Totals, Ext, Ext>(&src, &once, reduce_ext, Mode::SameSeq, |s| {
             Ok(Emit::Replace(g(&f(&s.rec.event))))
         })
         .unwrap();
@@ -394,8 +393,8 @@ proptest! {
     }
 }
 
-fn app_only(d: Vec<(Vec<u8>, Vec<u8>)>) -> Vec<(Vec<u8>, Vec<u8>)> {
-    d.into_iter().filter(|(k, _)| app_keys_only(k)).collect()
+fn app_only(d: durable::Dump) -> durable::Dump {
+    d.into_iter().filter(|(t, k, _)| app_keys_only(t, k)).collect()
 }
 
 /// (seq, from, to) of a sealed line, by parsing the envelope.

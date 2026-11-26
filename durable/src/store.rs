@@ -1,661 +1,682 @@
-//! Pluggable key-value storage backends.
-//!
-//! Exactly one `backend-*` feature must be enabled (see `Cargo.toml`); the
-//! choice is made by the depending crate. [`Db`](super::Db) talks to storage
-//! only through `Store`, so adding a backend means adding an enum variant
-//! plus its `open` / `get` / scan / commit arms below — no call-site changes.
-//!
-//! Backend contract notes:
-//!
-//! * Single keyspace, lexicographically ordered, forward scans from a key.
-//! * Commits are atomic: every `FinalOp` in one `Store::write` call lands
-//!   together or not at all.
-//! * [`Durability`] maps onto each engine's fsync story; see the commit arms.
-//! * Merge ops fold through the shared `schema::fold_merge`:
-//!   natively at compaction time on RocksDB, read-modify-write inside the
-//!   commit transaction on redb, against a commit-time overlay on sled
-//!   (whose batches have no merge op), and read-modify-write under one write
-//!   lock on the in-memory backend. All preserve single-writer semantics
-//!   exactly (and durable already assumes a single writer).
-//! * On-disk formats differ per backend. Switching backends for an existing
-//!   deployment means replaying the event tape into a fresh store directory —
-//!   which is the supported migration path everywhere durable is used.
-//! * `backend-memory` is ephemeral (`BTreeMap` + `RwLock`, no disk I/O,
-//!   [`Durability`] ignored). `Db::open(path)` ignores `path` and
-//!   `Db::open_memory` is the explicit entry point.
-//!   Data vanishes when the last `Db` clone drops, so persistence tests
-//!   must not run against it.
-//!
-//! Deliberately not a backend (yet): SurrealKV. Its commit path is `async`
-//! on top of tokio while this crate's API is fully synchronous — and the
-//! main consumer commits from tokio workers, where a `block_on` bridge
-//! would panic. Revisit if it ever gains a synchronous commit path.
+//! `redb`-native storage engine: MVCC snapshots (`ReadTx`), read-your-writes
+//! write transactions (`Tx`), and lazy double-ended streaming range scans.
 
+use std::ops::Bound;
 use std::path::Path as FsPath;
+use std::sync::Arc;
 
-#[cfg(any(
-    feature = "backend-redb",
-    feature = "backend-sled",
-    feature = "backend-memory"
-))]
-use super::codec;
-use super::{schema, Durability, Error, Result};
+use redb::{
+    Database, ReadableDatabase as _, ReadableTable as _, ReadableTableMetadata as _, TableDefinition,
+    TableError, TableHandle as _,
+};
 
-/// One committed point operation, in arrival order as recorded by [`Batch`](super::Batch).
-///
-/// Prefix deletes and collection appends are resolved to these primitives
-/// before commit, so every backend sees the same flat op stream.
-pub(crate) enum FinalOp {
-    Put(Vec<u8>, Vec<u8>),
-    Delete(Vec<u8>),
-    Merge(Vec<u8>, Vec<u8>),
-    /// Delete `[start, end)`; `end == None` means "to the end of the keyspace".
-    DeleteRange {
-        start: Vec<u8>,
-        end: Option<Vec<u8>>,
-    },
+use crate::watch::{table_in_namespace, WatchRange};
+use crate::{codec, Durability, Error, Meta, Result};
+
+pub(crate) const BOOKKEEPING_TABLE: &str = "__durable";
+pub(crate) const SCALARS_TABLE: &str = "__scalars";
+
+fn table_def(name: &str) -> TableDefinition<'_, &'static [u8], &'static [u8]> {
+    TableDefinition::new(name)
 }
 
-/// Forward key-order scan yielding owned pairs.
-///
-/// RocksDB iterates a live snapshot handle; redb materializes under one
-/// read transaction (also snapshot-consistent). sled has no read
-/// transactions, so scans materialize immediately — still exact under the
-/// single-writer contract. The in-memory backend materializes under a read
-/// lock.
-pub(crate) enum StoreIter<'a> {
-    #[cfg(feature = "backend-rocksdb")]
-    Rocksdb(rocksdb::DBIterator<'a>),
-    #[cfg(feature = "backend-redb")]
-    Redb(
-        std::vec::IntoIter<(Vec<u8>, Vec<u8>)>,
-        std::marker::PhantomData<&'a ()>,
-    ),
-    #[cfg(feature = "backend-sled")]
-    Sled(
-        std::vec::IntoIter<(Vec<u8>, Vec<u8>)>,
-        std::marker::PhantomData<&'a ()>,
-    ),
-    #[cfg(feature = "backend-memory")]
-    Memory(
-        std::vec::IntoIter<(Vec<u8>, Vec<u8>)>,
-        std::marker::PhantomData<&'a ()>,
-    ),
-}
-
-impl Iterator for StoreIter<'_> {
-    type Item = Result<(Vec<u8>, Vec<u8>)>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        match self {
-            #[cfg(feature = "backend-rocksdb")]
-            StoreIter::Rocksdb(iter) => iter.next().map(|item| {
-                item.map(|(k, v)| (k.into_vec(), v.into_vec()))
-                    .map_err(Error::RocksDb)
-            }),
-            #[cfg(feature = "backend-redb")]
-            StoreIter::Redb(iter, _) => iter.next().map(Ok),
-            #[cfg(feature = "backend-sled")]
-            StoreIter::Sled(iter, _) => iter.next().map(Ok),
-            #[cfg(feature = "backend-memory")]
-            StoreIter::Memory(iter, _) => iter.next().map(Ok),
-        }
-    }
-}
-
-pub(crate) enum Store {
-    #[cfg(feature = "backend-rocksdb")]
-    Rocksdb(rocksdb::DB),
-    #[cfg(feature = "backend-redb")]
-    Redb(redb::Database),
-    #[cfg(feature = "backend-sled")]
-    Sled(sled::Db),
-    #[cfg(feature = "backend-memory")]
-    Memory(
-        std::sync::RwLock<
-            std::collections::BTreeMap<Vec<u8>, Vec<u8>>,
-        >,
-    ),
-}
-
-impl Store {
-    /// Open (or create) the store inside directory `path`.
-    ///
-    /// With `backend-memory` the path is ignored and an empty ephemeral map
-    /// is created; see [`Store::open_memory`].
-    pub(crate) fn open(path: &FsPath) -> Result<Self> {
-        #[cfg(feature = "backend-rocksdb")]
-        {
-            let mut opts = rocksdb::Options::default();
-            opts.create_if_missing(true);
-            opts.set_merge_operator_associative("durable.sum", schema::sum_merge);
-            return rocksdb::DB::open(&opts, path)
-                .map(Store::Rocksdb)
-                .map_err(Error::RocksDb);
-        }
-        #[cfg(feature = "backend-redb")]
-        {
-            std::fs::create_dir_all(path).map_err(|e| Error::Log(e.to_string()))?;
-            let db = redb::Database::create(path.join("store.redb")).map_err(store_err)?;
-            // Reads fail on a missing table, so ensure it exists up front.
-            let txn = db.begin_write().map_err(store_err)?;
-            txn.open_table(redb_be::TABLE).map_err(store_err)?;
-            txn.commit().map_err(store_err)?;
-            return Ok(Store::Redb(db));
-        }
-        #[cfg(feature = "backend-sled")]
-        {
-            let db = sled::open(path).map_err(store_err)?;
-            return Ok(Store::Sled(db));
-        }
-        #[cfg(feature = "backend-memory")]
-        {
-            let _ = path; // ephemeral: no directory, no files, no persistence
-            return Ok(Store::Memory(std::sync::RwLock::new(
-                std::collections::BTreeMap::new(),
-            )));
-        }
-        #[allow(unreachable_code)]
-        Err(Error::Log("no durable storage backend enabled".into()))
-    }
-
-    /// Open an empty in-memory store (no path, no disk writes).
-    #[cfg(feature = "backend-memory")]
-    pub(crate) fn open_memory() -> Result<Self> {
-        Ok(Store::Memory(std::sync::RwLock::new(
-            std::collections::BTreeMap::new(),
-        )))
-    }
-
-    /// Point read.
-    pub(crate) fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        match self {
-            #[cfg(feature = "backend-rocksdb")]
-            Store::Rocksdb(db) => db.get(key).map_err(Error::RocksDb),
-            #[cfg(feature = "backend-redb")]
-            Store::Redb(db) => redb_be::get(db, key),
-            #[cfg(feature = "backend-sled")]
-            Store::Sled(db) => sled_be::get(db, key),
-            #[cfg(feature = "backend-memory")]
-            Store::Memory(map) => memory_be::get(map, key),
-        }
-    }
-
-    /// Forward scan starting at the first key `>= from`.
-    ///
-    /// Every caller scans a key *prefix*, so the scan is bounded above by
-    /// that prefix's upper bound. Unbounded tail scans would turn each
-    /// nested lookup into a full-table read (quadratic deep scans); the
-    /// callers' prefix-`break` stays as a safety net.
-    pub(crate) fn iter_from(&self, from: &[u8]) -> Result<StoreIter<'_>> {
-        #[cfg(any(
-            feature = "backend-redb",
-            feature = "backend-sled",
-            feature = "backend-memory"
-        ))]
-        let end = codec::prefix_upper_bound(from);
-        match self {
-            #[cfg(feature = "backend-rocksdb")]
-            Store::Rocksdb(db) => Ok(StoreIter::Rocksdb(db.iterator(
-                rocksdb::IteratorMode::From(from, rocksdb::Direction::Forward),
-            ))),
-            #[cfg(feature = "backend-redb")]
-            Store::Redb(db) => Ok(StoreIter::Redb(
-                redb_be::scan(db, Some(from), end.as_deref())?.into_iter(),
-                std::marker::PhantomData,
-            )),
-            #[cfg(feature = "backend-sled")]
-            Store::Sled(db) => Ok(StoreIter::Sled(
-                sled_be::scan(db, Some(from), end.as_deref())?.into_iter(),
-                std::marker::PhantomData,
-            )),
-            #[cfg(feature = "backend-memory")]
-            Store::Memory(map) => Ok(StoreIter::Memory(
-                memory_be::scan(map, Some(from), end.as_deref())?.into_iter(),
-                std::marker::PhantomData,
-            )),
-        }
-    }
-
-    /// Forward scan of the whole keyspace.
-    pub(crate) fn iter_start(&self) -> Result<StoreIter<'_>> {
-        match self {
-            #[cfg(feature = "backend-rocksdb")]
-            Store::Rocksdb(db) => Ok(StoreIter::Rocksdb(
-                db.iterator(rocksdb::IteratorMode::Start),
-            )),
-            #[cfg(feature = "backend-redb")]
-            Store::Redb(db) => Ok(StoreIter::Redb(
-                redb_be::scan(db, None, None)?.into_iter(),
-                std::marker::PhantomData,
-            )),
-            #[cfg(feature = "backend-sled")]
-            Store::Sled(db) => Ok(StoreIter::Sled(
-                sled_be::scan(db, None, None)?.into_iter(),
-                std::marker::PhantomData,
-            )),
-            #[cfg(feature = "backend-memory")]
-            Store::Memory(map) => Ok(StoreIter::Memory(
-                memory_be::scan(map, None, None)?.into_iter(),
-                std::marker::PhantomData,
-            )),
-        }
-    }
-
-    /// Atomically commit a resolved op stream.
-    pub(crate) fn write(&self, ops: Vec<FinalOp>, durability: Durability) -> Result<()> {
-        match self {
-            #[cfg(feature = "backend-rocksdb")]
-            Store::Rocksdb(db) => {
-                let mut batch = rocksdb::WriteBatch::default();
-                for op in ops {
-                    match op {
-                        FinalOp::Put(k, v) => batch.put(k, v),
-                        FinalOp::Delete(k) => batch.delete(k),
-                        FinalOp::Merge(k, v) => batch.merge(k, v),
-                        FinalOp::DeleteRange { start, end } => match end {
-                            Some(end) => batch.delete_range(start, end),
-                            None => {
-                                // Range runs to the end of the keyspace: scan and
-                                // delete point-wise (same fallback as before).
-                                let iter = db.iterator(rocksdb::IteratorMode::From(
-                                    &start,
-                                    rocksdb::Direction::Forward,
-                                ));
-                                for item in iter {
-                                    let (key, _) = item.map_err(Error::RocksDb)?;
-                                    if !key.starts_with(&start) {
-                                        break;
-                                    }
-                                    batch.delete(key);
-                                }
-                            }
-                        },
-                    }
-                }
-                match durability {
-                    Durability::SyncWal => {
-                        db.write(batch).map_err(Error::RocksDb)?;
-                        db.flush_wal(true).map_err(Error::RocksDb)?;
-                    }
-                    Durability::WalOnly => {
-                        db.write(batch).map_err(Error::RocksDb)?;
-                    }
-                    Durability::DisableWal => {
-                        let mut opts = rocksdb::WriteOptions::default();
-                        opts.disable_wal(true);
-                        db.write_opt(batch, &opts).map_err(Error::RocksDb)?;
-                    }
-                }
-                Ok(())
-            }
-            #[cfg(feature = "backend-redb")]
-            Store::Redb(db) => redb_be::commit(db, ops, durability),
-            #[cfg(feature = "backend-sled")]
-            Store::Sled(db) => sled_be::commit(db, ops, durability),
-            #[cfg(feature = "backend-memory")]
-            Store::Memory(map) => memory_be::commit(map, ops, durability),
-        }
-    }
-}
-
-/// Map any displayable backend error into [`Error::Store`].
-#[cfg(any(feature = "backend-redb", feature = "backend-sled"))]
 fn store_err<E: std::fmt::Display>(e: E) -> Error {
     Error::Store(e.to_string())
 }
 
-/// Map a poisoned lock into [`Error::Store`].
-#[cfg(feature = "backend-memory")]
-fn locked_err<E: std::fmt::Display>(e: E) -> Error {
-    Error::Store(e.to_string())
+fn open_read_table(
+    txn: &redb::ReadTransaction,
+    name: &str,
+) -> Result<Option<redb::ReadOnlyTable<&'static [u8], &'static [u8]>>> {
+    match txn.open_table(table_def(name)) {
+        Ok(t) => Ok(Some(t)),
+        Err(TableError::TableDoesNotExist(_)) => Ok(None),
+        Err(e) => Err(store_err(e)),
+    }
 }
 
-/// Pure-Rust backend: redb (ACID B-tree, no C++ toolchain).
-#[cfg(feature = "backend-redb")]
-mod redb_be {
-    use redb::{ReadableDatabase as _, ReadableTable as _};
+fn bound_as_slice(b: &Bound<Vec<u8>>) -> Bound<&[u8]> {
+    match b {
+        Bound::Included(v) => Bound::Included(v.as_slice()),
+        Bound::Excluded(v) => Bound::Excluded(v.as_slice()),
+        Bound::Unbounded => Bound::Unbounded,
+    }
+}
 
-    use super::*;
+/// A handle to an open `redb`-backed durable database.
+///
+/// Cheap to clone (`Arc<redb::Database>`). Concurrent [`ReadTx`] snapshots
+/// never block writers and never observe partial commits.
+#[derive(Clone)]
+pub struct Db {
+    inner: Arc<Database>,
+}
 
-    pub(super) const TABLE: redb::TableDefinition<&[u8], &[u8]> =
-        redb::TableDefinition::new("durable");
-
-    pub(super) fn get(db: &redb::Database, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        let txn = db.begin_read().map_err(store_err)?;
-        let table = txn.open_table(TABLE).map_err(store_err)?;
-        Ok(table
-            .get(key)
-            .map_err(store_err)?
-            .map(|guard| guard.value().to_vec()))
+impl Db {
+    /// Open (or create) a `redb` database inside directory `path`
+    /// (`<path>/store.redb`).
+    pub fn open<P: AsRef<FsPath>>(path: P) -> Result<Self> {
+        let dir = path.as_ref();
+        std::fs::create_dir_all(dir).map_err(|e| Error::Log(e.to_string()))?;
+        let db = Database::create(dir.join("store.redb")).map_err(store_err)?;
+        Ok(Self {
+            inner: Arc::new(db),
+        })
     }
 
-    /// Snapshot-consistent scan: materialized under one read transaction.
-    /// `from == None` scans the whole keyspace; otherwise the scan covers
-    /// `[from, end)` (`end == None` runs to the end of the keyspace).
-    pub(super) fn scan(
-        db: &redb::Database,
-        from: Option<&[u8]>,
-        end: Option<&[u8]>,
-    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        let txn = db.begin_read().map_err(store_err)?;
-        let table = txn.open_table(TABLE).map_err(store_err)?;
-        let mut out = Vec::new();
-        let range = match (from, end) {
-            (Some(start), Some(end)) => table
-                .range(start..end)
-                .map_err(store_err)?,
-            (Some(start), None) => table.range(start..).map_err(store_err)?,
-            (None, _) => table.range::<&[u8]>(..).map_err(store_err)?,
-        };
-        for item in range {
-            let (k, v) = item.map_err(store_err)?;
-            out.push((k.value().to_vec(), v.value().to_vec()));
-        }
-        Ok(out)
+    /// Open an ephemeral in-memory `redb` database backed by
+    /// `redb::backends::InMemoryBackend`. Runs the exact same B-tree engine as
+    /// on-disk databases with zero filesystem I/O.
+    pub fn open_memory() -> Result<Self> {
+        let db = Database::builder()
+            .create_with_backend(redb::backends::InMemoryBackend::new())
+            .map_err(store_err)?;
+        Ok(Self {
+            inner: Arc::new(db),
+        })
     }
 
-    pub(super) fn commit(
-        db: &redb::Database,
-        ops: Vec<FinalOp>,
-        durability: Durability,
-    ) -> Result<()> {
-        let mut txn = db.begin_write().map_err(store_err)?;
-        // redb offers no WAL-without-fsync level, so WalOnly upgrades to
-        // Immediate (strictly stronger: process-crash safe, like SyncWal).
+    /// Begin a snapshot-consistent read transaction.
+    ///
+    /// Every read through the returned [`ReadTx`] observes the same atomic
+    /// point-in-time snapshot, and range iterators stream lazily in either
+    /// direction without materializing the range into memory.
+    pub fn read(&self) -> Result<ReadTx> {
+        let txn = self.inner.begin_read().map_err(store_err)?;
+        Ok(ReadTx { txn })
+    }
+
+    /// Begin a read-your-writes transaction with [`Durability::SyncWal`].
+    pub fn write(&self) -> Result<Tx> {
+        self.write_with(Durability::SyncWal)
+    }
+
+    /// Begin a read-your-writes transaction with an explicit [`Durability`].
+    pub fn write_with(&self, durability: Durability) -> Result<Tx> {
+        let mut txn = self.inner.begin_write().map_err(store_err)?;
         txn.set_durability(match durability {
             Durability::SyncWal | Durability::WalOnly => redb::Durability::Immediate,
-            // No durability promises: projections rebuildable from tape.
             Durability::DisableWal => redb::Durability::None,
         })
         .map_err(store_err)?;
-        {
-            let mut table = txn.open_table(TABLE).map_err(store_err)?;
-            for op in ops {
-                match op {
-                    FinalOp::Put(k, v) => {
-                        table
-                            .insert(k.as_slice(), v.as_slice())
-                            .map_err(store_err)?;
-                    }
-                    FinalOp::Delete(k) => {
-                        table.remove(k.as_slice()).map_err(store_err)?;
-                    }
-                    FinalOp::Merge(k, operand) => {
-                        // No native merge operator: fold read-modify-write
-                        // inside the commit transaction. Exact for a single
-                        // writer (durable's contract).
-                        let current = table
-                            .get(k.as_slice())
-                            .map_err(store_err)?
-                            .map(|guard| guard.value().to_vec());
-                        match schema::fold_merge(current.as_deref(), &[operand.as_slice()]) {
-                            Some(next) => {
-                                table
-                                    .insert(k.as_slice(), next.as_slice())
-                                    .map_err(store_err)?;
-                            }
-                            None => {
-                                table.remove(k.as_slice()).map_err(store_err)?;
-                            }
-                        }
-                    }
-                    FinalOp::DeleteRange { start, end } => {
-                        // Collect first: the range borrows the table.
-                        let mut keys = Vec::new();
-                        match end {
-                            Some(end) => {
-                                let range = table
-                                    .range(start.as_slice()..end.as_slice())
-                                    .map_err(store_err)?;
-                                for item in range {
-                                    let (k, _) = item.map_err(store_err)?;
-                                    keys.push(k.value().to_vec());
-                                }
-                            }
-                            None => {
-                                let range = table.range(start.as_slice()..).map_err(store_err)?;
-                                for item in range {
-                                    let (k, _) = item.map_err(store_err)?;
-                                    let key = k.value().to_vec();
-                                    if !key.starts_with(&start) {
-                                        break;
-                                    }
-                                    keys.push(key);
-                                }
-                            }
-                        }
-                        for key in keys {
-                            table.remove(key.as_slice()).map_err(store_err)?;
-                        }
-                    }
-                }
-            }
-        }
-        txn.commit().map_err(store_err)?;
-        Ok(())
+        Ok(Tx {
+            txn,
+            meta: Meta::default(),
+            touched: Vec::new(),
+        })
+    }
+
+    /// Run `f` inside a single atomic write transaction, committing on `Ok` and
+    /// aborting on `Err`.
+    pub fn txn<T>(&self, durability: Durability, f: impl FnOnce(&mut Tx) -> Result<T>) -> Result<T> {
+        let mut tx = self.write_with(durability)?;
+        let out = f(&mut tx)?;
+        tx.commit()?;
+        Ok(out)
+    }
+
+    /// Snapshot-consistent sorted dump of every table: `(table, key, value)`.
+    pub fn dump(&self) -> Result<Vec<(String, Vec<u8>, Vec<u8>)>> {
+        let r = self.read()?;
+        r.dump()
     }
 }
 
-/// Pure-Rust backend: sled (ordered B-tree, no C++).
-///
-/// sled's [`sled::Batch`] has no merge op, so [`FinalOp::Merge`] lowers to a
-/// put/delete here against a commit-time overlay that replicates WriteBatch
-/// order semantics exactly (prior puts/deletes/ranges in the same batch are
-/// visible to later merges, and ranges cover earlier puts). The fold itself
-/// is the shared [`schema::fold_merge`], so accumulator bytes are identical
-/// on every backend.
-#[cfg(feature = "backend-sled")]
-mod sled_be {
-    use std::collections::HashMap;
+/// Lazy, double-ended byte-range iterator over a single table.
+#[doc(hidden)]
+pub struct StoreRange(StoreRangeInner);
 
-    use super::*;
+enum StoreRangeInner {
+    Empty,
+    Redb(redb::Range<'static, &'static [u8], &'static [u8]>),
+    Buffered(std::vec::IntoIter<(Vec<u8>, Vec<u8>)>),
+}
 
-    pub(super) fn get(db: &sled::Db, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        Ok(db.get(key).map_err(store_err)?.map(|v| v.to_vec()))
+impl StoreRange {
+    pub(crate) fn empty() -> Self {
+        Self(StoreRangeInner::Empty)
     }
 
-    /// Eagerly materialized scan. `from == None` scans the whole keyspace;
-    /// otherwise the scan covers `[from, end)` (`end == None` runs to the
-    /// end of the keyspace).
-    pub(super) fn scan(
-        db: &sled::Db,
-        from: Option<&[u8]>,
-        end: Option<&[u8]>,
-    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    pub(crate) fn redb(iter: redb::Range<'static, &'static [u8], &'static [u8]>) -> Self {
+        Self(StoreRangeInner::Redb(iter))
+    }
+
+    pub(crate) fn buffered(iter: std::vec::IntoIter<(Vec<u8>, Vec<u8>)>) -> Self {
+        Self(StoreRangeInner::Buffered(iter))
+    }
+}
+
+impl Iterator for StoreRange {
+    type Item = Result<(Vec<u8>, Vec<u8>)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match &mut self.0 {
+            StoreRangeInner::Empty => None,
+            StoreRangeInner::Redb(iter) => iter.next().map(|res| {
+                res.map(|(k, v)| (k.value().to_vec(), v.value().to_vec()))
+                    .map_err(store_err)
+            }),
+            StoreRangeInner::Buffered(iter) => iter.next().map(Ok),
+        }
+    }
+}
+
+impl DoubleEndedIterator for StoreRange {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        match &mut self.0 {
+            StoreRangeInner::Empty => None,
+            StoreRangeInner::Redb(iter) => iter.next_back().map(|res| {
+                res.map(|(k, v)| (k.value().to_vec(), v.value().to_vec()))
+                    .map_err(store_err)
+            }),
+            StoreRangeInner::Buffered(iter) => iter.next_back().map(Ok),
+        }
+    }
+}
+
+/// Read capability shared by [`ReadTx`], [`Tx`] (read-your-writes), and [`Db`]
+/// (convenience one-off reads).
+pub trait Read {
+    #[doc(hidden)]
+    fn raw_get(&self, table: &str, key: &[u8]) -> Result<Option<Vec<u8>>>;
+
+    #[doc(hidden)]
+    fn raw_table_len(&self, table: &str) -> Result<u64>;
+
+    #[doc(hidden)]
+    fn raw_first_in(
+        &self,
+        table: &str,
+        lo: Bound<Vec<u8>>,
+        hi: Bound<Vec<u8>>,
+    ) -> Result<Option<(Vec<u8>, Vec<u8>)>>;
+
+    #[doc(hidden)]
+    fn raw_last_in(
+        &self,
+        table: &str,
+        lo: Bound<Vec<u8>>,
+        hi: Bound<Vec<u8>>,
+    ) -> Result<Option<(Vec<u8>, Vec<u8>)>>;
+
+    #[doc(hidden)]
+    fn raw_range(
+        &self,
+        table: &str,
+        lo: Bound<Vec<u8>>,
+        hi: Bound<Vec<u8>>,
+    ) -> Result<StoreRange>;
+
+    #[doc(hidden)]
+    fn raw_count_in(&self, table: &str, lo: Bound<Vec<u8>>, hi: Bound<Vec<u8>>) -> Result<u64>;
+}
+
+/// A snapshot-consistent read transaction over a [`Db`].
+///
+/// Open one per HTTP request or query batch (`let r = rt.read()?;` or
+/// `let r = db.read()?;`) so every point read and range scan observes one
+/// consistent snapshot with zero extra transaction setup cost.
+pub struct ReadTx {
+    txn: redb::ReadTransaction,
+}
+
+impl ReadTx {
+    /// Snapshot-consistent sorted dump of every table: `(table, key, value)`.
+    pub fn dump(&self) -> Result<Vec<(String, Vec<u8>, Vec<u8>)>> {
+        let mut names: Vec<String> = self
+            .txn
+            .list_tables()
+            .map_err(store_err)?
+            .map(|h| h.name().to_string())
+            .collect();
+        names.sort();
         let mut out = Vec::new();
-        let range = match (from, end) {
-            (Some(start), Some(end)) => db.range(start..end),
-            (Some(start), None) => db.range(start..),
-            (None, _) => db.range::<&[u8], _>(..),
+        for name in names {
+            let Some(table) = open_read_table(&self.txn, &name)? else {
+                continue;
+            };
+            for item in table.range::<&[u8]>(..).map_err(store_err)? {
+                let (k, v) = item.map_err(store_err)?;
+                out.push((name.clone(), k.value().to_vec(), v.value().to_vec()));
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl Read for ReadTx {
+    fn raw_get(&self, table: &str, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let Some(t) = open_read_table(&self.txn, table)? else {
+            return Ok(None);
         };
-        for item in range {
-            let (k, v) = item.map_err(store_err)?;
-            out.push((k.to_vec(), v.to_vec()));
-        }
-        Ok(out)
+        Ok(t.get(key).map_err(store_err)?.map(|g| g.value().to_vec()))
     }
 
-    pub(super) fn commit(db: &sled::Db, ops: Vec<FinalOp>, durability: Durability) -> Result<()> {
-        let mut batch = sled::Batch::default();
-        // Committed-state overlay: Some(value) = put this batch,
-        // None = deleted this batch. Lets later ops in the same commit
-        // observe earlier ones, exactly like a RocksDB WriteBatch.
-        let mut overlay: HashMap<Vec<u8>, Option<Vec<u8>>> = HashMap::new();
-        for op in ops {
-            match op {
-                FinalOp::Put(k, v) => {
-                    batch.insert(k.clone(), v.clone());
-                    overlay.insert(k, Some(v));
-                }
-                FinalOp::Delete(k) => {
-                    batch.remove(k.clone());
-                    overlay.insert(k, None);
-                }
-                FinalOp::Merge(k, operand) => {
-                    let base = match overlay.get(&k) {
-                        Some(staged) => staged.clone(),
-                        None => get(db, &k)?,
-                    };
-                    match schema::fold_merge(base.as_deref(), &[operand.as_slice()]) {
-                        Some(next) => {
-                            batch.insert(k.clone(), next.clone());
-                            overlay.insert(k, Some(next));
-                        }
-                        None => {
-                            batch.remove(k.clone());
-                            overlay.insert(k, None);
-                        }
-                    }
-                }
-                FinalOp::DeleteRange { start, end } => {
-                    let in_range = |k: &[u8]| {
-                        k >= start.as_slice() && end.as_ref().is_none_or(|e| k < e.as_slice())
-                    };
-                    // Staged keys in range, plus the committed scan minus
-                    // anything the overlay already covers.
-                    let mut condemned: Vec<Vec<u8>> =
-                        overlay.keys().filter(|k| in_range(k)).cloned().collect();
-                    match &end {
-                        Some(end) => {
-                            for item in db.range(start.as_slice()..end.as_slice()) {
-                                let (k, _) = item.map_err(store_err)?;
-                                let key = k.to_vec();
-                                if !overlay.contains_key(&key) {
-                                    condemned.push(key);
-                                }
-                            }
-                        }
-                        None => {
-                            for item in db.range(start.as_slice()..) {
-                                let (k, _) = item.map_err(store_err)?;
-                                let key = k.to_vec();
-                                if !key.starts_with(&start) {
-                                    break;
-                                }
-                                if !overlay.contains_key(&key) {
-                                    condemned.push(key);
-                                }
-                            }
-                        }
-                    }
-                    for key in condemned {
-                        batch.remove(key.clone());
-                        overlay.insert(key, None);
-                    }
-                }
-            }
+    fn raw_table_len(&self, table: &str) -> Result<u64> {
+        let Some(t) = open_read_table(&self.txn, table)? else {
+            return Ok(0);
+        };
+        t.len().map_err(store_err)
+    }
+
+    fn raw_first_in(
+        &self,
+        table: &str,
+        lo: Bound<Vec<u8>>,
+        hi: Bound<Vec<u8>>,
+    ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        let Some(t) = open_read_table(&self.txn, table)? else {
+            return Ok(None);
+        };
+        let mut iter = t
+            .range::<&[u8]>((bound_as_slice(&lo), bound_as_slice(&hi)))
+            .map_err(store_err)?;
+        match iter.next() {
+            Some(Ok((k, v))) => Ok(Some((k.value().to_vec(), v.value().to_vec()))),
+            Some(Err(e)) => Err(store_err(e)),
+            None => Ok(None),
         }
-        db.apply_batch(batch).map_err(store_err)?;
-        match durability {
-            // Force the WAL to stable storage before returning.
-            Durability::SyncWal => {
-                db.flush().map_err(store_err)?;
-            }
-            // sled has no WAL-without-fsync level and no WAL-disable knob:
-            // batches still go through the WAL, background flush decides
-            // when bytes hit disk. Documented, same as upstream behavior.
-            Durability::WalOnly | Durability::DisableWal => {}
+    }
+
+    fn raw_last_in(
+        &self,
+        table: &str,
+        lo: Bound<Vec<u8>>,
+        hi: Bound<Vec<u8>>,
+    ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        let Some(t) = open_read_table(&self.txn, table)? else {
+            return Ok(None);
+        };
+        let mut iter = t
+            .range::<&[u8]>((bound_as_slice(&lo), bound_as_slice(&hi)))
+            .map_err(store_err)?;
+        match iter.next_back() {
+            Some(Ok((k, v))) => Ok(Some((k.value().to_vec(), v.value().to_vec()))),
+            Some(Err(e)) => Err(store_err(e)),
+            None => Ok(None),
         }
-        Ok(())
+    }
+
+    fn raw_range(
+        &self,
+        table: &str,
+        lo: Bound<Vec<u8>>,
+        hi: Bound<Vec<u8>>,
+    ) -> Result<StoreRange> {
+        let Some(t) = open_read_table(&self.txn, table)? else {
+            return Ok(StoreRange::empty());
+        };
+        // Inherent `ReadOnlyTable::range` returns `Range<'static, ...>` backed
+        // by an `Arc<TransactionGuard>` — lazy, streaming, double-ended.
+        let iter = t
+            .range::<&[u8]>((bound_as_slice(&lo), bound_as_slice(&hi)))
+            .map_err(store_err)?;
+        Ok(StoreRange::redb(iter))
+    }
+
+    fn raw_count_in(&self, table: &str, lo: Bound<Vec<u8>>, hi: Bound<Vec<u8>>) -> Result<u64> {
+        let Some(t) = open_read_table(&self.txn, table)? else {
+            return Ok(0);
+        };
+        if matches!(lo, Bound::Unbounded) && matches!(hi, Bound::Unbounded) {
+            return t.len().map_err(store_err);
+        }
+        let iter = t
+            .range::<&[u8]>((bound_as_slice(&lo), bound_as_slice(&hi)))
+            .map_err(store_err)?;
+        let mut count = 0u64;
+        for item in iter {
+            let _ = item.map_err(store_err)?;
+            count += 1;
+        }
+        Ok(count)
     }
 }
 
-/// In-memory backend for tests: `RwLock<BTreeMap>` with no persistence.
+/// Convenience one-off reads directly on `&Db`.
 ///
-/// Commits hold the write lock for the whole op stream, so readers never
-/// observe a partial batch — the same atomicity each on-disk engine
-/// provides, at the cost of blocking reads during a commit. [`Durability`]
-/// is accepted and ignored: there is no WAL to fsync and nothing to
-/// survive a crash.
-#[cfg(feature = "backend-memory")]
-mod memory_be {
-    use std::collections::BTreeMap;
-    use std::sync::RwLock;
-
-    use super::*;
-
-    pub(super) type Map = RwLock<BTreeMap<Vec<u8>, Vec<u8>>>;
-
-    pub(super) fn get(map: &Map, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        let guard = map.read().map_err(locked_err)?;
-        Ok(guard.get(key).cloned())
+/// Each call opens a short-lived snapshot; for multi-read consistency and speed,
+/// prefer `let r = db.read()?;` (or `rt.read()?`).
+impl Read for Db {
+    fn raw_get(&self, table: &str, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.read()?.raw_get(table, key)
     }
 
-    /// Materialized scan under the read lock. `from == None` scans the whole
-    /// keyspace; otherwise the scan covers `[from, end)` (`end == None` runs
-    /// to the end of the keyspace).
-    pub(super) fn scan(
-        map: &Map,
-        from: Option<&[u8]>,
-        end: Option<&[u8]>,
-    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        let guard = map.read().map_err(locked_err)?;
-        let mut out = Vec::new();
-        match (from, end) {
-            (Some(start), Some(end)) => {
-                for (k, v) in guard.range(start.to_vec()..end.to_vec()) {
-                    out.push((k.clone(), v.clone()));
+    fn raw_table_len(&self, table: &str) -> Result<u64> {
+        self.read()?.raw_table_len(table)
+    }
+
+    fn raw_first_in(
+        &self,
+        table: &str,
+        lo: Bound<Vec<u8>>,
+        hi: Bound<Vec<u8>>,
+    ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        self.read()?.raw_first_in(table, lo, hi)
+    }
+
+    fn raw_last_in(
+        &self,
+        table: &str,
+        lo: Bound<Vec<u8>>,
+        hi: Bound<Vec<u8>>,
+    ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        self.read()?.raw_last_in(table, lo, hi)
+    }
+
+    fn raw_range(
+        &self,
+        table: &str,
+        lo: Bound<Vec<u8>>,
+        hi: Bound<Vec<u8>>,
+    ) -> Result<StoreRange> {
+        self.read()?.raw_range(table, lo, hi)
+    }
+
+    fn raw_count_in(&self, table: &str, lo: Bound<Vec<u8>>, hi: Bound<Vec<u8>>) -> Result<u64> {
+        self.read()?.raw_count_in(table, lo, hi)
+    }
+}
+
+/// An atomic read-your-writes transaction wrapping `redb::WriteTransaction`.
+///
+/// Inside a [`crate::Runtime`] reducer (`fn(&mut Tx, &E) -> Result<()>`),
+/// mutations are immediately visible to subsequent reads on the same `Tx`,
+/// applied strictly in arrival order, and rolled back automatically if the
+/// reducer returns `Err` (before the event ever touches the tape).
+pub struct Tx {
+    txn: redb::WriteTransaction,
+    meta: Meta,
+    touched: Vec<WatchRange>,
+}
+
+impl Tx {
+    /// Sequence number and timestamp of the event currently being reduced
+    /// (zeroed when opened standalone via [`Db::write`]).
+    pub fn meta(&self) -> Meta {
+        self.meta
+    }
+
+    /// Log index of the event currently being reduced.
+    pub fn seq(&self) -> u64 {
+        self.meta.seq
+    }
+
+    pub(crate) fn set_meta(&mut self, meta: Meta) {
+        self.meta = meta;
+    }
+
+    /// The key ranges touched by mutations in this transaction so far.
+    pub fn touched(&self) -> &[WatchRange] {
+        &self.touched
+    }
+
+    /// Commit the transaction atomically, returning the touched [`WatchRange`]s.
+    pub fn commit(self) -> Result<Vec<WatchRange>> {
+        let touched = self.touched;
+        self.txn.commit().map_err(store_err)?;
+        Ok(touched)
+    }
+
+    /// Abort and discard all writes made in this transaction.
+    pub fn abort(self) -> Result<()> {
+        self.txn.abort().map_err(store_err)
+    }
+
+    pub(crate) fn raw_put(&mut self, table: &str, key: &[u8], value: &[u8]) -> Result<()> {
+        {
+            let mut t = self.txn.open_table(table_def(table)).map_err(store_err)?;
+            t.insert(key, value).map_err(store_err)?;
+        }
+        if table != BOOKKEEPING_TABLE {
+            self.touched.push(WatchRange::point(table, key));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn raw_delete(&mut self, table: &str, key: &[u8]) -> Result<bool> {
+        let existed = {
+            let mut t = self.txn.open_table(table_def(table)).map_err(store_err)?;
+            let found = t.remove(key).map_err(store_err)?.is_some();
+            found
+        };
+        if table != BOOKKEEPING_TABLE {
+            self.touched.push(WatchRange::point(table, key));
+        }
+        Ok(existed)
+    }
+
+    pub(crate) fn raw_delete_prefix(&mut self, table: &str, prefix: &[u8]) -> Result<()> {
+        if prefix.is_empty() {
+            return self.raw_delete_table(table);
+        }
+        let end = codec::prefix_upper_bound(prefix);
+        {
+            let mut t = self.txn.open_table(table_def(table)).map_err(store_err)?;
+            match &end {
+                Some(hi) => {
+                    t.retain_in(prefix..hi.as_slice(), |_, _| false)
+                        .map_err(store_err)?;
                 }
-            }
-            (Some(start), None) => {
-                for (k, v) in guard.range(start.to_vec()..) {
-                    out.push((k.clone(), v.clone()));
-                }
-            }
-            (None, _) => {
-                for (k, v) in guard.iter() {
-                    out.push((k.clone(), v.clone()));
+                None => {
+                    t.retain_in(prefix.., |_, _| false).map_err(store_err)?;
                 }
             }
         }
+        if table != BOOKKEEPING_TABLE {
+            self.touched.push(WatchRange::prefix(table, prefix));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn raw_delete_table(&mut self, table: &str) -> Result<()> {
+        self.txn
+            .delete_table(table_def(table))
+            .map_err(store_err)?;
+        if table != BOOKKEEPING_TABLE {
+            self.touched.push(WatchRange::table(table));
+        }
+        Ok(())
+    }
+
+    /// Delete every application table (leaving `__durable` bookkeeping untouched).
+    pub(crate) fn raw_wipe_app(&mut self) -> Result<()> {
+        let handles: Vec<_> = self
+            .txn
+            .list_tables()
+            .map_err(store_err)?
+            .filter(|h| h.name() != BOOKKEEPING_TABLE)
+            .collect();
+        for h in handles {
+            self.txn.delete_table(h).map_err(store_err)?;
+        }
+        self.touched.push(WatchRange::all());
+        Ok(())
+    }
+
+    /// Delete every table in a namespace (`"{ns}/..."`).
+    pub(crate) fn raw_wipe_namespace(&mut self, ns: &str) -> Result<()> {
+        let handles: Vec<_> = self
+            .txn
+            .list_tables()
+            .map_err(store_err)?
+            .filter(|h| table_in_namespace(h.name(), ns))
+            .collect();
+        for h in handles {
+            self.txn.delete_table(h).map_err(store_err)?;
+        }
+        self.touched.push(WatchRange::namespace(ns));
+        Ok(())
+    }
+
+    /// Delete every table in the database, including `__durable` bookkeeping.
+    pub(crate) fn raw_wipe_everything(&mut self) -> Result<()> {
+        let handles: Vec<_> = self.txn.list_tables().map_err(store_err)?.collect();
+        for h in handles {
+            self.txn.delete_table(h).map_err(store_err)?;
+        }
+        self.touched.push(WatchRange::all());
+        Ok(())
+    }
+
+    /// Pop the smallest key-value pair in `[lo, hi)`.
+    pub(crate) fn raw_pop_first_in(
+        &mut self,
+        table: &str,
+        lo: Bound<Vec<u8>>,
+        hi: Bound<Vec<u8>>,
+    ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        let popped = {
+            let mut t = self.txn.open_table(table_def(table)).map_err(store_err)?;
+            if matches!(lo, Bound::Unbounded) && matches!(hi, Bound::Unbounded) {
+                t.pop_first()
+                    .map_err(store_err)?
+                    .map(|(k, v)| (k.value().to_vec(), v.value().to_vec()))
+            } else {
+                let first = {
+                    let mut iter = t
+                        .range::<&[u8]>((bound_as_slice(&lo), bound_as_slice(&hi)))
+                        .map_err(store_err)?;
+                    let res = match iter.next() {
+                        Some(Ok((k, v))) => Some((k.value().to_vec(), v.value().to_vec())),
+                        Some(Err(e)) => return Err(store_err(e)),
+                        None => None,
+                    };
+                    res
+                };
+                if let Some((ref k, _)) = first {
+                    t.remove(k.as_slice()).map_err(store_err)?;
+                }
+                first
+            }
+        };
+        if let Some((ref k, _)) = popped {
+            if table != BOOKKEEPING_TABLE {
+                self.touched.push(WatchRange::point(table, k));
+            }
+        }
+        Ok(popped)
+    }
+
+    /// Pop the largest key-value pair in `[lo, hi)`.
+    pub(crate) fn raw_pop_last_in(
+        &mut self,
+        table: &str,
+        lo: Bound<Vec<u8>>,
+        hi: Bound<Vec<u8>>,
+    ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        let popped = {
+            let mut t = self.txn.open_table(table_def(table)).map_err(store_err)?;
+            if matches!(lo, Bound::Unbounded) && matches!(hi, Bound::Unbounded) {
+                t.pop_last()
+                    .map_err(store_err)?
+                    .map(|(k, v)| (k.value().to_vec(), v.value().to_vec()))
+            } else {
+                let last = {
+                    let mut iter = t
+                        .range::<&[u8]>((bound_as_slice(&lo), bound_as_slice(&hi)))
+                        .map_err(store_err)?;
+                    let res = match iter.next_back() {
+                        Some(Ok((k, v))) => Some((k.value().to_vec(), v.value().to_vec())),
+                        Some(Err(e)) => return Err(store_err(e)),
+                        None => None,
+                    };
+                    res
+                };
+                if let Some((ref k, _)) = last {
+                    t.remove(k.as_slice()).map_err(store_err)?;
+                }
+                last
+            }
+        };
+        if let Some((ref k, _)) = popped {
+            if table != BOOKKEEPING_TABLE {
+                self.touched.push(WatchRange::point(table, k));
+            }
+        }
+        Ok(popped)
+    }
+}
+
+impl Read for Tx {
+    fn raw_get(&self, table: &str, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let t = self.txn.open_table(table_def(table)).map_err(store_err)?;
+        let out = t.get(key).map_err(store_err)?.map(|g| g.value().to_vec());
         Ok(out)
     }
 
-    pub(super) fn commit(map: &Map, ops: Vec<FinalOp>, _durability: Durability) -> Result<()> {
-        let mut guard = map.write().map_err(locked_err)?;
-        for op in ops {
-            match op {
-                FinalOp::Put(k, v) => {
-                    guard.insert(k, v);
-                }
-                FinalOp::Delete(k) => {
-                    guard.remove(&k);
-                }
-                FinalOp::Merge(k, operand) => {
-                    let current = guard.get(&k).cloned();
-                    match schema::fold_merge(current.as_deref(), &[operand.as_slice()]) {
-                        Some(next) => {
-                            guard.insert(k, next);
-                        }
-                        None => {
-                            guard.remove(&k);
-                        }
-                    }
-                }
-                FinalOp::DeleteRange { start, end } => {
-                    let mut keys = Vec::new();
-                    match end {
-                        Some(end) => {
-                            for (k, _) in guard.range(start.clone()..end) {
-                                keys.push(k.clone());
-                            }
-                        }
-                        None => {
-                            for (k, _) in guard.range(start.clone()..) {
-                                if !k.starts_with(&start) {
-                                    break;
-                                }
-                                keys.push(k.clone());
-                            }
-                        }
-                    }
-                    for key in keys {
-                        guard.remove(&key);
-                    }
-                }
-            }
+    fn raw_table_len(&self, table: &str) -> Result<u64> {
+        let t = self.txn.open_table(table_def(table)).map_err(store_err)?;
+        t.len().map_err(store_err)
+    }
+
+    fn raw_first_in(
+        &self,
+        table: &str,
+        lo: Bound<Vec<u8>>,
+        hi: Bound<Vec<u8>>,
+    ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        let t = self.txn.open_table(table_def(table)).map_err(store_err)?;
+        let mut iter = t
+            .range::<&[u8]>((bound_as_slice(&lo), bound_as_slice(&hi)))
+            .map_err(store_err)?;
+        let out = match iter.next() {
+            Some(Ok((k, v))) => Ok(Some((k.value().to_vec(), v.value().to_vec()))),
+            Some(Err(e)) => Err(store_err(e)),
+            None => Ok(None),
+        };
+        out
+    }
+
+    fn raw_last_in(
+        &self,
+        table: &str,
+        lo: Bound<Vec<u8>>,
+        hi: Bound<Vec<u8>>,
+    ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        let t = self.txn.open_table(table_def(table)).map_err(store_err)?;
+        let mut iter = t
+            .range::<&[u8]>((bound_as_slice(&lo), bound_as_slice(&hi)))
+            .map_err(store_err)?;
+        let out = match iter.next_back() {
+            Some(Ok((k, v))) => Ok(Some((k.value().to_vec(), v.value().to_vec()))),
+            Some(Err(e)) => Err(store_err(e)),
+            None => Ok(None),
+        };
+        out
+    }
+
+    fn raw_range(
+        &self,
+        table: &str,
+        lo: Bound<Vec<u8>>,
+        hi: Bound<Vec<u8>>,
+    ) -> Result<StoreRange> {
+        let t = self.txn.open_table(table_def(table)).map_err(store_err)?;
+        let iter = t
+            .range::<&[u8]>((bound_as_slice(&lo), bound_as_slice(&hi)))
+            .map_err(store_err)?;
+        let mut out = Vec::new();
+        for item in iter {
+            let (k, v) = item.map_err(store_err)?;
+            out.push((k.value().to_vec(), v.value().to_vec()));
         }
-        Ok(())
+        Ok(StoreRange::buffered(out.into_iter()))
+    }
+
+    fn raw_count_in(&self, table: &str, lo: Bound<Vec<u8>>, hi: Bound<Vec<u8>>) -> Result<u64> {
+        let t = self.txn.open_table(table_def(table)).map_err(store_err)?;
+        if matches!(lo, Bound::Unbounded) && matches!(hi, Bound::Unbounded) {
+            return t.len().map_err(store_err);
+        }
+        let iter = t
+            .range::<&[u8]>((bound_as_slice(&lo), bound_as_slice(&hi)))
+            .map_err(store_err)?;
+        let mut count = 0u64;
+        for item in iter {
+            let _ = item.map_err(store_err)?;
+            count += 1;
+        }
+        Ok(count)
     }
 }
