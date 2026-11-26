@@ -4,7 +4,7 @@
 //! write could change what that path reads. The schema *is* the dependency
 //! graph; prefix overlap just reads it.
 //!
-//! Rules (hop-wait.md, proven in `tests/invalidation_lab.rs`):
+//! Rules:
 //! 1. Watch whole subtrees, never the rows you saw — stop at the first
 //!    collecting step (`where`, `first`, `slice`, `keys`, …), at a deque
 //!    index, or on entering a leaf blob's interior.
@@ -12,8 +12,7 @@
 //!    (deleting `users/bob` while watching `users/bob/banned`) still hits.
 //! 3. Only RocksDB is visible — server lets, fs, http never wake anyone.
 //!
-//! This module is the shipped form of the lab's strategy A. The lab keeps
-//! proving it; this module is what the courier calls.
+//! This module is what the courier calls.
 
 use crate::{dynpath, Nav, Op, Shape, Write};
 
