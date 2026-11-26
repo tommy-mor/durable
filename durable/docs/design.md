@@ -113,10 +113,7 @@ supports concurrent snapshots, so an in-flight fsync does not block `one` /
 `verify()` checks the live projection against a fresh replay. The property
 that matters is incremental execution == replay from zero.
 
-The hop/Lua frontend uses the same runtime. [`dynpath`](../src/dynpath.rs)
-is the untyped write algebra (a `Shape` plus a list of `Nav`s) so a Lua
-reducer can `tx.put(["todos", tx.seq, "text"], …)` without a Rust
-`Path<S>`. Browser VMs never get those bindings.
+[`dynpath`](../src/dynpath.rs) is the untyped write algebra (a `Shape` plus a list of `Nav`s) for clients and reducers that have no Rust `Path<S>` at compile time.
 
 ## Query language
 

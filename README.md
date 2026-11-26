@@ -1,9 +1,3 @@
-# durable/hop
-
-This repo is two things.
-One replaces the backend, one replaces the frontend.
-The backend part is the `durable` crate. The frontend part it she `hop` crate.
-
 # durable
 
 A program is a stream of events. Mouse clicks, form submissions, timer ticks.
@@ -60,8 +54,4 @@ This api lets you build disk-backed fast structure almost as ergonomically as yo
 
 In this way, jsonl and rocksdb can be used as the entire data layer for an application.
 There is more to be said about durable, but check out `durable/examples/nested_records.rs` to see more of the api.
-
-# hop
-
-The data layer is only one half of an application. The other half is the user interface. At some point your bits on disk have to be converted to divs in the dom. 
 
